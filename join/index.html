@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="referrer" content="no-referrer">
   <meta name="robots" content="noindex, nofollow">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-KhEgnqenmWKiedyryzVuvR+fQXlA3KaKDM6QpycGf74='; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-Oa/AKC5bAkkpf+44pLf1wfsowixoqvkdn8bN61/lrNU='; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
   <title>Join a Tiamatrix chat</title>
   <style>
     :root { color-scheme: light dark; font: 1rem/1.5 system-ui, sans-serif; }
@@ -25,8 +25,8 @@
     <section id="join" hidden>
       <p>Open Tiamatrix → Chats → Join with a link. Paste the invite link there.</p>
       <div class="actions">
-        <button id="open" type="button">Open Tiamatrix</button>
         <button id="copy" type="button">Copy invite link</button>
+        <button id="open" type="button">Open Tiamatrix</button>
       </div>
       <p id="status" role="status"></p>
       <div id="manual" hidden>
@@ -39,28 +39,37 @@
   <script>
     "use strict";
     const get = (id) => document.getElementById(id);
-    const payload = window.location.hash.slice(1);
-    if (!/^[A-Za-z0-9_-]{1,4096}$/.test(payload)) {
-      get("unavailable").hidden = false;
-    } else {
-      const link = "tmx://join/" + payload;
-      const open = () => { window.location.href = link; };
-      get("join").hidden = false;
-      get("open").addEventListener("click", open);
-      get("copy").addEventListener("click", async () => {
-        try {
-          await navigator.clipboard.writeText(link);
-          get("status").textContent = "Invite link copied.";
-        } catch {
-          get("manual").hidden = false;
-          get("invite").value = link;
-          get("invite").focus();
-          get("invite").select();
-          get("status").textContent = "Select and copy the invite link below.";
-        }
-      });
+    let link = "";
+    const open = () => { if (link) window.location.href = link; };
+    function readInvite() {
+      const payload = window.location.hash.slice(1);
+      if (window.location.hash) window.history.replaceState(null, "", window.location.pathname);
+      link = /^[A-Za-z0-9_-]{1,2037}$/.test(payload) ? "tmx://join/" + payload : "";
+      get("unavailable").hidden = !!link;
+      get("join").hidden = !link;
+      get("manual").hidden = true;
+      get("invite").value = "";
+      get("status").textContent = "";
       open();
     }
+    get("open").addEventListener("click", open);
+    get("copy").addEventListener("click", async () => {
+      const current = link;
+      if (!current) return;
+      try {
+        await navigator.clipboard.writeText(current);
+        if (link === current) get("status").textContent = "Invite link copied.";
+      } catch {
+        if (link !== current) return;
+        get("manual").hidden = false;
+        get("invite").value = current;
+        get("invite").focus();
+        get("invite").select();
+        get("status").textContent = "Select and copy the invite link below.";
+      }
+    });
+    window.addEventListener("hashchange", readInvite);
+    readInvite();
   </script>
 </body>
 </html>
