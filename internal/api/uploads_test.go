@@ -20,6 +20,56 @@ type upload struct {
 	Image                      bool
 }
 
+func TestAgentMailAttachmentIsBoundToSenderAndRecipient(t *testing.T) {
+	d := apitest.New(t)
+	target := mkWorker(t, d)
+	owner := client{t: t, base: d.URL, token: d.OwnerToken}
+	head := client{t: t, base: d.URL, token: d.AgentToken(t, "head")}
+	worker := client{t: t, base: d.URL, token: d.AgentToken(t, target)}
+	file := map[string]string{"name": "note.txt", "data": "aGVsbG8="}
+	for _, tc := range []struct {
+		to   string
+		want int
+	}{
+		{d.Fleet.HeadID(), 400},
+		{"absent-recipient", 404},
+	} {
+		if code := head.do("POST", "/api/agents/"+tc.to+"/mail-uploads", file, nil); code != tc.want {
+			t.Fatalf("stage to %s: %d, want %d", tc.to, code, tc.want)
+		}
+	}
+	if staged, err := os.ReadDir(d.Uploads.AgentDir(d.Fleet.HeadID())); len(staged) != 0 || (err != nil && !os.IsNotExist(err)) {
+		t.Fatalf("refused upload staged data: %v, %v", staged, err)
+	}
+	var attachment upload
+	if code := head.do("POST", "/api/agents/"+target+"/mail-uploads", file, &attachment); code != 201 {
+		t.Fatalf("agent upload: %d", code)
+	}
+	if got, err := os.ReadFile(attachment.Path); err != nil || string(got) != "hello" {
+		t.Fatalf("attachment bytes: %q, %v", got, err)
+	}
+	req := map[string]any{"uploads": []string{attachment.ID}}
+	if code := head.do("POST", "/api/agents/"+d.Fleet.HeadID()+"/mail", req, nil); code != 400 {
+		t.Fatalf("different recipient: %d", code)
+	}
+	if code := worker.do("POST", "/api/agents/"+target+"/mail", req, nil); code != 400 {
+		t.Fatalf("different sender: %d", code)
+	}
+	var ownerFile upload
+	if code := owner.do("POST", "/api/agents/"+target+"/uploads", file, &ownerFile); code != 201 {
+		t.Fatalf("owner upload: %d", code)
+	}
+	if code := head.do("POST", "/api/agents/"+target+"/mail",
+		map[string]any{"uploads": []string{ownerFile.ID}}, nil); code != 400 {
+		t.Fatalf("owner attachment accepted as agent file: %d", code)
+	}
+	var msg model.Message
+	if code := head.do("POST", "/api/agents/"+target+"/mail", req, &msg); code != 200 ||
+		msg.From != d.Fleet.HeadID() || !strings.Contains(msg.Body, attachment.Path) {
+		t.Fatalf("send: %d %+v", code, msg)
+	}
+}
+
 func TestUploads(t *testing.T) {
 	d := apitest.New(t)
 	owner := client{t: t, base: d.URL, token: d.OwnerToken}
@@ -73,7 +123,7 @@ func TestUploads(t *testing.T) {
 	if s := owner.do("POST", "/api/agents/alpha-lead/uploads", map[string]string{"name": "e", "data": "@@"}, nil); s != 400 {
 		t.Fatalf("bad base64: %d", s)
 	}
-	big := base64.StdEncoding.EncodeToString(make([]byte, 20<<20+1))
+	big := base64.StdEncoding.EncodeToString(make([]byte, 100<<20+1)) // one byte over uploads.MaxFileBytes
 	if s := owner.do("POST", "/api/agents/alpha-lead/uploads", map[string]string{"name": "big", "data": big}, nil); s != 413 {
 		t.Fatalf("too big: %d", s)
 	}
@@ -88,6 +138,7 @@ func TestUploads(t *testing.T) {
 	var note upload
 	owner.do("POST", "/api/agents/alpha-lead/uploads", map[string]string{"name": "notes.txt", "type": "text/plain",
 		"data": base64.StdEncoding.EncodeToString([]byte("hello"))}, &note)
+	d.Ready(t, "alpha-lead")
 	var m model.Message
 	if s := owner.do("POST", "/api/agents/alpha-lead/send", map[string]any{"text": "look", "uploads": []string{up.ID, note.ID}}, &m); s != 200 {
 		t.Fatalf("send: %d", s)

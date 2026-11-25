@@ -9,7 +9,7 @@ import (
 
 // The inbox is available mid-turn; inspecting it as owner must not consume mail.
 // A reply obeys the same busy/typing/unknown-state holds as a new send.
-func TestMailSendInboxReplyHeld(t *testing.T) {
+func TestMailSendInboxReplyImmediate(t *testing.T) {
 	for _, hold := range []string{"busy", "typing", "unknown"} {
 		t.Run(hold, func(t *testing.T) {
 			e := newUnguardedEnv(t)
@@ -47,8 +47,8 @@ func TestMailSendInboxReplyHeld(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if first.State != model.MsgQueued || reply.State != model.MsgQueued || len(p.Sent()) != 0 {
-				t.Fatal("mail bypassed hold")
+			if first.State == model.MsgQueued || reply.State == model.MsgQueued || len(p.Sent()) != 2 {
+				t.Fatal("mail did not submit immediately")
 			}
 			msgs, err := f.Messages(OwnerCaller, a.ID, 0)
 			if err != nil || len(msgs) != 3 {
@@ -63,8 +63,8 @@ func TestMailSendInboxReplyHeld(t *testing.T) {
 			r.humanInputAt = time.Now().Add(-TypingQuiet - time.Second)
 			f.mu.Unlock()
 			f.tryDeliver(a.ID)
-			if len(p.Sent()) != 1 {
-				t.Fatal("queued send and reply not batched on idle")
+			if len(p.Sent()) != 2 {
+				t.Fatal("send and reply were not separate submissions")
 			}
 			msgs, err = f.Messages(AgentCaller(a.ID), "", 0)
 			if err != nil {
@@ -76,7 +76,7 @@ func TestMailSendInboxReplyHeld(t *testing.T) {
 				}
 			}
 			f.tryDeliver(a.ID)
-			if len(p.Sent()) != 1 {
+			if len(p.Sent()) != 2 {
 				t.Fatal("mail delivered twice")
 			}
 		})

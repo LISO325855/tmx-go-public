@@ -34,7 +34,7 @@ func TestConnectBoundaryDaemonReply(t *testing.T) {
 				if r.URL.Hostname() != "127.0.0.1" || r.URL.Path != "/api/companion/connect" {
 					t.Fatal("credential sent to wrong recipient")
 				}
-				var input map[string]string
+				var input map[string]any
 				if err := json.NewDecoder(r.Body).Decode(&input); err != nil || input["token"] != key {
 					t.Fatal("key handover changed")
 				}
@@ -102,5 +102,31 @@ func TestConnectBoundaryFlagEcho(t *testing.T) {
 		if strings.Contains(out+stderr, key) {
 			t.Fatal("argument parsing echoed a credential")
 		}
+	}
+}
+
+func TestConnectJSONRequiresCheckedKey(t *testing.T) {
+	testCompanionProtocol(t)
+	for _, reply := range []string{`{}`, `{"key_ok":false}`, `{"key_ok":true}`} {
+		t.Run(reply, func(t *testing.T) {
+			t.Setenv(config.EnvHome, t.TempDir())
+			t.Setenv(companion.EnvURL, "http://127.0.0.1:8777")
+			previous := http.DefaultTransport
+			defer func() { http.DefaultTransport = previous }()
+			http.DefaultTransport = connectBoundaryTransport(func(r *http.Request) (*http.Response, error) {
+				var req struct {
+					RequireChecked bool `json:"require_checked"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&req); err != nil || !req.RequireChecked {
+					t.Fatal("handover did not require validation")
+				}
+				return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(reply)), Request: r}, nil
+			})
+			out, _, code := tmxIn(t, "synthetic-test-key\n", "companion", "connect", "--token-stdin", "--json")
+			want := reply == `{"key_ok":true}`
+			if got := oneJSON(t, out).OK; got != want || (code == 0) != want {
+				t.Fatalf("ack=%v code=%d", got, code)
+			}
+		})
 	}
 }

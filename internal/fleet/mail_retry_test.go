@@ -2,6 +2,7 @@ package fleet
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 
@@ -16,6 +17,8 @@ func TestMailRetryIdentityConcurrentAndPersistent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	e.chat.Last(a.ID).State(model.StateIdle)
+	waitState(t, f, a.ID, model.StateIdle)
 	request := SendRequest{To: a.ID, Body: "one effect", RetryID: "request-one"}
 	const count = 12
 	results := make(chan model.Message, count)
@@ -75,7 +78,7 @@ func TestMailRetryScopeReplyAndReceipts(t *testing.T) {
 	f.mu.Unlock()
 	req := SendRequest{To: b.ID, Body: "question", RetryID: "shared"}
 	m, err := f.SendMessage(AgentCaller(a.ID), req)
-	if err != nil || m.Receipt != "queued" {
+	if err != nil || m.Receipt != "accepted" {
 		t.Fatalf("queued: %+v %v", m, err)
 	}
 	owner, err := f.SendMessage(OwnerCaller, req)
@@ -90,8 +93,10 @@ func TestMailRetryScopeReplyAndReceipts(t *testing.T) {
 	if err != nil || again.ID != m.ID || again.Receipt != "accepted" {
 		t.Fatalf("retry after effect: %+v %v", again, err)
 	}
-	if n := len(e.term.Last(b.ID).Sent()); n != 1 {
-		t.Fatalf("duplicate batch %d", n)
+	// Two writes, each once: the owner's message was typed at once into the working agent, the
+	// agent's mail when it became idle; the retry added none.
+	if sent := e.term.Last(b.ID).Sent(); len(sent) != 2 || !strings.Contains(sent[1], "question") || strings.Count(strings.Join(sent, "\n"), "question") != 2 {
+		t.Fatalf("writes: %q", sent)
 	}
 	replyReq := SendRequest{ReplyTo: m.ID, Body: "answer", RetryID: "reply-one"}
 	reply, err := f.SendMessage(AgentCaller(b.ID), replyReq)
@@ -160,4 +165,49 @@ func TestMailProcessExitClosesPendingReceipt(t *testing.T) {
 	}
 	e.chat.Last(a.ID).Exit(0, nil)
 	eventually(t, "uncertain receipt after exit", func() bool { got, _ := f.message(m.ID); return got.Receipt == "unconfirmed" })
+}
+
+func TestMenuWaitRequeuedOnProcessExitAndDeliveredAfterStart(t *testing.T) {
+	e := newUnguardedEnv(t)
+	f := e.started()
+	a, err := f.LaunchAgent(OwnerCaller, LaunchRequest{ProjectID: workerProject(t, f), Name: "menu-restart", Harness: model.HarnessClaude, Mode: model.ModeTerminal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// This is the durable receipt emitted when Esc failed before any paste.
+	m := model.Message{ID: "unpasted-menu", From: model.Owner, To: a.ID, Body: "preserved owner words", State: model.MsgDelivered, Receipt: "menu_wait", CreatedAt: model.Now(), DeliveredAt: model.Now()}
+	if err := e.st.PutMessage(m); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	f.agents[a.ID].a.Desired = "stopped"
+	f.mu.Unlock()
+	old := e.term.Last(a.ID)
+	old.Exit(0, nil)
+	eventually(t, "menu message restored after exit", func() bool {
+		got, _ := f.message(m.ID)
+		agent, _ := f.Agent(a.ID)
+		return got.State == model.MsgQueued && got.Receipt == "queued" && got.DeliveredAt == 0 && agent.Queued == 1
+	})
+	if _, err := f.StartAgent(OwnerCaller, a.ID); err != nil {
+		t.Fatal(err)
+	}
+	next := e.term.Last(a.ID)
+	if next == old {
+		t.Fatal("process not restarted")
+	}
+	next.State(model.StateIdle)
+	eventually(t, "recovered menu message delivered", func() bool {
+		for _, text := range next.Sent() {
+			if strings.Contains(text, m.Body) {
+				return true
+			}
+		}
+		return false
+	})
+	// The text reaches the process before the send is confirmed and the message marked.
+	eventually(t, "recovered menu message marked delivered", func() bool {
+		got, _ := f.message(m.ID)
+		return got.State == model.MsgDelivered
+	})
 }

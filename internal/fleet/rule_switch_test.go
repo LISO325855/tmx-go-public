@@ -50,9 +50,18 @@ func TestRuleSwitches(t *testing.T) {
 	e.chat.Last(head.ID).State(model.StateWorking)
 	waitState(t, f, "head", model.StateWorking)
 	req := HoldRequest{Tool: "Bash", Command: "sudo true", Rule: guard.RuleElevation, Cwd: "/w"}
+	// Administrator rights are Held by default (17 Nov); for the check that an Allowed rule has
+	// nothing to hold, the owner sets it to Allowed first.
+	if _, err := f.SetRuleState(OwnerCaller, guard.RuleElevation, guard.Allow); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Hold(me, req); KindOf(err) != KindInvalid {
+		t.Fatalf("elevation is Allowed, yet a hold was accepted: %v", err)
+	}
+	holdRules(t, f, guard.RuleElevation)
 	ap, err := f.Hold(me, req)
 	if err != nil || ap.State != model.ApprovalPending {
-		t.Fatalf("held by default: %+v %v", ap, err)
+		t.Fatalf("held once the owner chose it: %+v %v", ap, err)
 	}
 	f.CancelHold(me, ap.ID)
 
@@ -82,7 +91,7 @@ func TestRuleSwitches(t *testing.T) {
 	}
 
 	// The general settings PUT can neither set nor drop switches.
-	inject := guard.Settings{Enabled: true, RuleStates: map[string]guard.Outcome{guard.RuleDisk: guard.Allow}}
+	inject := guard.Settings{RuleStates: map[string]guard.Outcome{guard.RuleDisk: guard.Allow}}
 	if s, err := f.SetGuardSettings(OwnerCaller, inject); err != nil || s.Effective()[guard.RuleDisk] != guard.Block || s.Effective()[guard.RuleElevation] != guard.Block {
 		t.Fatalf("settings PUT changed switches: %v %v", err, s.RuleStates)
 	}

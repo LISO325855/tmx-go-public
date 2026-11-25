@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -55,10 +56,14 @@ const voiceUsage = `usage: tmx voice [status]            engine, models, setting
        tmx voice rm MODEL            remove a downloaded model
        tmx voice model MODEL         the model transcriptions use
        tmx voice language auto|CODE  the spoken language (auto = detected)
+       tmx voice engine whisper.cpp|faster-whisper
+       tmx voice python|tools_dir|model_dir PATH   local worker paths (empty resets)
+       tmx voice set FIELD VALUE [FIELD VALUE...]  validate and activate worker settings together
+                                     (python, tools_dir, model_dir, engine, remote_url, remote_model, idle_unload_s)
        tmx voice auto on|off         transcribe finished recordings by themselves (default on)`
 
 const transcribeUsage = `usage: tmx transcribe FILE [--language auto|CODE] [--timestamps] [--json]
-       FILE: WAV, MP3, FLAC or Ogg (up to 512 MB); prints the text.
+       FILE: WAV, MP3, FLAC, Ogg, M4A or AAC (up to 512 MB); prints the text.
        Fleet mode retains audio and returns a transcript ID while work is pending.`
 
 func cmdVoice(e *env, args []string) error {
@@ -73,10 +78,40 @@ func cmdVoice(e *env, args []string) error {
 		return args[1], nil
 	}
 	return withOwner(e, func(c *client.Client, cx context.Context) error {
+		if sub == "set" || sub == "python" || sub == "tools_dir" || sub == "model_dir" || sub == "engine" {
+			var cancel context.CancelFunc
+			cx, cancel = context.WithTimeout(context.Background(), 4*time.Minute)
+			defer cancel()
+			c.HTTP.Timeout = 4 * time.Minute
+		}
 		var st transcribe.Status
 		var err error
 		follow := ""
 		switch sub {
+		case "set":
+			if len(args) < 3 || len(args)%2 != 1 {
+				return usageErr(voiceUsage)
+			}
+			values := map[string]any{}
+			for i := 1; i < len(args); i += 2 {
+				field, v := args[i], args[i+1]
+				if _, exists := values[field]; exists {
+					return usageErr(voiceUsage)
+				}
+				switch field {
+				case "python", "tools_dir", "model_dir", "engine", "remote_url", "remote_model":
+					values[field] = v
+				case "idle_unload_s":
+					n, cerr := strconv.Atoi(v)
+					if cerr != nil {
+						return usageErr(voiceUsage)
+					}
+					values[field] = n
+				default:
+					return usageErr(voiceUsage)
+				}
+			}
+			err = c.Do(cx, http.MethodPut, "/api/voice", values, &st)
 		case "status":
 			if len(args) > 1 {
 				return usageErr(voiceUsage)
@@ -100,7 +135,7 @@ func cmdVoice(e *env, args []string) error {
 				return err
 			}
 			err = c.Do(cx, http.MethodDelete, "/api/voice/models/"+client.Seg(m), nil, &st)
-		case "model", "language":
+		case "model", "language", "engine", "python", "tools_dir", "model_dir":
 			var v string
 			if v, err = arg(); err != nil {
 				return err
@@ -191,6 +226,25 @@ func describeVoice(st transcribe.Status) string {
 		eng = "installed (" + size(st.Engine.Size) + ")"
 	case st.Engine.Downloading != nil:
 		eng = "downloading"
+	}
+	if sc := st.Sidecar; sc != nil {
+		state := "not ready: " + sc.Reason
+		switch {
+		case sc.Step != "":
+			state = sc.Step + " ..."
+		case sc.Ready && sc.Running:
+			state = "ready, running (the model is loaded)"
+		case sc.Ready:
+			state = "ready (starts with the next job)"
+		}
+		fmt.Fprintf(&b, "\nengine: faster-whisper worker, %s", state)
+		if sc.Ready {
+			fmt.Fprintf(&b, "\n  python: %s\n  model:  %s", sc.Python, sc.ModelDir)
+		}
+		if sc.Error != "" {
+			fmt.Fprintf(&b, "\n  error: %s", sc.Error)
+		}
+		b.WriteString("\nits fallback:")
 	}
 	fmt.Fprintf(&b, "\nengine: whisper.cpp %s, %s", st.Engine.Version, eng)
 	if st.Engine.Error != "" {

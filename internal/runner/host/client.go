@@ -222,6 +222,14 @@ const End = ^uint64(0)
 // Start is the offset of the first output byte this connection delivers.
 func (c *Conn) Start() uint64 { return c.start }
 
+// OutputOffset includes output received even if its consumer has not read it yet.
+// Comparing it with an earlier connection's Start detects output across reconnects.
+func (c *Conn) OutputOffset() uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.next
+}
+
 // ClearState removes what SaveState left in dir (it was taken over).
 func ClearState(dir string) { _ = os.Remove(filepath.Join(dir, stateFile)) }
 
@@ -312,6 +320,10 @@ func (c *Conn) HostStart() int64 { return c.in.Start }
 // Token is the agent's tmx credential the program was started with.
 func (c *Conn) Token() string { return c.in.Token }
 
+// Piped reports how the host runs the program: with stdin/stdout pipes (a chat process) or in
+// a terminal (false). A runner that reattaches checks it: the two speak different protocols.
+func (c *Conn) Piped() bool { return c.in.Piped }
+
 // Wait blocks until the program ended (its exit code) or the connection ended without its
 // exit (ErrDetached).
 func (c *Conn) Wait() (int, error) {
@@ -341,7 +353,16 @@ func LoadState(dir string, v any) bool { return readJSON(dir, stateFile, v) == n
 
 // Spawn starts a session host for spec in dir and connects to it. The host is started through
 // `exe host --launch DIR`, which starts the real host detached and exits at once (Launch).
+//
+// A host that dir still records and that still runs is ended first, with its program (Stop):
+// dir holds one host. Without that the earlier host stayed behind with nothing pointing at it,
+// its program still attached to the agent's conversation (hosta-go, 17 Nov: the head had two
+// programs on one conversation for almost six hours after a restart with a mode switch). If
+// it cannot be told whether that host runs (ErrHostUnknown), nothing is started.
 func Spawn(ctx context.Context, exe, dir string, spec Spec) (*Conn, error) {
+	if _, err := Stop(dir); err != nil {
+		return nil, fmt.Errorf("the earlier session host in this folder was not ended, so no new one is started: %w", err)
+	}
 	_ = os.Remove(filepath.Join(dir, infoFile))
 	_ = os.Remove(filepath.Join(dir, stateFile))
 	if err := writeJSON(dir, specFile, spec); err != nil {

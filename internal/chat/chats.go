@@ -409,6 +409,9 @@ func (s *Service) Delete(id string) error {
 		}
 		return errf(fleet.KindConflict, "leave the group first")
 	}
+	if s.teamSt != nil {
+		_ = s.teamSt.DeleteGroup(c.ID) // team.go: a deleted chat keeps no team records
+	}
 	if err := s.st.DeleteChat(c.ID); err != nil {
 		return err
 	}

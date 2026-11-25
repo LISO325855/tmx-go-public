@@ -2,7 +2,11 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, typ
 import { ArrowDown, MessageSquareDashed, MessagesSquare, Play, SquareTerminal } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
+import { Switch } from "@/components/ui/switch";
 import { Skeleton } from "@/components/ui/skeleton";
+import { useClassic } from "@/hooks/use-classic";
+import { useAgentMessagePreference } from "@/lib/agent-message-preference";
+import { withPendingOwnerMessages } from "@/lib/owner-delivery";
 import { api } from "@/lib/api";
 import { ensureFullTimeline, loadEarlier, pendingApprovals, useStore } from "@/lib/store";
 import { isRunning, STATE_LABEL } from "@/lib/format";
@@ -12,13 +16,18 @@ import type { Agent } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { InlineApproval } from "../approval";
 import { switchMode } from "../harness-screen";
-import { buildItems, type Item } from "./build";
+import { buildItems, conversationItems, type Item } from "./build";
 import { Composer, type ComposerHandle } from "./composer";
-import { AssistantText, ErrorRow, MailChip, ResultDivider, SystemLine, Thinking, TimeBreak, ToolGroup, UserBubble } from "./items";
+import { AgentMessageRow, AgentTraffic, AssistantText, ErrorRow, MailChip, ResultDivider, SystemLine, Thinking, TimeBreak, ToolGroup, ToolRun, UserBubble } from "./items";
 
 const PAGE = 120;
+// Classic: Python's chat is wider than the default dashboard's reading column: up to 1040 px
+// (65rem at Python's text size; from go-ui-parity-f's reading), the message box with it.
+const CLASSIC_COLUMN = "max-w-[65rem]";
+const CLASSIC_BOX = "max-w-[63.5rem]";
 
-export function ItemView({ item, cwd }: { item: Item; cwd: string }) {
+/** classic: a run of tool calls is one soft "N steps" card (items.tsx ToolRun). */
+export function ItemView({ item, cwd, classic }: { item: Item; cwd: string; classic?: boolean }) {
   switch (item.type) {
     case "user":
       return <UserBubble e={item.e} />;
@@ -27,7 +36,7 @@ export function ItemView({ item, cwd }: { item: Item; cwd: string }) {
     case "thinking":
       return <Thinking e={item.e} />;
     case "tools":
-      return <ToolGroup tools={item.tools} cwd={cwd} />;
+      return classic ? <ToolRun tools={item.tools} cwd={cwd} /> : <ToolGroup tools={item.tools} cwd={cwd} />;
     case "mail":
       return <MailChip e={item.e} />;
     case "result":
@@ -38,7 +47,21 @@ export function ItemView({ item, cwd }: { item: Item; cwd: string }) {
       return <ErrorRow e={item.e} />;
     case "time":
       return <TimeBreak at={item.at} />;
+    case "traffic":
+      return <AgentTraffic entries={item.entries} />;
+    case "agent-message":
+      return <AgentMessageRow e={item.e} defaultOpen />;
   }
+}
+
+export function AgentMessageToggle() {
+  const { show, setShow } = useAgentMessagePreference();
+  return (
+    <label className="inline-flex min-h-8 cursor-pointer items-center gap-2 text-xs text-muted-foreground">
+      <Switch size="sm" checked={show} onCheckedChange={setShow} />
+      Show agent messages
+    </label>
+  );
 }
 
 export function spacing(prev: Item | undefined, cur: Item): string {
@@ -58,7 +81,7 @@ function ScreenNotice({ agent }: { agent: Agent }) {
   const label = harnessLabel(agent.harness);
   const screen = inOwnScreen(agent);
   if (!screen && agent.pending_mode !== "terminal") return null;
-  let text = `${agent.name} is in ${label}'s own screen. What it does there shows up here; messages are typed in when it is ready.`;
+  let text = `${agent.name} is in ${label}'s own screen. What it does there shows up here; messages are typed straight into it.`;
   if (agent.pending_mode === "terminal") text = `${agent.name} opens ${label}'s screen when this turn ends.`;
   if (agent.pending_mode === "chat") text = `${agent.name} comes back to chat when this turn ends.`;
   return (
@@ -87,7 +110,54 @@ function ScreenNotice({ agent }: { agent: Agent }) {
   );
 }
 
+/**
+ * The message box of an agent with what sits right above it. Default dashboard: a stopped chat
+ * agent's Start, and the notice about the harness's own screen. Classic (the owner #7, 17 Nov;
+ * lib/ui-profile.ts): the same box under Chat and under Terminal, and above it only a stopped
+ * agent's Start; nothing about the mode the agent runs in, as in Python. bare: without that
+ * line (under Terminal, where the closed screen offers Start itself).
+ */
+export function MessageBox({ agent, composerRef, bare }: { agent: Agent; composerRef?: Ref<ComposerHandle>; bare?: boolean }) {
+  const classic = useClassic();
+  const stopped = !isRunning(agent.state);
+  const startLine = classic ? !bare && agent.harness !== "shell" : agent.mode === "chat";
+
+  async function startAgent() {
+    try {
+      await api.agentAction(agent.id, "start");
+    } catch (e) {
+      toast.error((e as Error).message);
+    }
+  }
+
+  return (
+    <div className={cn("mx-auto w-full", classic ? CLASSIC_BOX : "max-w-[47.25rem]")}>
+      {stopped && startLine && (
+        <div className={cn("mb-2 flex items-center gap-2 rounded-lg border bg-muted/40 px-3 py-1.5 text-xs text-muted-foreground")}>
+          <span className="min-w-0 flex-1 truncate">
+            {agent.name} is {STATE_LABEL[agent.state].toLowerCase()}. Messages wait until it runs again.
+          </span>
+          <Button size="xs" variant="outline" onClick={() => void startAgent()}>
+            <Play className="fill-current" />
+            Start
+          </Button>
+        </div>
+      )}
+      {!classic && <ScreenNotice agent={agent} />}
+      <Composer
+        ref={composerRef}
+        agent={agent}
+        placeholder={agent.harness === "shell" ? `Type into ${agent.name}'s terminal from the ${classic ? "Terminal" : "Shell"} tab` : undefined}
+      />
+    </div>
+  );
+}
+
 function WorkingLine({ agent }: { agent: Agent }) {
+ const conn = useStore((s) => s.conn);
+ const loadFailed = useStore((s) => s.timelines[agent.id]?.error);
+ if (loadFailed) return <div className="mt-3 text-xs text-muted-foreground" role="status">Couldn't load the conversation. Retrying...</div>;
+ if (conn !== "open") return <div className="mt-3 text-xs text-muted-foreground" role="status">Reconnecting - replies will catch up when connected.</div>;
   if (agent.state !== "working" && agent.state !== "starting") return null;
   return (
     <div className="mt-3 flex items-center gap-2 text-xs text-muted-foreground" aria-live="polite">
@@ -101,12 +171,19 @@ function WorkingLine({ agent }: { agent: Agent }) {
   );
 }
 
-export function Conversation({ agent, composerRef }: { agent: Agent; composerRef?: Ref<ComposerHandle> }) {
+/** hideBox: without the message box (classic side by side: one box runs under both panes). */
+export function Conversation({ agent, composerRef, hideBox }: { agent: Agent; composerRef?: Ref<ComposerHandle>; hideBox?: boolean }) {
+  const classic = useClassic();
+  const showAgentMessages = useAgentMessagePreference((s) => s.show);
   const tl = useStore((s) => s.timelines[agent.id]);
   const approvals = useStore((s) => s.approvals);
   const mine = useMemo(() => pendingApprovals(approvals).filter((a) => a.agent_id === agent.id && a.kind !== "brake").reverse(), [approvals, agent.id]);
-  const entries = useMemo(() => tl?.entries ?? [], [tl?.entries]);
-  const items = useMemo(() => buildItems(entries), [entries]);
+  const messages = useStore((s) => s.messages);
+  const entries = useMemo(() => withPendingOwnerMessages(tl?.entries ?? [], messages, agent.id), [tl?.entries, messages, agent.id]);
+  const items = useMemo(
+    () => conversationItems(buildItems(entries), classic, showAgentMessages, agent.parent_id ?? "owner"),
+    [entries, classic, showAgentMessages, agent.parent_id],
+  );
   const [shown, setShown] = useState(PAGE);
   const scroller = useRef<HTMLDivElement>(null);
   const content = useRef<HTMLDivElement>(null);
@@ -156,20 +233,14 @@ export function Conversation({ agent, composerRef }: { agent: Agent; composerRef
   const visible = items.length > shown ? items.slice(items.length - shown) : items;
   const hiddenLocal = items.length - visible.length;
   const loading = !tl?.full && (tl?.loading || !tl);
-  const stopped = !isRunning(agent.state);
-
-  async function startAgent() {
-    try {
-      await api.agentAction(agent.id, "start");
-    } catch (e) {
-      toast.error((e as Error).message);
-    }
-  }
 
   return (
     <div className="relative flex min-h-0 flex-1 flex-col">
+      <div className="flex shrink-0 justify-end px-5 md:px-6">
+        <AgentMessageToggle />
+      </div>
       <div ref={scroller} onScroll={onScroll} className="scroll-thin min-h-0 flex-1 overflow-y-auto" data-testid="conversation-scroll">
-        <div ref={content} className="mx-auto w-full max-w-[48.75rem] px-5 pt-6 pb-6 md:px-6">
+        <div ref={content} className={cn("mx-auto w-full px-5 pt-6 pb-6 md:px-6", classic ? CLASSIC_COLUMN : "max-w-[48.75rem]")}>
           {(hiddenLocal > 0 || tl?.maybeMore) && (
             <div className="mb-4 flex justify-center">
               <Button
@@ -203,17 +274,17 @@ export function Conversation({ agent, composerRef }: { agent: Agent; composerRef
           ) : items.length === 0 ? (
             <div className="flex flex-col items-center py-20 text-center">
               <MessageSquareDashed className="mb-3 size-6 text-subtle-foreground" />
-              <p className="text-sm font-medium">No conversation yet</p>
+              <p className="text-sm font-medium">{tl?.error ? "Conversation unavailable" : "No conversation yet"}</p>
               <p className="mt-1 max-w-xs text-xs text-muted-foreground">
                 {agent.mode === "terminal" && !hasChatMode(agent.harness)
-                  ? `This agent runs in ${harnessLabel(agent.harness)}'s own screen. Open the ${harnessLabel(agent.harness)} tab to see it.`
+                  ? `This agent runs in ${harnessLabel(agent.harness)}'s own screen. Open ${classic ? "Terminal" : `the ${harnessLabel(agent.harness)} tab`} to see it.`
                   : `Messages, tool calls and results from ${agent.name} show up here.`}
               </p>
             </div>
           ) : (
             visible.map((it, i) => (
               <div key={it.key} className={spacing(visible[i - 1], it)}>
-                <ItemView item={it} cwd={agent.cwd} />
+                <ItemView item={it} cwd={agent.cwd} classic={classic} />
               </div>
             ))
           )}
@@ -230,9 +301,9 @@ export function Conversation({ agent, composerRef }: { agent: Agent; composerRef
         </div>
       </div>
 
-      <div className="relative shrink-0 bg-background px-3 pb-3 md:px-4 md:pb-4">
+      <div className={cn("relative shrink-0 bg-background", !hideBox && "px-3 pb-3 md:px-4 md:pb-4")}>
       {!atBottom && items.length > 0 && (
-        <div className="pointer-events-none absolute inset-x-0 -top-10 flex justify-center">
+        <div className="shrink-0 flex justify-center py-2">
           <Button
             variant="outline"
             size="xs"
@@ -249,25 +320,7 @@ export function Conversation({ agent, composerRef }: { agent: Agent; composerRef
         </div>
       )}
 
-        <div className="mx-auto w-full max-w-[47.25rem]">
-          {stopped && agent.mode === "chat" && (
-            <div className={cn("mb-2 flex items-center gap-2 rounded-lg border bg-muted/40 px-3 py-1.5 text-xs text-muted-foreground")}>
-              <span className="min-w-0 flex-1 truncate">
-                {agent.name} is {STATE_LABEL[agent.state].toLowerCase()}. Messages wait until it runs again.
-              </span>
-              <Button size="xs" variant="outline" onClick={() => void startAgent()}>
-                <Play className="fill-current" />
-                Start
-              </Button>
-            </div>
-          )}
-          <ScreenNotice agent={agent} />
-          <Composer
-            ref={composerRef}
-            agent={agent}
-            placeholder={agent.harness === "shell" ? `Type into ${agent.name}'s terminal from the Shell tab` : undefined}
-          />
-        </div>
+        {!hideBox && <MessageBox agent={agent} composerRef={composerRef} />}
       </div>
     </div>
   );

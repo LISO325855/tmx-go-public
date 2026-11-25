@@ -71,17 +71,6 @@ func TestAgentFileTransferIsInert(t *testing.T) {
 	if _, _, err := a.svc.serveFile(p2p.FileRequest{PeerID: "stranger", ChatID: id, FileID: f.ID}); err == nil {
 		t.Fatal("non-peer downloaded")
 	}
-	for i := 1; i < MaxAgentRun; i++ {
-		if _, err := a.svc.Send(fleet.AgentCaller("h1"), id, "message"); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if _, err := a.svc.SendFile(fleet.AgentCaller("h1"), id, "a.txt", "", []byte("rate limited")); err == nil {
-		t.Fatal("file bypassed agent-run limit")
-	}
-	if pending, _ := a.st.UnsentChatFiles(model.Now() + 1); len(pending) != 0 {
-		t.Fatal("failed send left an upload", pending)
-	}
 }
 
 func TestFileSizeAndTypePolicy(t *testing.T) {
@@ -100,7 +89,7 @@ func TestFileSizeAndTypePolicy(t *testing.T) {
 	if _, err := a.svc.SendFile(fleet.AgentCaller("h1"), id, "ok.txt", "", []byte("12345678")); err != nil {
 		t.Fatal("cap boundary", err)
 	}
-	for _, name := range []string{"a.pdf", "a.png", "a.mp3", "a.zip", "a.docx", "a.tar.gz"} {
+	for _, name := range []string{"a.pdf", "a.png", "a.mp3", "a.zip", "a.docx", "a.tar.gz", "main.go", "tool.py", "Makefile", "notes.rst"} { // source code and files without an extension: refused until 17 Nov
 		if err := validateFile(name, []byte("fixture")); err != nil {
 			t.Errorf("refused allowed %s: %v", name, err)
 		}

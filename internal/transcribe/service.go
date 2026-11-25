@@ -13,6 +13,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -104,7 +105,9 @@ type Service struct {
 	log *slog.Logger
 
 	mu          sync.Mutex
-	peerFilesMu sync.Mutex // checkpoint reads/replacements/deletion, including Windows sharing rules
+	configureMu sync.Mutex   // serialize settings transactions, including activation probes
+	fwUseMu     sync.RWMutex // commit cannot replace a worker used by an in-flight job
+	peerFilesMu sync.Mutex   // checkpoint reads/replacements/deletion, including Windows sharing rules
 	queue       []*job
 	running     *job
 	wake        chan struct{}
@@ -117,6 +120,10 @@ type Service struct {
 	pubTimer    *time.Timer
 	closed      bool
 	pubWG       sync.WaitGroup // publications and delayed callbacks admitted under mu
+	fw          *fwWorker      // the faster-whisper worker (sidecar.go)
+	fwStep      string         // its setup's step in progress
+	ffmpegOnce  sync.Once
+	ffmpegPath  string
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -156,7 +163,8 @@ func New(o Options) *Service {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Service{o: o, log: o.Logger, wake: make(chan struct{}, 1), downloads: map[string]*Progress{},
-		cancels: map[string]context.CancelFunc{}, dlErrors: map[string]string{}, ctx: ctx, cancel: cancel}
+		cancels: map[string]context.CancelFunc{}, dlErrors: map[string]string{}, ctx: ctx, cancel: cancel,
+		fw: &fwWorker{log: o.Logger}}
 }
 
 // Start picks up what a restart cut off and starts the job worker.
@@ -195,6 +203,7 @@ func (s *Service) Start() error {
 	}
 	s.wg.Add(1)
 	go s.worker()
+	s.warmWorker()
 	return nil
 }
 
@@ -210,6 +219,9 @@ func (s *Service) Close() {
 	}
 	s.mu.Unlock()
 	s.wg.Wait()
+	s.configureMu.Lock()
+	defer s.configureMu.Unlock()
+	s.fw.close() // the worker process leaves with the daemon
 	s.pubWG.Wait()
 }
 
@@ -242,20 +254,42 @@ func (s *Service) modelInstalled(m Model) bool {
 
 // Settings are the voice settings as they apply (GET /api/voice "settings").
 type Settings struct {
-	ViaPeer  string `json:"via_peer"`
-	Model    string `json:"model"`
-	Language string `json:"language"` // "auto" or a code
+	ViaPeer            string   `json:"via_peer"`
+	RemoteURL          string   `json:"remote_url,omitempty"`
+	RemoteModel        string   `json:"remote_model,omitempty"`
+	Engine             string   `json:"engine"` // "whisper.cpp" or "faster-whisper"
+	Model              string   `json:"model"`
+	Language           string   `json:"language"` // "auto" or a code
+	DictationLanguages []string `json:"dictation_languages"`
 	// Threads the engine uses (Threads 0 in config = ThreadsAuto).
 	Threads        int  `json:"threads"`
 	ThreadsAuto    bool `json:"threads_auto"`
 	VAD            bool `json:"vad"`
 	AutoTranscribe bool `json:"auto_transcribe"`
+	// IdleUnloadS: the local worker (faster-whisper) ends this many seconds after its last
+	// job; 0 in config means IdleUnloadSAuto, the 300 s default (sidecar.go fwDefaultIdle).
+	IdleUnloadS     int  `json:"idle_unload_s"`
+	IdleUnloadSAuto bool `json:"idle_unload_s_auto"`
 }
 
 func (s *Service) settings() Settings {
 	c := s.o.Settings()
 	out := Settings{Model: c.Model, Language: c.Language, Threads: c.Threads, VAD: c.VAD == nil || *c.VAD, AutoTranscribe: c.AutoTranscribeOn()}
+	out.DictationLanguages = dictationLanguages(c)
 	out.ViaPeer = c.ViaPeer
+	out.RemoteURL, out.RemoteModel = c.RemoteURL, c.RemoteModel
+	if out.RemoteURL != "" && out.RemoteModel == "" {
+		out.RemoteModel = DefaultRemoteModel
+	}
+	out.IdleUnloadS = c.IdleUnloadS
+	if out.IdleUnloadS <= 0 {
+		out.IdleUnloadSAuto = true
+		out.IdleUnloadS = int(fwDefaultIdle / time.Second)
+	}
+	out.Engine = "whisper.cpp"
+	if s.fwOn() {
+		out.Engine = config.EngineFasterWhisper
+	}
 	if _, ok := FindModel(out.Model); !ok || out.Model == VADModel.Name {
 		out.Model = DefaultModel
 	}
@@ -273,40 +307,106 @@ func (s *Service) settings() Settings {
 // transcribed by themselves (internal/summarize does it, setting voice up first when needed).
 func (s *Service) AutoTranscribe() bool { return s.settings().AutoTranscribe }
 
+// Omitted/empty config uses the owner's primary languages; invalid hand-edited entries are ignored.
+func dictationLanguages(c config.VoiceConfig) []string {
+	var out []string
+	for _, raw := range c.DictationLanguages {
+		value := strings.ToLower(strings.TrimSpace(raw))
+		if langRx.MatchString(value) && !slices.Contains(out, value) {
+			out = append(out, value)
+		}
+	}
+	if len(out) == 0 {
+		return []string{"en", "fr"}
+	}
+	return out
+}
+
 // SettingsPatch is PUT /api/voice; nil fields stay.
 type SettingsPatch struct {
-	ViaPeer        *string `json:"via_peer"`
-	Model          *string `json:"model"`
-	Language       *string `json:"language"`
-	Threads        *int    `json:"threads"`
-	VAD            *bool   `json:"vad"`
-	AutoTranscribe *bool   `json:"auto_transcribe"`
+	Engine             *string   `json:"engine"`
+	Python             *string   `json:"python"`
+	ToolsDir           *string   `json:"tools_dir"`
+	ModelDir           *string   `json:"model_dir"`
+	ViaPeer            *string   `json:"via_peer"`
+	RemoteURL          *string   `json:"remote_url"`
+	RemoteModel        *string   `json:"remote_model"`
+	Model              *string   `json:"model"`
+	Language           *string   `json:"language"`
+	DictationLanguages *[]string `json:"dictation_languages"`
+	Threads            *int      `json:"threads"`
+	VAD                *bool     `json:"vad"`
+	AutoTranscribe     *bool     `json:"auto_transcribe"`
+	IdleUnloadS        *int      `json:"idle_unload_s"`
 }
 
 var langRx = regexp.MustCompile(`^[a-z]{2,3}$`)
 
 // Configure changes the settings (config.json "voice").
 func (s *Service) Configure(p SettingsPatch) (Status, error) {
+	s.configureMu.Lock()
+	defer s.configureMu.Unlock()
 	c := s.o.Settings()
+	if p.Engine != nil {
+		if *p.Engine != "" && *p.Engine != "whisper.cpp" && *p.Engine != config.EngineFasterWhisper {
+			return Status{}, fmt.Errorf("%w: engine must be whisper.cpp or faster-whisper", ErrInvalid)
+		}
+		c.Engine = *p.Engine
+	}
+	for _, item := range []struct {
+		name      string
+		value     *string
+		target    *string
+		directory bool
+	}{
+		{"python", p.Python, &c.Python, false},
+		{"tools_dir", p.ToolsDir, &c.ToolsDir, true},
+		{"model_dir", p.ModelDir, &c.ModelDir, true},
+	} {
+		if item.value == nil {
+			continue
+		}
+		v := strings.TrimSpace(*item.value)
+		if v != "" {
+			info, err := os.Stat(v)
+			if !filepath.IsAbs(v) || err != nil || info.IsDir() != item.directory {
+				return Status{}, fmt.Errorf("%w: voice.%s must be an existing absolute %s path", ErrInvalid, item.name, map[bool]string{true: "directory", false: "file"}[item.directory])
+			}
+		}
+		*item.target = v
+	}
 	if p.ViaPeer != nil {
 		name := strings.ToLower(strings.TrimSpace(*p.ViaPeer))
 		if !validatePeerName(name) {
-			return s.Status(), fmt.Errorf("%w: choose a paired fleet machine name", ErrInvalid)
+			return Status{}, fmt.Errorf("%w: choose a paired fleet machine name", ErrInvalid)
 		}
 		if name != "" {
 			if s.o.Peer == nil {
-				return s.Status(), fmt.Errorf("%w: no fleet peers configured", ErrInvalid)
+				return Status{}, fmt.Errorf("%w: no fleet peers configured", ErrInvalid)
 			}
 			if err := s.o.Peer.ValidateVoicePeer(name); err != nil {
-				return s.Status(), err
+				return Status{}, err
 			}
 		}
 		c.ViaPeer = name
 	}
+	if p.RemoteURL != nil {
+		raw := strings.TrimSpace(*p.RemoteURL)
+		if raw != "" {
+			u, err := url.Parse(raw)
+			if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+				return Status{}, fmt.Errorf("%w: voice.remote_url must be an absolute http(s) URL", ErrInvalid)
+			}
+		}
+		c.RemoteURL = raw
+	}
+	if p.RemoteModel != nil {
+		c.RemoteModel = strings.TrimSpace(*p.RemoteModel)
+	}
 	if p.Model != nil {
 		m, ok := FindModel(*p.Model)
 		if !ok || m.VAD {
-			return s.Status(), fmt.Errorf("%w: there is no model %q (%s)", ErrInvalid, *p.Model, strings.Join(modelNames(), ", "))
+			return Status{}, fmt.Errorf("%w: there is no model %q (%s)", ErrInvalid, *p.Model, strings.Join(modelNames(), ", "))
 		}
 		c.Model = m.Name
 	}
@@ -316,13 +416,26 @@ func (s *Service) Configure(p SettingsPatch) (Status, error) {
 			l = "auto"
 		}
 		if l != "auto" && !langRx.MatchString(l) {
-			return s.Status(), fmt.Errorf("%w: the language is \"auto\" or a code like \"de\" or \"en\"", ErrInvalid)
+			return Status{}, fmt.Errorf("%w: the language is \"auto\" or a code like \"de\" or \"en\"", ErrInvalid)
 		}
 		c.Language = l
 	}
+	if p.DictationLanguages != nil {
+		languages := make([]string, 0, len(*p.DictationLanguages))
+		for _, value := range *p.DictationLanguages {
+			language := strings.ToLower(strings.TrimSpace(value))
+			if !langRx.MatchString(language) {
+				return Status{}, fmt.Errorf("%w: dictation_languages must contain language codes", ErrInvalid)
+			}
+			if !slices.Contains(languages, language) {
+				languages = append(languages, language)
+			}
+		}
+		c.DictationLanguages = languages
+	}
 	if p.Threads != nil {
 		if *p.Threads < 0 || *p.Threads > 64 {
-			return s.Status(), fmt.Errorf("%w: threads is 0 (automatic) to 64", ErrInvalid)
+			return Status{}, fmt.Errorf("%w: threads is 0 (automatic) to 64", ErrInvalid)
 		}
 		c.Threads = *p.Threads
 	}
@@ -334,10 +447,14 @@ func (s *Service) Configure(p SettingsPatch) (Status, error) {
 		v := *p.AutoTranscribe
 		c.AutoTranscribe = &v
 	}
-	if s.o.Save != nil {
-		if err := s.o.Save(c); err != nil {
-			return s.Status(), err
-		}
+	if p.IdleUnloadS != nil {
+		// No bound: config.json's voice.idle_unload_s never had one either (sidecar.go
+		// fwSpecFor treats <= 0 as the 300 s default; an owner who wants the worker resident
+		// sets it high).
+		c.IdleUnloadS = *p.IdleUnloadS
+	}
+	if err := s.commitVoiceSettings(c, p); err != nil {
+		return Status{}, err // never advertise readiness for a rejected candidate
 	}
 	s.publish(true)
 	return s.Status(), nil
@@ -397,17 +514,18 @@ type JobStatus struct {
 
 // Status is GET /api/voice and the data of the "voice.status" event.
 type Status struct {
-	Platform string        `json:"platform"`
-	Ready    bool          `json:"ready"`
-	Reason   string        `json:"reason,omitempty"` // not ready: why, and what to do
-	Engine   EngineStatus  `json:"engine"`
-	Models   []ModelStatus `json:"models"`
-	VAD      ModelStatus   `json:"vad"`
-	Settings Settings      `json:"settings"`
-	Job      *JobStatus    `json:"job,omitempty"`
-	Queued   int           `json:"queued"`
-	MemoryMB int           `json:"memory_mb,omitempty"` // this machine's RAM
-	Busy     bool          `json:"busy"`                // a download is running
+	Platform string         `json:"platform"`
+	Ready    bool           `json:"ready"`
+	Reason   string         `json:"reason,omitempty"` // not ready: why, and what to do
+	Engine   EngineStatus   `json:"engine"`
+	Models   []ModelStatus  `json:"models"`
+	VAD      ModelStatus    `json:"vad"`
+	Settings Settings       `json:"settings"`
+	Sidecar  *SidecarStatus `json:"sidecar,omitempty"` // voice.engine = faster-whisper: its worker
+	Job      *JobStatus     `json:"job,omitempty"`
+	Queued   int            `json:"queued"`
+	MemoryMB int            `json:"memory_mb,omitempty"` // this machine's RAM
+	Busy     bool           `json:"busy"`                // a download is running
 }
 
 // Status says what is installed, downloading and running.
@@ -419,8 +537,22 @@ func (s *Service) Status() Status {
 	if fi, err := os.Stat(s.enginePath()); err == nil {
 		st.Engine.Size = fi.Size()
 	}
+	if s.fwOn() {
+		sc := &SidecarStatus{Running: s.fw.running()}
+		spec, err := s.fwSpecNow()
+		sc.Python, sc.ModelDir = spec.Python, spec.Model
+		if sc.Ready = err == nil; err != nil {
+			sc.Reason = err.Error()
+		}
+		cpp, _ := s.cppReadiness()
+		sc.Fallback = cpp
+		st.Sidecar = sc
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if st.Sidecar != nil {
+		st.Sidecar.Step, st.Sidecar.Error = s.fwStep, s.dlErrors["sidecar"]
+	}
 	st.Engine.Downloading = copyProgress(s.downloads["engine"])
 	st.Engine.Error = s.dlErrors["engine"]
 	st.Engine.NeedsToken = s.needsToken
@@ -435,7 +567,7 @@ func (s *Service) Status() Status {
 		st.Models = append(st.Models, ms)
 	}
 	st.VAD = s.modelStatusLocked(VADModel)
-	st.Busy = len(s.downloads) > 0 || s.settingUp
+	st.Busy = len(s.downloads) > 0 || s.settingUp || s.fwStep != ""
 	st.Queued = len(s.queue)
 	if j := s.running; j != nil {
 		js := j.status
@@ -462,6 +594,28 @@ func (s *Service) readiness() (bool, string) {
 	if s.ViaPeer() != "" {
 		return true, ""
 	} // queue is available even while the peer is offline
+	if s.remoteURL() != "" {
+		return true, "" // Fae is reachable even while the local engine is not set up
+	}
+	return s.localReadiness()
+}
+
+func (s *Service) localReadiness() (bool, string) {
+	if s.fwOn() {
+		_, err := s.fwSpecNow()
+		if err == nil {
+			return true, ""
+		}
+		if ok, _ := s.cppReadiness(); ok {
+			return true, "" // whisper.cpp does the jobs until the worker is set up
+		}
+		return false, err.Error()
+	}
+	return s.cppReadiness()
+}
+
+// cppReadiness: whether whisper.cpp can run jobs, else why not.
+func (s *Service) cppReadiness() (bool, string) {
 	if engineAsset(s.o.GOOS, s.o.GOARCH) == "" {
 		return false, "Voice transcription is not available on this platform (" + s.platform() + ")."
 	}
@@ -511,14 +665,26 @@ func (s *Service) publish(force bool) {
 // ---- downloads
 
 // Setup downloads what is missing for the chosen model: the engine, the model and the voice
-// activity model, in the background. Status follows the progress.
-func (s *Service) Setup() (Status, error) {
+// activity model, in the background. Status follows the progress. It is what runs by itself
+// (a first recording that wants a transcript): it never sets up the faster-whisper worker,
+// which means running pip and fetching its models; that is SetupOwner, on the owner's request.
+func (s *Service) Setup() (Status, error) { return s.setup(false) }
+
+// SetupOwner is Setup on the owner's explicit request (Settings, `tmx voice setup`): it also
+// sets up the faster-whisper worker when that engine is chosen.
+func (s *Service) SetupOwner() (Status, error) { return s.setup(true) }
+
+func (s *Service) setup(owner bool) (Status, error) {
 	if s.ViaPeer() != "" {
 		return s.Status(), nil
 	}
-	if engineAsset(s.o.GOOS, s.o.GOARCH) == "" {
+	if engineAsset(s.o.GOOS, s.o.GOARCH) == "" && !s.fwOn() {
 		_, reason := s.readiness()
 		return s.Status(), fmt.Errorf("%w: %s", ErrNotSetUp, lowerFirst(reason))
+	}
+	if !owner && s.fwOn() && engineAsset(s.o.GOOS, s.o.GOARCH) == "" {
+		// Nothing this path may set up: the worker is the owner's to install.
+		return s.Status(), fmt.Errorf("%w: the faster-whisper worker is set up only on your request (Settings, Voice, or `tmx voice setup`)", ErrNotSetUp)
 	}
 	m, _ := FindModel(s.settings().Model)
 	s.mu.Lock()
@@ -527,7 +693,7 @@ func (s *Service) Setup() (Status, error) {
 		return s.Status(), nil
 	}
 	s.settingUp = true
-	for _, k := range []string{"engine", m.Name, VADModel.Name} {
+	for _, k := range []string{"engine", m.Name, VADModel.Name, "sidecar"} {
 		delete(s.dlErrors, k)
 	}
 	s.mu.Unlock()
@@ -540,6 +706,14 @@ func (s *Service) Setup() (Status, error) {
 			s.mu.Unlock()
 			s.publish(true)
 		}()
+		if s.fwOn() {
+			if owner {
+				s.setupSidecar(s.ctx) // then whisper.cpp, its fallback
+			}
+			if engineAsset(s.o.GOOS, s.o.GOARCH) == "" {
+				return
+			}
+		}
 		if !s.engineInstalled() {
 			if err := s.runDownload("engine", s.downloadEngine); err != nil {
 				return
@@ -737,6 +911,12 @@ type Result struct {
 	Text     string                    `json:"text"`
 	Language string                    `json:"language"`
 	Segments []model.TranscriptSegment `json:"segments"`
+	// Held: the faster-whisper worker is unsure of this text (a near-silent recording, an
+	// invented caption): show it for review, never send it by itself. HeldReason names why.
+	Held       bool   `json:"held,omitempty"`
+	HeldReason string `json:"held_reason,omitempty"`
+	// Note: shown alongside the (trustworthy) text, e.g. "Fae unreachable, used local".
+	Note string `json:"note,omitempty"`
 }
 
 type job struct {
@@ -871,7 +1051,9 @@ func (s *Service) run(j *job) {
 	}
 	s.publish(true)
 
+	began := time.Now()
 	r, modelName, err := s.transcribe(ctx, j)
+	s.logJob(j, r, modelName, time.Since(began), err)
 	if j.done != nil {
 		answerErr := err
 		if j.peer != "" && errors.Is(err, ErrPending) {
@@ -930,19 +1112,64 @@ func (s *Service) fail(t model.Transcript, why string) {
 	}
 }
 
-// transcribe runs the engine on a job's audio (part by part for a long WAV), in a heavy slot.
+// transcribe runs the engine on a job's audio: Fae (voice.remote_url) when configured, falling
+// back to the local engine for that one job on a connect failure, 5xx or timeout; otherwise the
+// local engine directly.
 func (s *Service) transcribe(ctx context.Context, j *job) (Result, string, error) {
 	if j.peer != "" {
 		return s.peerTranscribe(ctx, j)
 	}
 	set := s.settings()
-	m, _ := FindModel(set.Model)
-	if ready, _ := s.readiness(); !ready {
-		return Result{}, m.Name, s.notSetUp()
-	}
 	lang := j.language
 	if lang == "" {
 		lang = set.Language
+	}
+	if set.RemoteURL != "" {
+		// rctx is a child of ctx, scoped to this one Fae request: its deadline firing cancels
+		// only rctx, so ctx (the job's, cancelable only by the caller going away or the daemon
+		// stopping) is still live for localTranscribe below.
+		rctx, cancel := context.WithTimeout(ctx, timeoutFor(estimatedDuration(j)))
+		r, name, err := s.remoteTranscribe(rctx, set.RemoteURL, set.RemoteModel, j, lang)
+		cancel()
+		if err == nil {
+			return r, name, nil
+		}
+		var re errRemote
+		if !errors.As(err, &re) {
+			return Result{}, name, err
+		}
+		s.log.Warn("voice: Fae unreachable, the local worker does this job", "err", re.msg)
+		r, lname, lerr := s.localTranscribe(ctx, j, set, lang)
+		if lerr == nil {
+			r.Note = "Fae unreachable, used local"
+		}
+		return r, lname, lerr
+	}
+	return s.localTranscribe(ctx, j, set, lang)
+}
+
+// estimatedDuration is the best guess at a job's audio length before it is decoded: the WAV
+// header when the file is one, else what the job already knew, else (MP3, FLAC, Ogg: at least
+// 4 KB a second, 32 kbit/s) a guess from its size.
+func estimatedDuration(j *job) time.Duration {
+	dur := j.duration
+	if w, err := readWAV(j.audio); err == nil {
+		dur = w.Duration()
+	}
+	if dur <= 0 {
+		if st, err := os.Stat(j.audio); err == nil {
+			dur = time.Duration(st.Size()/4000) * time.Second
+		}
+	}
+	return dur
+}
+
+// localTranscribe runs the local engine (part by part for a long WAV), in a heavy slot:
+// faster-whisper when voice.engine asks for it, else whisper.cpp.
+func (s *Service) localTranscribe(ctx context.Context, j *job, set Settings, lang string) (Result, string, error) {
+	m, _ := FindModel(set.Model)
+	if ready, _ := s.localReadiness(); !ready {
+		return Result{}, m.Name, s.notSetUp()
 	}
 	vad := ""
 	if set.VAD && s.modelInstalled(VADModel) {
@@ -955,24 +1182,31 @@ func (s *Service) transcribe(ctx context.Context, j *job) (Result, string, error
 		return Result{}, m.Name, err
 	}
 
+	if s.fwOn() {
+		r, name, err := s.fwTranscribe(ctx, j, lang)
+		if err == nil {
+			return r, name, nil
+		}
+		var we errWorker
+		if !errors.As(err, &we) {
+			return Result{}, name, err // the caller went away, or the daemon stops
+		}
+		if ok, _ := s.cppReadiness(); !ok {
+			return Result{}, name, err
+		}
+		s.log.Warn("voice: the faster-whisper worker failed, whisper.cpp does this job", "err", err)
+	}
+
 	work, err := os.MkdirTemp(s.tmpDir(), "job-")
 	if err != nil {
 		return Result{}, m.Name, err
 	}
 	defer os.RemoveAll(work)
 	parts := []part{{Path: j.audio}}
-	dur := j.duration
-	if w, err := readWAV(j.audio); err == nil {
-		dur = w.Duration()
-		if w.pcm16() && dur > partLength+partLength/2 {
-			if parts, err = splitWAV(j.audio, w, partLength, work); err != nil {
-				return Result{}, m.Name, fmt.Errorf("cutting the audio into parts: %w", err)
-			}
-		}
-	}
-	if dur <= 0 { // MP3, FLAC, Ogg: at least 4 KB a second (32 kbit/s), so this bounds it
-		if st, err := os.Stat(j.audio); err == nil {
-			dur = time.Duration(st.Size()/4000) * time.Second
+	dur := estimatedDuration(j)
+	if w, err := readWAV(j.audio); err == nil && w.pcm16() && dur > partLength+partLength/2 {
+		if parts, err = splitWAV(j.audio, w, partLength, work); err != nil {
+			return Result{}, m.Name, fmt.Errorf("cutting the audio into parts: %w", err)
 		}
 	}
 	each := dur
@@ -1148,16 +1382,54 @@ func (s *Service) inRecordings(p string) bool {
 	return err == nil && st.Mode().IsRegular()
 }
 
-// Dictate transcribes a short WAV (at most MaxDictation) and returns the text; nothing is
-// stored. A configured fallback can handle a busy/unavailable local engine; otherwise
+// Dictate transcribes a short WAV (at most MaxDictation) and returns the text; no audio is retained.
+// A configured fallback handles a busy/unavailable engine; otherwise
 // it waits for its turn (dictation goes first) until ctx ends.
 func (s *Service) Dictate(ctx context.Context, wav []byte, language string) (Result, error) {
 	return s.DictateWithHosts(ctx, wav, language, s.o.Hosts)
 }
 
-// DictateWithHosts supplies a request-scoped configured-host adapter. Nil forces local
-// execution, including for forwarded requests, so a fallback cannot loop between hosts.
-func (s *Service) DictateWithHosts(ctx context.Context, wav []byte, language string, hosts ConfiguredHosts) (Result, error) {
+// DictateWithHosts supplies a request-scoped configured-host fallback adapter.
+// Nil disables that fallback. LocalOnly prevents all onward forwarding.
+func (s *Service) DictateWithHosts(ctx context.Context, wav []byte, language string, hosts ConfiguredHosts) (result Result, err error) {
+	defer func() {
+		if err != nil || result.Held {
+			w, _ := parseWAV(bytes.NewReader(wav), int64(len(wav)))
+			reason := result.HeldReason
+			if err != nil {
+				reason = dictationRejectReason(err)
+			}
+			s.logDictationRejected(wav, w, reason, result.Language, len([]rune(result.Text)))
+		}
+	}()
+	language = strings.ToLower(strings.TrimSpace(language))
+	if language == "" {
+		language = s.settings().Language
+	}
+	// Apply the same policy before returning from any local or remote dictation route.
+	// A LocalOnly receiver leaves language decisions to its forwarding caller, avoiding
+	// two independent auto-detection retries with different host language preferences.
+	result, err = s.dictateWithHostsOnce(ctx, wav, language, hosts)
+	allowed := dictationLanguages(s.o.Settings())
+	if err != nil || ctx.Value(localOnlyKey{}) == true || (language != "" && language != "auto") || result.Language == "" || slices.Contains(allowed, result.Language) {
+		return result, err
+	}
+	s.log.Info("voice: retrying dictation in an allowed language", "detected", result.Language, "retry", allowed[0])
+	second, retryErr := s.dictateWithHostsOnce(ctx, wav, allowed[0], hosts)
+	if retryErr != nil {
+		if ctx.Err() != nil {
+			return Result{}, ctx.Err()
+		}
+		result.Held, result.HeldReason = true, "unexpected_language"
+		return result, nil
+	}
+	if second.Language != "" && !slices.Contains(allowed, second.Language) {
+		second.Held, second.HeldReason = true, "unexpected_language"
+	}
+	return second, nil
+}
+
+func (s *Service) dictateWithHostsOnce(ctx context.Context, wav []byte, language string, hosts ConfiguredHosts) (Result, error) {
 	w, err := parseWAV(bytes.NewReader(wav), int64(len(wav)))
 	if err != nil {
 		return Result{}, fmt.Errorf("%w: the recording is %v", ErrInvalid, err)
@@ -1173,7 +1445,7 @@ func (s *Service) DictateWithHosts(ctx context.Context, wav []byte, language str
 		return Result{}, ErrNoSpeech
 	}
 	if s.ViaPeer() != "" {
-		return s.spoolPeer(ctx, bytes.NewReader(wav), "wav", language)
+		return s.dictatePeer(ctx, wav, language)
 	}
 	if res, used, err := s.dictationFallback(ctx, wav, w, language, hosts); used {
 		return res, err
@@ -1197,15 +1469,33 @@ func (s *Service) DictateWithHosts(ctx context.Context, wav []byte, language str
 		return Result{}, err
 	}
 	res, err := s.direct(ctx, &job{source: "dictation", audio: f.Name(), removeAudio: true, language: language, prio: 0, label: "dictation", duration: w.Duration()})
+	if err == nil {
+		res.Text = Tidy(res.Text, s.o.Settings()) // tidy.go: the cleanup pass, for every dictation
+	}
 	if err == nil && strings.TrimSpace(res.Text) == "" {
-		return Result{}, ErrNoSpeech
+		return res, ErrNoSpeech
 	}
 	return res, err
 }
 
-// TranscribeFile transcribes a WAV, MP3, FLAC or Ogg file read from r (at most MaxFileBytes);
+// TranscribeFile transcribes a WAV, MP3, FLAC, Ogg, M4A or AAC file read from r (at most MaxFileBytes);
 // nothing is stored. It waits for its turn until ctx ends.
 func (s *Service) TranscribeFile(ctx context.Context, r io.Reader, language string) (Result, error) {
+	return s.transcribeFile(ctx, r, language, false)
+}
+
+// TranscribeLocalFile uses the shared local queue/worker, memory budget and idle
+// unload. WhatsApp attachments never use peer or configured cloud fallbacks.
+func (s *Service) TranscribeLocalFile(ctx context.Context, r io.Reader, language string) (Result, error) {
+	return s.transcribeFile(ctx, r, language, true)
+}
+
+func (s *Service) transcribeFile(ctx context.Context, r io.Reader, language string, localOnly bool) (Result, error) {
+	if localOnly {
+		if ready, why := s.localReadiness(); !ready {
+			return Result{}, fmt.Errorf("local voice unavailable: %s", why)
+		}
+	}
 	if ready, _ := s.readiness(); !ready {
 		return Result{}, s.notSetUp()
 	}
@@ -1217,9 +1507,9 @@ func (s *Service) TranscribeFile(ctx context.Context, r io.Reader, language stri
 	head = head[:n]
 	kind := audioKind(head)
 	if kind == "" {
-		return Result{}, fmt.Errorf("%w: that is not a WAV, MP3, FLAC or Ogg file", ErrInvalid)
+		return Result{}, fmt.Errorf("%w: that is not a WAV, MP3, FLAC, Ogg, M4A or AAC file", ErrInvalid)
 	}
-	if s.ViaPeer() != "" {
+	if !localOnly && s.ViaPeer() != "" {
 		return s.spoolPeer(ctx, io.MultiReader(bytes.NewReader(head), r), kind, language)
 	}
 	if err := os.MkdirAll(s.tmpDir(), 0o700); err != nil {
@@ -1244,7 +1534,15 @@ func (s *Service) TranscribeFile(ctx context.Context, r io.Reader, language stri
 		os.Remove(f.Name())
 		return Result{}, err
 	}
-	return s.direct(ctx, &job{source: "file", audio: f.Name(), removeAudio: true, language: language, prio: 1, label: "a file"})
+	audio := f.Name()
+	if kind == "m4a" || kind == "aac" {
+		audio, err = s.convertAAC(ctx, f.Name())
+		os.Remove(f.Name())
+		if err != nil {
+			return Result{}, err
+		}
+	}
+	return s.direct(ctx, &job{source: "file", audio: audio, removeAudio: true, language: language, prio: 1, label: "a file"})
 }
 
 // direct queues a job somebody waits for and returns its result.

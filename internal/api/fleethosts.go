@@ -47,11 +47,13 @@ func (s *Server) fleetHostRoutes(mux *http.ServeMux) {
 // loopback daemon (CPU/mem/disk/head activity, all precise - same process family, same model
 // package); a "peer" is a real other machine (DESIGN.md "Peer-to-peer network" / Python fleet
 // interop) - only what GET /api/sessions already carries (ONE FLEET, 3 Nov: Python peers are in
-// scope too, as full rows), so a peer row never has CPU/mem/disk and its Running/Paused/NeedsYou
-// counts are a best-effort read of each session's display state string, not the precise
-// model.AgentState enum a same-process host gets.
+// scope too, as full rows): its agents, and its own machine reading when it sends one ("system":
+// CPU, memory, disk; Go and Python machines both do). A peer's Running/Paused/NeedsYou counts
+// are a best-effort read of each session's display state string, not the precise
+// model.AgentState enum a same-process host gets. "self" is this machine, only ever in the
+// answer's own "self" field (the Machines bar shows it first), never in "hosts".
 type HostSummary struct {
-	Kind       string  `json:"kind"` // "host" or "peer"
+	Kind       string  `json:"kind"` // "host", "peer" or "self"
 	Name       string  `json:"name"`
 	Port       int     `json:"port,omitempty"` // "host" only
 	Reachable  bool    `json:"reachable"`
@@ -72,6 +74,19 @@ type HostSummary struct {
 	// token (false = configured but never completed the handshake, e.g. a stale config.json
 	// entry) - it can be Reachable without being Paired, or the reverse if a token just rotated.
 	Paired bool `json:"paired,omitempty"`
+	// Measured says CPU, MemFreeMB and MemTotalMB are a real reading (a CPU of 0 % is one): a
+	// "peer" or "self" row without it has no numbers to show. DiskTotalGB > 0 says the same of
+	// the disk. Version is that machine's tmx version; Seen (Unix ms) its last good answer, kept
+	// while it is unreachable; DiskBusy that its disk guard is holding work back now.
+	Measured    bool    `json:"measured,omitempty"`
+	MemTotalMB  int64   `json:"mem_total_mb,omitempty"`
+	DiskTotalGB float64 `json:"disk_total_gb,omitempty"`
+	DiskBusy    bool    `json:"disk_busy,omitempty"`
+	Version     string  `json:"version,omitempty"`
+	// Daemon is "go" for a Go daemon (this machine, a loopback host, a Go peer) and empty for a
+	// Python peer: the two take different launch bodies.
+	Daemon string `json:"daemon,omitempty"`
+	Seen   int64  `json:"seen,omitempty"`
 }
 
 func (s *Server) fleetHosts(w http.ResponseWriter, r *http.Request) {
@@ -95,11 +110,48 @@ func (s *Server) fleetHosts(w http.ResponseWriter, r *http.Request) {
 			out = append(out, peerHostSummary(st))
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"hosts": out})
+	writeJSON(w, http.StatusOK, map[string]any{"hosts": out, "self": s.selfSummary()})
+}
+
+// selfSummary is this machine's own row, in the same shape as the others.
+func (s *Server) selfSummary() HostSummary {
+	out := HostSummary{Kind: "self", Name: s.f.Machine(), Machine: s.f.Machine(), Reachable: true, Version: s.f.Version(), Daemon: peers.DaemonGo}
+	if s.peers != nil {
+		out.Name = s.peers.Machine() // the fleet name the peers know this machine by
+	}
+	snap, err := s.f.Snapshot()
+	if err != nil {
+		out.Error = clampText(err.Error(), 200)
+		return out
+	}
+	out.Projects, out.Agents, out.NeedsYou = len(snap.Projects), len(snap.Agents), len(snap.Approvals)
+	for _, a := range snap.Agents {
+		switch a.State {
+		case model.StateWorking, model.StateWaiting, model.StateStarting:
+			out.Running++
+		case model.StatePaused:
+			out.Paused++
+		}
+	}
+	out.applySystem(s.peerSystem())
+	return out
+}
+
+// applySystem copies a machine reading (already checked: peers.Status, or this machine's own)
+// into the row.
+func (h *HostSummary) applySystem(sys peers.System) {
+	if sys.CPUPercent != nil && sys.Memory != nil {
+		h.Measured, h.CPU = true, *sys.CPUPercent
+		h.MemFreeMB, h.MemTotalMB = sys.Memory.AvailableMB, sys.Memory.TotalMB
+	}
+	if sys.DiskFreeMB != nil && sys.DiskTotalMB != nil {
+		h.DiskFreeGB, h.DiskTotalGB = float64(*sys.DiskFreeMB)/1024, float64(*sys.DiskTotalMB)/1024
+	}
+	h.DiskBusy = sys.IOOverloaded
 }
 
 func (s *Server) fetchHost(ctx context.Context, h config.Host) HostSummary {
-	out := HostSummary{Kind: "host", Name: h.Name, Port: h.Port}
+	out := HostSummary{Kind: "host", Name: h.Name, Port: h.Port, Daemon: peers.DaemonGo}
 	if !config.ValidHostName(h.Name) {
 		out.Error = "invalid host name"
 		return out
@@ -150,16 +202,21 @@ func (s *Server) fetchHost(ctx context.Context, h config.Host) HostSummary {
 	var res struct {
 		Sample struct {
 			Machine struct {
-				CPU      float64 `json:"cpu"`
-				MemFree  int64   `json:"mem_free"`
-				DiskFree int64   `json:"disk_free"`
+				CPU       float64 `json:"cpu"`
+				MemFree   int64   `json:"mem_free"`
+				MemTotal  int64   `json:"mem_total"`
+				DiskFree  int64   `json:"disk_free"`
+				DiskTotal int64   `json:"disk_total"`
 			} `json:"machine"`
 		} `json:"sample"`
 	}
 	if err := getHostJSON(ctx, base+"/api/resources", tok, &res); err == nil {
+		out.Measured = true
 		out.CPU = res.Sample.Machine.CPU
 		out.MemFreeMB = res.Sample.Machine.MemFree / (1 << 20)
+		out.MemTotalMB = res.Sample.Machine.MemTotal / (1 << 20)
 		out.DiskFreeGB = float64(res.Sample.Machine.DiskFree) / (1 << 30)
+		out.DiskTotalGB = float64(res.Sample.Machine.DiskTotal) / (1 << 30)
 	}
 	return out
 }
@@ -172,9 +229,13 @@ func (s *Server) fetchHost(ctx context.Context, h config.Host) HostSummary {
 // answers its own detector's words) - a best-effort read, not the precise model.AgentState enum
 // a same-process host gets from its own Snapshot.
 func peerHostSummary(st peers.Status) HostSummary {
-	out := HostSummary{Kind: "peer", Name: st.Name, Machine: st.Name, Reachable: st.OK, Paired: st.Paired, Error: st.Error}
+	out := HostSummary{Kind: "peer", Name: st.Name, Machine: st.Name, Reachable: st.OK, Paired: st.Paired, Error: st.Error,
+		Version: st.Version, Seen: st.Seen, Daemon: st.Daemon}
 	if !st.OK {
-		return out
+		return out // numbers of a machine that stopped answering would read as live
+	}
+	if st.System != nil {
+		out.applySystem(*st.System)
 	}
 	out.Agents = len(st.Sessions)
 	for _, sess := range st.Sessions {

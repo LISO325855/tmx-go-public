@@ -45,8 +45,8 @@ func (s *Service) tellHead(m model.WaMessage) {
 		return
 	}
 	head := s.o.Fleet.HeadID()
-	if head == "" || s.CanRead(head) != nil {
-		return // the head may not read WhatsApp: it gets no mail about it either
+	if head == "" || s.CanRead(head) != nil || !s.CanReadChat(head, m.ChatJID) {
+		return // the head may not read WhatsApp, or not this chat (private): no mail about it either
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -149,6 +149,9 @@ func Describe(m model.WaMessage) string {
 		tag = "[a kind of message tmx doesn't show]"
 	}
 	text := firstNonEmpty(m.Text, m.Caption)
+	if (m.Type == model.WaVoice || m.Type == model.WaAudio) && m.Media != nil && m.Media.Transcript != "" {
+		text = m.Media.Transcript
+	}
 	switch {
 	case tag == "":
 		return text

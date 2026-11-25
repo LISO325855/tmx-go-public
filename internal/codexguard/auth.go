@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/blackcode-ch/tmx-go/internal/config"
 )
 
 // SyncOwnerAuth copies only auth.json into the isolated home, never the owner's
@@ -27,22 +29,8 @@ func SyncOwnerAuth(sourceHome, destHome string) error {
 	if err != nil || !json.Valid(b) {
 		return fmt.Errorf("Codex owner login could not be read")
 	}
-	f, err := os.CreateTemp(destHome, ".auth-*.tmp")
-	if err != nil {
-		return fmt.Errorf("cannot prepare isolated Codex login")
-	}
-	temp := f.Name()
-	defer os.Remove(temp)
-	_, err = f.Write(b)
-	closeErr := f.Close()
-	if err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		return fmt.Errorf("cannot write isolated Codex login")
-	}
-	if err = os.Rename(temp, filepath.Join(destHome, "auth.json")); err != nil {
-		return fmt.Errorf("cannot install isolated Codex login")
+	if err := config.WriteSecretFile(filepath.Join(destHome, "auth.json"), b); err != nil {
+		return fmt.Errorf("cannot install isolated Codex login: %w", err)
 	}
 	return nil
 }

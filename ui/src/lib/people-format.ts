@@ -48,6 +48,22 @@ export function forPage(all: Person[], page: "people" | "clients"): Person[] {
   return keep.sort((a, b) => displayName(a).localeCompare(displayName(b)));
 }
 
+/**
+ * Classic (the Python dashboard): People is one entry with two tabs, "Team" and "Clients &
+ * partners". Team is the people of kind team; clients and external partners are the other tab
+ * (the default dashboard lists partners with the team: forPage). Addresses stay #/people (Team)
+ * and #/clients (Clients & partners).
+ */
+export const PEOPLE_TABS: { page: "people" | "clients"; label: string }[] = [
+  { page: "people", label: "Team" },
+  { page: "clients", label: "Clients & partners" },
+];
+
+export function forClassicTab(all: Person[], page: "people" | "clients"): Person[] {
+  const keep = all.filter((p) => (page === "clients" ? p.kind === "client" || p.kind === "external" : p.kind !== "client" && p.kind !== "external"));
+  return keep.sort((a, b) => displayName(a).localeCompare(displayName(b)));
+}
+
 export function displayName(p: Pick<Person, "key" | "name">): string {
   return p.name?.trim() || p.key;
 }

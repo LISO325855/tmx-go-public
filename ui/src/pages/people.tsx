@@ -1,3 +1,4 @@
+import { useClassic } from "@/hooks/use-classic";
 // People, Clients and Promises (#/people, #/clients, #/promises; docs/PEOPLE_PROMISES.md).
 // Phone-first: one column, base text 18 px, every tap target at least 48 px high.
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
@@ -6,7 +7,9 @@ import { PageBody, PageHeader, PageTitle } from "@/components/page";
 import { peopleApi, type PersonEdit } from "@/lib/people";
 import {
   displayName,
+  forClassicTab,
   forPage,
+  PEOPLE_TABS,
   groupPromises,
   isoDay,
   keyFromName,
@@ -17,6 +20,7 @@ import {
   type Promise_,
   type Reminder,
 } from "@/lib/people-format";
+import { href, paths } from "@/lib/router";
 import { cn } from "@/lib/utils";
 
 const TAP = "min-h-12 rounded-lg px-4 text-[18px] font-medium";
@@ -53,12 +57,18 @@ function fail(e: unknown) {
   toast.error(e instanceof Error ? e.message : String(e));
 }
 
+/** The pages' column: phone-first sizes; under classic the normal scale from md up. */
+function bodyClass(classic: boolean): string {
+  return cn("flex flex-col gap-4 pb-16 text-[18px] leading-relaxed", classic && "md:text-sm md:[&_div]:text-sm md:[&_label]:text-sm md:[&_button]:text-sm md:[&_input]:text-sm md:[&_select]:text-sm md:[&_textarea]:text-sm md:[&_h2]:text-base md:[&_h3]:text-sm md:[&_span]:text-sm md:[&_button]:min-h-[34px] md:[&_input]:min-h-[34px] md:[&_select]:min-h-[34px]");
+}
+
 function Shell({ title, children }: { title: string; children: ReactNode }) {
+  const classic = useClassic();
   return (
     <>
       <PageHeader><PageTitle>{title}</PageTitle></PageHeader>
-      <PageBody width="max-w-xl">
-        <div className="flex flex-col gap-4 pb-16 text-[18px] leading-relaxed">{children}</div>
+      <PageBody width={classic ? "max-w-[65rem]" : "max-w-xl"}>
+        <div className={bodyClass(classic)}>{children}</div>
       </PageBody>
     </>
   );
@@ -70,8 +80,10 @@ export function PeopleBookPage({ page }: { page: "people" | "clients" }) {
   const [open, setOpen] = useState<string | null>(null); // a key, or "new"
   const load = useCallback(() => peopleApi.list().then(setAll, fail), []);
   useEffect(() => void load(), [load]);
-  const list = useMemo(() => forPage(all ?? [], page), [all, page]);
-  const title = page === "clients" ? "Clients" : "People";
+  const classic = useClassic();
+  // Classic: one "People" entry with the tabs Team | Clients & partners, as in Python.
+  const list = useMemo(() => (classic ? forClassicTab(all ?? [], page) : forPage(all ?? [], page)), [all, page, classic]);
+  const title = classic ? "People" : page === "clients" ? "Clients" : "People";
 
   if (open) {
     const person = list.find((p) => p.key === open);
@@ -84,6 +96,23 @@ export function PeopleBookPage({ page }: { page: "people" | "clients" }) {
   }
   return (
     <Shell title={title}>
+      {classic && (
+        <nav className="flex gap-1.5" aria-label="People" data-people-tabs>
+          {PEOPLE_TABS.map((t) => (
+            <a
+              key={t.page}
+              href={href(t.page === "clients" ? paths.clients() : paths.people())}
+              aria-current={t.page === page ? "page" : undefined}
+              className={cn(
+                "inline-flex h-8 items-center rounded-full border px-3.5 outline-none transition-colors duration-150 focus-visible:ring-2 focus-visible:ring-ring",
+                t.page === page ? "border-brand/50 bg-brand-soft font-medium text-foreground" : "text-muted-foreground hover:bg-muted/50 hover:text-foreground",
+              )}
+            >
+              {t.label}
+            </a>
+          ))}
+        </nav>
+      )}
       <Btn kind="primary" onClick={() => setOpen("new")}>{page === "clients" ? "Add a client" : "Add a person"}</Btn>
       {all === null ? <p className="text-muted-foreground">Loading…</p> :
         list.length === 0 ? <p className="text-muted-foreground">No one yet.</p> :
@@ -183,9 +212,21 @@ function PersonForm({ person, defaultKind, onDone }: { person?: Person; defaultK
 }
 
 function PersonPromises({ person }: { person: Person }) {
+  const classic = useClassic();
   const [list, setList] = useState<Promise_[] | null>(null);
   const load = useCallback(() => peopleApi.promises(person.key).then(setList, fail), [person.key]);
   useEffect(() => void load(), [load]);
+  // Classic (the owner, 17 Nov 18:55; tmx-lead 19:02): promises are no longer made anywhere. A
+  // person's existing ones stay listed, read-only; with none there is no section at all.
+  if (classic) {
+    if (!list?.length) return null;
+    return (
+      <section className="flex flex-col gap-3 border-t pt-4" data-person-promises>
+        <h2 className="text-[20px] font-semibold">Old promises</h2>
+        <PromiseList list={list} people={[person]} onChange={() => {}} readOnly />
+      </section>
+    );
+  }
   return (
     <section className="flex flex-col gap-3 border-t pt-4">
       <h2 className="text-[20px] font-semibold">Promises</h2>
@@ -231,7 +272,8 @@ function NewPromise({ people, onAdded }: { people: Person[]; onAdded: () => void
   );
 }
 
-function PromiseList({ list, people, onChange }: { list: Promise_[] | null; people: Person[]; onChange: () => void }) {
+/** readOnly: the records as they are, without Done / Drop / Reopen (the classic "Old promises" page). */
+function PromiseList({ list, people, onChange, readOnly }: { list: Promise_[] | null; people: Person[]; onChange: () => void; readOnly?: boolean }) {
   const today = isoDay(new Date());
   const names = useMemo(() => new Map(people.map((p) => [p.key, displayName(p)])), [people]);
   if (list === null) return <p className="text-muted-foreground">Loading…</p>;
@@ -258,7 +300,9 @@ function PromiseList({ list, people, onChange }: { list: Promise_[] | null; peop
                     {[names.get(p.person_key) ?? p.person_key, p.due && `due ${p.due}`, p.owner && `owner ${p.owner}`].filter(Boolean).join(" · ")}
                   </div>
                 </div>
-                {p.status === "open" ? (
+                {readOnly ? (
+                  p.status !== "open" && <div className="text-muted-foreground">{p.status}</div>
+                ) : p.status === "open" ? (
                   <div className="grid grid-cols-2 gap-3">
                     <Btn kind="primary" onClick={() => void set(p.id, "done")}>Done</Btn>
                     <Btn onClick={() => void set(p.id, "dropped")}>Drop</Btn>
@@ -277,6 +321,42 @@ function PromiseList({ list, people, onChange }: { list: Promise_[] | null; peop
 
 /** Promises across everyone, then the pending reminders. */
 export function PromisesPage() {
+  return (
+    <Shell title="Promises">
+      <PromisesContent />
+    </Shell>
+  );
+}
+
+/**
+ * Classic (the owner, 17 Nov 18:55: "It's completely replaced by matrix… promises is basically
+ * useless… It can be removed from that main menu on the side"): Promises is no longer a place.
+ * The records are not deleted: this page keeps them readable until he decides. It is reached
+ * from a small link at the bottom of the Matrix. Nothing can be added or changed here; a
+ * reminder that is still pending can be cancelled, so that nothing fires out of sight.
+ */
+export function OldPromisesPage() {
+  const [people, setPeople] = useState<Person[]>([]);
+  const [list, setList] = useState<Promise_[] | null>(null);
+  useEffect(() => {
+    peopleApi.list().then(setPeople, fail);
+    peopleApi.promises().then(setList, fail);
+  }, []);
+  return (
+    <Shell title="Old promises">
+      <p className="text-muted-foreground" data-old-promises>
+        Promises are no longer kept here: the Matrix has taken their place. These are the ones recorded before, to read.{" "}
+        <a className="text-brand hover:underline" href={href(paths.matrix())}>
+          Back to the Matrix
+        </a>
+      </p>
+      <PromiseList list={list} people={people} onChange={() => {}} readOnly />
+      <Reminders readOnly />
+    </Shell>
+  );
+}
+
+function PromisesContent() {
   const [people, setPeople] = useState<Person[]>([]);
   const [list, setList] = useState<Promise_[] | null>(null);
   const load = useCallback(() => {
@@ -285,16 +365,18 @@ export function PromisesPage() {
   }, []);
   useEffect(() => void load(), [load]);
   return (
-    <Shell title="Promises">
+    <>
       {people.length > 0 ? <NewPromise people={people} onAdded={load} /> :
         <p className="text-muted-foreground">Add someone under People or Clients first.</p>}
       <PromiseList list={list} people={people} onChange={load} />
       <Reminders />
-    </Shell>
+    </>
   );
 }
 
-function Reminders() {
+/** readOnly: only what is still pending, each with its Cancel; no form, and nothing at all when none is pending. */
+function Reminders({ readOnly }: { readOnly?: boolean } = {}) {
+  const classic = useClassic();
   const [list, setList] = useState<Reminder[] | null>(null);
   const [text, setText] = useState("");
   const [when, setWhen] = useState("");
@@ -322,15 +404,16 @@ function Reminders() {
     }
   };
   const now = Date.now();
+  if (readOnly && !list?.length) return null;
   return (
     <section className="flex flex-col gap-3 border-t pt-4">
       <h2 className="text-[20px] font-semibold">Reminders</h2>
-      <p className="text-muted-foreground">Sent to the head as a message at the time you choose, even if tmx restarts in between.</p>
-      <div className="flex flex-col gap-3 rounded-xl border bg-card p-4">
+      <p className="text-muted-foreground">{classic ? "Sent to the Architect as a message at the time you choose, even if tmx restarts in between." : "Sent to the head as a message at the time you choose, even if tmx restarts in between."}</p>
+      {!readOnly && <div className="flex flex-col gap-3 rounded-xl border bg-card p-4">
         <Field label="Remind about"><input className={FIELD} value={text} onChange={(e) => setText(e.target.value)} /></Field>
         <Field label="When (30m, 2h, 3d or 2026-11-09 14:30)"><input className={FIELD} value={when} onChange={(e) => setWhen(e.target.value)} autoCapitalize="none" /></Field>
         <Btn kind="primary" onClick={() => void add()}>Set reminder</Btn>
-      </div>
+      </div>}
       {list === null ? <p className="text-muted-foreground">Loading…</p> :
         list.length === 0 ? <p className="text-muted-foreground">Nothing scheduled.</p> :
         <ul className="flex flex-col gap-3">

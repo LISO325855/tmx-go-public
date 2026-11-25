@@ -95,7 +95,8 @@ func (f *Fleet) PostTask(c Caller, req TaskRequest) (model.TaskEnvelope, error) 
 		f.mu.Unlock()
 		return empty, err
 	}
-	if len(active) >= 256 || n >= 100000 {
+	// Ceilings against a runaway filling the disk (256 active and 100000 in all until 17 Nov).
+	if len(active) >= 25600 || n >= 10000000 {
 		f.mu.Unlock()
 		return empty, errf(KindTooMany, "task receipt capacity reached; existing receipts are retained")
 	}
@@ -106,7 +107,7 @@ func (f *Fleet) PostTask(c Caller, req TaskRequest) (model.TaskEnvelope, error) 
 	if sender == "companion@"+local {
 		from = model.CompanionParty
 	}
-	m := model.Message{ID: req.ID, From: from, To: r.a.ID, Body: req.Body, State: model.MsgQueued, CreatedAt: model.Now(), Receipt: "queued", ReceiptAt: model.Now(), ThreadID: model.GeneralThread}
+	m := model.Message{ID: req.ID, From: from, To: r.a.ID, Body: req.Body, Urgent: req.Urgent, State: model.MsgQueued, CreatedAt: model.Now(), Receipt: "queued", ReceiptAt: model.Now(), ThreadID: model.GeneralThread}
 	if err := f.checkLimitsLocked(m); err != nil {
 		f.mu.Unlock()
 		return empty, err
@@ -118,7 +119,7 @@ func (f *Fleet) PostTask(c Caller, req TaskRequest) (model.TaskEnvelope, error) 
 	f.refreshQueuedLocked(r)
 	f.bus.Publish(model.BusEvent{Type: model.EvMessageCreated, AgentID: r.a.ID, Data: m})
 	f.mu.Unlock()
-	f.tryDeliver(r.a.ID)
+	f.deliverQueued(m.To, priorityMail(m))
 	return f.GetTask(c, req.ID)
 }
 

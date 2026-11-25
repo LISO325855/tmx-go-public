@@ -1,3 +1,6 @@
 # Vite preserves HTML line endings and copies public assets verbatim. Keep UI
 # text identical on Windows (including core.autocrlf=true) and Linux checkouts.
 ui/** text=auto eol=lf
+
+# Forge operator scripts are packaged from the private checkout only.
+ops/sat11-install export-ignore

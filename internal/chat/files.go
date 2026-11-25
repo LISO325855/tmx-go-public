@@ -26,8 +26,10 @@ import (
 // p2p /tmx/file/1.0.0, check the checksum and keep it under FilesDir. An install answers a
 // file request only from a current member of that chat, and only for files sent in it.
 const (
-	MaxFileBytes       = 25 << 20
-	MaxFilesPerMessage = 10
+	// 25 MB and 10 files until 17 Nov. A file is held in memory while it is checked, so this is
+	// not set further out; an install older than that still refuses more when it arrives there.
+	MaxFileBytes       = 100 << 20
+	MaxFilesPerMessage = 100
 	maxFetchSources    = 5                // the author plus up to four other members
 	fetchTimeout       = 10 * time.Minute // one download attempt from one member
 	fetchRetryMin      = 30 * time.Second

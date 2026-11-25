@@ -292,11 +292,14 @@ func companionConnect(e *env, args []string) error {
 	if err := e.load(); err != nil {
 		return fail(err)
 	}
-	res, err := connectKey(e, *url, *token)
+	res, err := connectKey(e, *url, *token, jsonOut)
 	if err != nil {
 		return fail(err)
 	}
 	if jsonOut {
+		if !res.Reachable {
+			return fail(errors.New("Companion could not check the key; connect again when Companion is available"))
+		}
 		// The protocol needs success, not a remote-controlled display name.
 		return json.NewEncoder(e.out).Encode(connectJSON{OK: true, Label: companion.Name})
 	}
@@ -357,12 +360,12 @@ func readKey(r io.Reader) (string, error) {
 
 // connectKey checks the key with Companion and stores it: through the daemon when it runs
 // (tasks waiting for a key go out at once), else here.
-func connectKey(e *env, url, token string) (companion.ConnectResult, error) {
+func connectKey(e *env, url, token string, requireChecked bool) (companion.ConnectResult, error) {
 	if c, err := e.owner(); err == nil {
 		c.HTTP = companion.NoRedirectClient(c.HTTP)
 		cx, cancel := ctx()
 		var st companion.Status
-		err := c.Do(cx, http.MethodPut, "/api/companion/connect", map[string]string{"url": url, "token": token}, &st)
+		err := c.Do(cx, http.MethodPut, "/api/companion/connect", map[string]any{"url": url, "token": token, "require_checked": requireChecked}, &st)
 		cancel()
 		var ae *client.APIError
 		switch {
@@ -375,7 +378,7 @@ func connectKey(e *env, url, token string) (companion.ConnectResult, error) {
 	}
 	cx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	return companion.Connect(cx, e.paths, url, token, nil, "tmx/cli")
+	return companion.Connect(cx, e.paths, url, token, nil, "tmx/cli", requireChecked)
 }
 
 // connectViaCompanion installs tmx into Companion if needed, opens Companion's "Connect tmx?"

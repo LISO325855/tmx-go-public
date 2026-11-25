@@ -21,15 +21,14 @@ import (
 	"github.com/blackcode-ch/tmx-go/internal/model"
 	"github.com/blackcode-ch/tmx-go/internal/p2p"
 	"github.com/blackcode-ch/tmx-go/internal/store"
+	"github.com/blackcode-ch/tmx-go/internal/team"
+	"github.com/blackcode-ch/tmx-go/internal/teamstore"
 )
 
 // Limits (DESIGN.md "Chats").
 const (
 	MaxBodyBytes    = 32 << 10
 	MaxGroupMembers = 20
-	// MaxAgentRun: after this many agent messages in a row (no person in between) agents
-	// get no more chat mail and cannot send in that chat until a person writes.
-	MaxAgentRun = 20
 	// Incoming envelopes per peer: a bucket of rateBurst refilled at ratePerSec.
 	rateBurst  = 120
 	ratePerSec = 2.0
@@ -66,6 +65,14 @@ type Options struct {
 	OutboxTTL   time.Duration // queued envelopes older than this fail (default 7 days)
 	SendTimeout time.Duration // one Node.Send (default 20 s)
 	SendWait    time.Duration // how long a send waits for its first attempt (default 3 s)
+
+	// Team status (team.go). TeamStore keeps the reports, state changes and per-group settings
+	// (nil = team status is off: nothing is sent, announced or kept). TeamTick is how often the
+	// loop looks for a changed status (default 1 min), TeamEvery how often a report goes out
+	// unchanged (default team.Every, 15 min).
+	TeamStore *teamstore.Store
+	TeamTick  time.Duration
+	TeamEvery time.Duration
 }
 
 // Service is the chat layer. Create with New, then Start; Close on shutdown.
@@ -91,7 +98,9 @@ type Service struct {
 	pendingPeers []string
 	pendingMail  []mailItem
 	fetchKick    chan struct{} // wakes the file fetcher
-	adm          adminMem      // admin handovers (admin.go)
+	team         *teamMem      // status reports (team.go)
+	teamSt       *teamstore.Store
+	adm          adminMem // admin handovers (admin.go)
 }
 
 func New(o Options) (*Service, error) {
@@ -114,10 +123,12 @@ func New(o Options) (*Service, error) {
 	def(&o.OutboxTTL, 7*24*time.Hour)
 	def(&o.SendTimeout, 20*time.Second)
 	def(&o.SendWait, 3*time.Second)
+	def(&o.TeamTick, time.Minute)
+	def(&o.TeamEvery, team.Every)
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Service{o: o, node: o.Node, st: o.Store, ag: o.Agents, log: o.Logger, ctx: ctx, cancel: cancel,
 		workers: map[string]*worker{}, buckets: map[string]*bucket{}, held: map[string][]heldEnv{},
-		fetchKick: make(chan struct{}, 1)}, nil
+		fetchKick: make(chan struct{}, 1), team: newTeamMem(), teamSt: o.TeamStore}, nil
 }
 
 // Enabled reports whether peer-to-peer is on.
@@ -146,6 +157,9 @@ func (s *Service) Start() error {
 	s.node.ServeFiles(s.serveFile)
 	s.pruneUnsentFiles()
 	s.goTracked(s.fetchLoop)
+	if s.teamSt != nil {
+		s.goTracked(s.teamLoop) // team.go: status reports
+	}
 	peers, err := s.st.OutboxPeers()
 	if err != nil {
 		return err
@@ -236,6 +250,7 @@ func (s *Service) eventsLoop() {
 				s.kick(ev.PeerID, true)
 				s.peerOnlineForFiles(ev.PeerID)
 			}
+			s.teamKick() // team.go: a report or an announcement may wait for this peer; links changed
 			if c, err := s.st.GetContact(ev.PeerID); err == nil {
 				c.Reachability = string(ev.Reachability)
 				s.publish(model.EvContactUpdated, c)

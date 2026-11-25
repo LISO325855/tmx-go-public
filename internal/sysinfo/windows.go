@@ -97,6 +97,16 @@ func startTime(h windows.Handle) int64 {
 	return int64(uint64(c.HighDateTime)<<32 | uint64(c.LowDateTime)) // raw 100ns ticks; nanoseconds overflow
 }
 
+// ProcessStart identifies one live process without enumerating the machine.
+func ProcessStart(pid int) int64 {
+	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(pid))
+	if err != nil {
+		return 0
+	}
+	defer windows.CloseHandle(h)
+	return startTime(h)
+}
+
 // ProcUsage reads CPU times, working set and I/O transfer counts.
 func ProcUsage(pid int) (Usage, bool) {
 	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(pid))
@@ -178,7 +188,13 @@ func Disks() ([]Disk, error) {
 		if err != nil || n < uint32(unsafe.Offsetof(dp.QueryTime)) || dp.ReadTime < 0 || dp.WriteTime < 0 || dp.BytesWritten < 0 {
 			continue
 		}
-		out = append(out, Disk{Name: name, IOTime: time.Duration(dp.ReadTime+dp.WriteTime) * 100, Written: uint64(dp.BytesWritten)})
+		d := Disk{Name: name, IOTime: time.Duration(dp.ReadTime+dp.WriteTime) * 100, Written: uint64(dp.BytesWritten)}
+		// QueryTime - IdleTime is the time the drive had work, both in 100 ns since its counters
+		// began. WriteCount is 32 bits and wraps: readers take differences and skip a decrease.
+		if dp.QueryTime > 0 && dp.IdleTime >= 0 && dp.QueryTime >= dp.IdleTime {
+			d.Writes, d.Busy, d.HasOps = uint64(dp.WriteCount), time.Duration(dp.QueryTime-dp.IdleTime)*100, true
+		}
+		out = append(out, d)
 	}
 	if len(out) == 0 {
 		return nil, ErrUnsupported

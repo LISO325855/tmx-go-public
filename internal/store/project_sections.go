@@ -68,7 +68,7 @@ func (s *Store) CommitProjectFeedback(sec model.ProjectSection, rec model.Projec
 		return err
 	}
 	for _, m := range rec.Messages {
-		if _, err = tx.Exec("INSERT INTO messages ("+messageCols+") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", m.ID, m.From, m.To, m.Body, m.State, nullable(m.ReplyTo), m.CreatedAt, m.DeliveredAt, m.ThreadID, m.RetryID, m.RetryHash, m.Receipt, m.ReceiptAt); err != nil {
+		if _, err = tx.Exec("INSERT INTO messages ("+messageCols+") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", m.ID, m.From, m.To, m.Body, m.State, nullable(m.ReplyTo), m.CreatedAt, m.DeliveredAt, m.ThreadID, m.RetryID, m.RetryHash, m.Receipt, m.ReceiptAt, m.Urgent); err != nil {
 			return err
 		}
 	}

@@ -62,7 +62,12 @@ type Recording struct {
 	DurationMS int64 `json:"duration_ms"`
 	// ResumedAt: while recording, when the current stretch began (elapsed = DurationMS +
 	// now - ResumedAt); 0 otherwise.
-	ResumedAt int64  `json:"resumed_at,omitempty"`
+	ResumedAt int64 `json:"resumed_at,omitempty"`
+	// SavedMS: while live, how much recorded time has reached this computer (the sum of the
+	// segments as stored: the sound's length where there is sound, else what the window counted
+	// with the chunks it sent). The window's own timer runs ahead of it when chunks wait; this
+	// is "saved so far". 0 once the recording has ended (DurationMS is the total then).
+	SavedMS   int64  `json:"saved_ms,omitempty"`
 	Error     string `json:"error,omitempty"`
 	StartedAt int64  `json:"started_at"`
 	EndedAt   int64  `json:"ended_at,omitempty"`

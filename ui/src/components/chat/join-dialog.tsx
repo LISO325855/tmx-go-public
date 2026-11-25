@@ -1,5 +1,6 @@
 // Join with a link someone sent: preview first ("Join Alex's tmx" / "Join group Trip by
 // Alex"), then pair and land in the chat.
+import { useClassic } from "@/hooks/use-classic";
 import { useEffect, useRef, useState } from "react";
 import { Loader2, Users } from "lucide-react";
 import { toast } from "sonner";
@@ -15,6 +16,7 @@ import { PersonAvatar } from "./chat-bits";
 const looksLikeLink = (s: string) => /^tmx:\/\/join\/\S+$/i.test(s.trim());
 
 export function JoinDialog() {
+  const classic = useClassic();
   const { open, link: initial } = useChats((s) => s.join);
   const [link, setLink] = useState("");
   const [preview, setPreview] = useState<InvitePreview | null>(null);
@@ -39,7 +41,10 @@ export function JoinDialog() {
     setPreview(null);
     try {
       const pv = await chatApi.preview(l.trim());
-      if (my === seq.current) setPreview(pv);
+      if (my === seq.current) {
+        if (classic && pv.kind === "group") setError("Group chats are not available in this view.");
+        else setPreview(pv);
+      }
     } catch (e) {
       if (my === seq.current) setError((e as Error).message || "This link doesn't work.");
     } finally {
@@ -53,6 +58,7 @@ export function JoinDialog() {
       if (link.trim()) void check(link);
       return;
     }
+    if (classic && preview.kind === "group") return;
     setJoining(true);
     setError("");
     try {

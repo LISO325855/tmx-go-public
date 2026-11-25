@@ -18,8 +18,8 @@ func (f *Fleet) MessagePins(c Caller) ([]model.MessagePin, error) {
 // PinMessage saves the owner's selection. Agents may read their own pins but cannot
 // create, complete or dismiss the owner's reminders. Pinning never dispatches mail.
 func (f *Fleet) PinMessage(c Caller, p model.MessagePin) error {
-	if !c.Owner {
-		return errf(KindForbidden, "only the owner can pin messages")
+	if err := f.managePin(c, p.AgentID); err != nil {
+		return err
 	}
 	if p.Source == "" || len(p.Source) > 512 || strings.TrimSpace(p.Text) == "" || len(p.Text) > 256*1024 || len(p.Label) > 256 || p.Label == "" || len(p.Href) > 1024 || !strings.HasPrefix(p.Href, "#/") {
 		return errf(KindInvalid, "invalid message selection")
@@ -40,8 +40,8 @@ func (f *Fleet) PinMessage(c Caller, p model.MessagePin) error {
 }
 
 func (f *Fleet) SetMessagePinState(c Caller, id, state string) error {
-	if !c.Owner {
-		return errf(KindForbidden, "only the owner can change pins")
+	if err := f.managePin(c, ""); err != nil {
+		return err
 	}
 	if state != "active" && state != "done" && state != "unpinned" {
 		return errf(KindInvalid, "invalid pin state")

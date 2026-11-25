@@ -111,3 +111,13 @@ func nullable(s string) any {
 func escapeURIPath(path string) string {
 	return strings.NewReplacer("%", "%25", "?", "%3F", "#", "%23").Replace(filepath.ToSlash(path))
 }
+
+// HasTimelineKind reports whether the agent's timeline holds at least one entry of kind.
+func (s *Store) HasTimelineKind(agentID, kind string) (bool, error) {
+	var one int
+	err := s.db.QueryRow(`SELECT 1 FROM timeline WHERE agent_id=? AND kind=? LIMIT 1`, agentID, kind).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
+}

@@ -50,7 +50,7 @@ type Options struct {
 	// $TMXG_AIOS_HOME or ~/.aios).
 	Install InstallOptions
 	Poll    time.Duration // how often an active task is polled (default 3 s)
-	HTTP    *http.Client  // nil = 20 s timeout
+	HTTP    *http.Client  // nil = 120 s response-header timeout
 	// Open hands Companion's connect link (DeepLink) to the OS (nil = OpenURL; tests pass a fake).
 	Open Opener
 	// Retry backoff for a busy or unreachable Companion (defaults 5 s .. 2 min) and how long a
@@ -75,7 +75,8 @@ type Service struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
-	lastRecover time.Time // loop only
+	polls       map[string]pollSchedule // loop only
+	lastRecover time.Time               // loop only
 	link        linkToken
 
 	// Companion refused this key (keyID) last; until holdUntil no task is sent with it, so one
@@ -140,7 +141,7 @@ func New(o Options) *Service {
 		o.GiveUp = 24 * time.Hour
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Service{o: o, log: o.Logger, kick: make(chan struct{}, 1), ctx: ctx, cancel: cancel}
+	return &Service{o: o, log: o.Logger, kick: make(chan struct{}, 1), ctx: ctx, cancel: cancel, polls: make(map[string]pollSchedule)}
 }
 
 // Start resumes after a restart (a send that was in flight is unconfirmed) and runs the loop.
@@ -150,6 +151,9 @@ func (s *Service) Start() error {
 		return err
 	}
 	for _, t := range sending {
+		if t.SentAt == 0 {
+			t.SentAt = model.Now()
+		}
 		s.finish(&t, model.CompanionUnconfirmed, "", "tmx stopped while sending this "+noun(t)+", so it may or may not have reached Companion; tmx does not send it again")
 	}
 	s.wg.Add(1)
@@ -211,7 +215,8 @@ type ConnectResult struct {
 // (url "" = found the way Companion advertises itself). A key Companion refuses is not stored.
 // When Companion does not answer, the key is stored unchecked. An address configured earlier
 // that no longer answers is dropped for discovery, so a stale --url never sticks.
-func Connect(ctx context.Context, p config.Paths, url, token string, hc *http.Client, agent string) (res ConnectResult, resultErr error) {
+// With requireChecked=true, a failed check leaves the previous key and config untouched.
+func Connect(ctx context.Context, p config.Paths, url, token string, hc *http.Client, agent string, requireChecked ...bool) (res ConnectResult, resultErr error) {
 	token = strings.TrimSpace(token)
 	defer func() {
 		if resultErr == nil {
@@ -258,7 +263,7 @@ func Connect(ctx context.Context, p config.Paths, url, token string, hc *http.Cl
 	}
 	res.Address = loc
 	pctx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	me, err := (&Client{BaseURL: loc.URL, Token: token, Agent: agent, HTTP: hc}).Me(pctx)
+	me, err := (&Client{BaseURL: loc.URL, Token: token, Agent: agent, HTTP: hc, OwnerSet: loc.Source == SourceConfig}).Me(pctx)
 	cancel()
 	switch e := AsError(err); {
 	case err == nil:
@@ -273,10 +278,19 @@ func Connect(ctx context.Context, p config.Paths, url, token string, hc *http.Cl
 	default:
 		res.Error = err.Error()
 	}
-	if keep == "" {
+	if len(requireChecked) > 0 && requireChecked[0] && !res.Reachable {
+		return res, reqErr(http.StatusBadGateway, "Companion could not check the key; the previous connection was left unchanged. Connect again when Companion is available")
+	}
+	// The section is written as before (the address alone; Load fills the rest in again),
+	// plus the owner's trusted programs, which must survive a new key.
+	next := config.CompanionConfig{URL: keep}
+	if c.Companion != nil {
+		next.TrustedPrograms = c.Companion.TrustedPrograms
+	}
+	if next.URL == "" && len(next.TrustedPrograms) == 0 {
 		c.Companion = nil
 	} else {
-		c.Companion = &config.CompanionConfig{URL: keep}
+		c.Companion = &next
 	}
 	if err := config.Save(p, c); err != nil {
 		return res, err
@@ -286,8 +300,8 @@ func Connect(ctx context.Context, p config.Paths, url, token string, hc *http.Cl
 
 // Connect is the owner connecting tmx through the daemon: checked and stored as above, and
 // tasks that waited for a working key go out now.
-func (s *Service) Connect(ctx context.Context, url, token string) (Status, error) {
-	if _, err := Connect(ctx, s.o.Paths, url, token, s.o.HTTP, "tmx/"+s.o.Version); err != nil {
+func (s *Service) Connect(ctx context.Context, url, token string, requireChecked ...bool) (Status, error) {
+	if _, err := Connect(ctx, s.o.Paths, url, token, s.o.HTTP, "tmx/"+s.o.Version, requireChecked...); err != nil {
 		return Status{}, err
 	}
 	s.keyAccepted()
@@ -308,7 +322,7 @@ func (s *Service) client(st Settings) (*Client, Located, error) {
 	if err != nil {
 		return nil, loc, err
 	}
-	return &Client{BaseURL: loc.URL, Token: st.Token, Agent: "tmx/" + s.o.Version, HTTP: s.o.HTTP}, loc, nil
+	return &Client{BaseURL: loc.URL, Token: st.Token, Agent: "tmx/" + s.o.Version, HTTP: s.o.HTTP, OwnerSet: loc.Source == SourceConfig}, loc, nil
 }
 
 // --- status ---
@@ -324,13 +338,15 @@ type Status struct {
 	Checked    bool          `json:"checked"`   // Companion was probed (GET only)
 	Reachable  bool          `json:"reachable"` // its agent card answered
 	Version    string        `json:"version,omitempty"`
-	KeyOK      *bool         `json:"key_ok,omitempty"`       // Companion accepted the key
-	Label      string        `json:"label,omitempty"`        // Companion's name for tmx
-	Error      string        `json:"error,omitempty"`        // why it is not reachable / the key is refused
-	LinkUsedAt int64         `json:"link_used_at,omitempty"` // Companion last read tmx (since the daemon started)
-	Active     int           `json:"active"`                 // tasks and messages queued or running
-	Awaiting   int           `json:"awaiting"`               // agents' hand-offs (and the head's messages) waiting for the owner
-	CheckedAt  int64         `json:"checked_at"`
+	KeyOK      *bool         `json:"key_ok,omitempty"` // Companion accepted the key
+	Label      string        `json:"label,omitempty"`  // Companion's name for tmx
+	Error      string        `json:"error,omitempty"`  // why it is not reachable / the key is refused
+	// TrustedPrograms: what the owner accepts as Companion's engine besides the installed app.
+	TrustedPrograms []string `json:"trusted_programs,omitempty"`
+	LinkUsedAt      int64    `json:"link_used_at,omitempty"` // Companion last read tmx (since the daemon started)
+	Active          int      `json:"active"`                 // tasks and messages queued or running
+	Awaiting        int      `json:"awaiting"`               // agents' hand-offs (and the head's messages) waiting for the owner
+	CheckedAt       int64    `json:"checked_at"`
 }
 
 // Status reports the links; probe = also ask Companion (read-only GETs: agent card, and the
@@ -342,6 +358,7 @@ func (s *Service) Status(ctx context.Context, probe bool) Status {
 		out.LinkToken = true
 	}
 	out.LinkUsedAt = s.LinkLastUsed()
+	out.TrustedPrograms = TrustedPrograms()
 	st := s.settings()
 	out.Connected = st.Token != ""
 	if fi, err := os.Stat(s.o.Paths.CompanionAgentTokenFile()); err == nil && out.Connected {
@@ -352,7 +369,7 @@ func (s *Service) Status(ctx context.Context, probe bool) Status {
 	if err != nil {
 		out.AddressErr = err.Error()
 	}
-	if active, err := s.o.Store.ListCompanionTasks(0, model.CompanionQueued, model.CompanionSending, model.CompanionWorking, model.CompanionInputRequired); err == nil {
+	if active, err := s.o.Store.ListCompanionTasks(0, model.CompanionQueued, model.CompanionSending, model.CompanionWorking, model.CompanionInputRequired, model.CompanionUnknown); err == nil {
 		out.Active = len(active)
 	}
 	if aw, err := s.o.Store.ListCompanionTasks(0, model.CompanionAwaitingApproval); err == nil {
@@ -410,6 +427,7 @@ type Preview struct {
 // PreviewRequest is POST /api/companion/preview and the body of an owner's task.
 type PreviewRequest struct {
 	Spec             model.CompanionSpec `json:"spec"`
+	OwnerOrderID     string              `json:"owner_order_id,omitempty"`
 	AgentID          string              `json:"agent_id,omitempty"`           // who gets the outcome (default the head)
 	SourceApprovalID string              `json:"source_approval_id,omitempty"` // a Needs-you item handed over
 	TextHash         string              `json:"text_hash,omitempty"`          // create: the preview's hash
@@ -452,8 +470,8 @@ func (s *Service) PreviewOwner(req PreviewRequest) (Preview, error) {
 }
 
 // CreateOwner queues the owner's task (it is the owner's approval). With TextHash set, the
-// rendered text must be the one previewed. The API asks the owner gate first when the
-// effects are not none.
+// rendered text must be the one previewed. The API asks the owner gate first for
+// outward and money effects.
 func (s *Service) CreateOwner(req PreviewRequest) (model.CompanionTask, error) {
 	p, spec, err := s.preview("owner", req)
 	if err != nil {
@@ -475,12 +493,13 @@ func (s *Service) CreateOwner(req PreviewRequest) (model.CompanionTask, error) {
 	return t, nil
 }
 
-// MaxAwaiting is how many hand-offs one agent may have waiting for the owner.
+// MaxAwaiting was how many hand-offs one agent could have waiting for the owner; nothing is
+// refused for it any more (the owner, 17 Nov: no talk limits).
 const MaxAwaiting = 3
 
-// CreateAgent records an agent's hand-off and asks the owner (an Approval of kind companion
-// showing the exact text). The agent's profile must allow Companion tasks.
-func (s *Service) CreateAgent(agentID string, spec model.CompanionSpec) (model.CompanionTask, error) {
+// CreateAgent records an agent's hand-off. Outward and money tasks need approval or a
+// verified order. The agent's profile must allow Companion tasks.
+func (s *Service) CreateAgent(agentID string, spec model.CompanionSpec, ownerOrderID string) (model.CompanionTask, error) {
 	prof, err := s.o.Fleet.AgentProfile(agentID)
 	if err != nil {
 		return model.CompanionTask{}, reqErr(http.StatusForbidden, "%s", err.Error())
@@ -495,22 +514,29 @@ func (s *Service) CreateAgent(agentID string, spec model.CompanionSpec) (model.C
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	waiting, err := s.o.Store.ListCompanionTasks(0, model.CompanionAwaitingApproval)
-	if err != nil {
-		return model.CompanionTask{}, err
-	}
-	n := 0
-	for _, w := range waiting {
-		if w.AgentID == p.AgentID && !w.IsMessage() { // the head's messages have their own limit
-			n++
-		}
-	}
-	if n >= MaxAwaiting {
-		return model.CompanionTask{}, reqErr(http.StatusTooManyRequests, "you already have %d Companion tasks waiting for the owner", n)
-	}
 	now := model.Now()
 	t := model.CompanionTask{ID: model.NewID(), AgentID: p.AgentID, Origin: "agent", Spec: spec, Text: p.Text,
 		Effects: p.Effects, State: model.CompanionAwaitingApproval, CreatedAt: now, UpdatedAt: now}
+	orderText := s.ownerOrderText(p, spec, ownerOrderID)
+	if orderText != "" {
+		// One persisted task per order, including retries after a restart.
+		t.ID = "order-" + ownerOrderID
+		if prior, err := s.o.Store.GetCompanionTask(t.ID); err == nil {
+			return prior, nil
+		} else if !errors.Is(err, store.ErrNotFound) {
+			return model.CompanionTask{}, err
+		}
+		t.OwnerOrderID = ownerOrderID
+		t.Text = orderText
+	}
+	if !NeedsTaskApproval(p.Effects) || orderText != "" {
+		t.State = model.CompanionQueued
+		if err := s.save(&t); err != nil {
+			return t, err
+		}
+		s.wake()
+		return t, nil
+	}
 	ap, err := s.o.Fleet.CompanionApproval(p.AgentID, model.ToolCompanionTask, spec.Goal,
 		"Hand this task to Companion: "+EffectsLabel(p.Effects)+".",
 		model.CompanionApprovalInput{TaskID: t.ID, Text: p.Text, Effects: p.Effects, Spec: spec})
@@ -519,6 +545,26 @@ func (s *Service) CreateAgent(agentID string, spec model.CompanionSpec) (model.C
 	}
 	t.ApprovalID = ap.ID
 	return t, s.save(&t)
+}
+
+func (s *Service) ownerOrderText(p Preview, spec model.CompanionSpec, id string) string {
+	if id == "" || p.AgentID != s.o.Fleet.HeadID() || !NeedsTaskApproval(p.Effects) {
+		return ""
+	}
+	// The relay may carry the complete order, without agent-authored instructions.
+	if spec.Context != "" || spec.Where != "" || spec.Success != "" || len(spec.Steps) != 0 || len(spec.DoNotTouch) != 0 ||
+		!directOrderRx.MatchString(spec.Goal) || ClassifyEffects(model.CompanionSpec{Goal: spec.Goal}) != p.Effects {
+		return ""
+	}
+	m, err := s.o.Store.GetMessage(id)
+	if err != nil || m.From != model.Owner || m.To != p.AgentID || strings.TrimSpace(m.Body) != spec.Goal {
+		return ""
+	}
+	text := Render(spec, p.Effects, RenderInfo{Machine: s.o.Fleet.Machine(), Agent: p.Agent, Origin: "agent", OwnerOrder: true})
+	if !strings.Contains(text, "\n"+spec.Goal+"\n") {
+		return "" // A truncated order cannot authorize the relay.
+	}
+	return text
 }
 
 // --- the owner's decisions (from fleet.Decide) ---
@@ -599,7 +645,7 @@ func (s *Service) answer(t model.CompanionTask, text, raw, by string) error {
 	if len(text) > MaxText {
 		return reqErr(http.StatusBadRequest, "the answer is too long")
 	}
-	if t.State != model.CompanionInputRequired || t.RemoteID == "" {
+	if !t.AwaitingAnswer() {
 		return reqErr(http.StatusConflict, "Companion is not waiting for an answer on this %s (it is %s)", noun(t), t.State)
 	}
 	s.mu.Lock()
@@ -608,7 +654,7 @@ func (s *Service) answer(t model.CompanionTask, text, raw, by string) error {
 		s.mu.Unlock()
 		return err
 	}
-	if cur.State != model.CompanionInputRequired || s.answering[t.ID] {
+	if !cur.AwaitingAnswer() || s.answering[t.ID] {
 		s.mu.Unlock()
 		return reqErr(http.StatusConflict, "Companion is no longer waiting for this answer")
 	}
@@ -628,7 +674,7 @@ func (s *Service) answer(t model.CompanionTask, text, raw, by string) error {
 	if err != nil {
 		return reqErr(http.StatusBadGateway, "%s", err.Error())
 	}
-	ctx, cancel := context.WithTimeout(s.ctx, 20*time.Second)
+	ctx, cancel := context.WithTimeout(s.ctx, 135*time.Second)
 	defer cancel()
 	rt, err := cl.Send(ctx, text, t.RemoteID, t.ContextID)
 	if err != nil {
@@ -647,7 +693,9 @@ func (s *Service) answer(t model.CompanionTask, text, raw, by string) error {
 		return nil
 	}
 	answeredLocked(&cur, strings.TrimSpace(raw), by)
-	cur.QuestionApprovalID, cur.Question = "", ""
+	cur.QuestionApprovalID, cur.Question, cur.LinkDownAt = "", "", 0
+	cur.QueueReleased = false
+	cur.LastReadAt, cur.ProgressAt, cur.ProgressKey = model.Now(), model.Now(), progressKey(rt)
 	s.applyLocked(&cur, rt)
 	s.wake()
 	return nil
@@ -662,21 +710,63 @@ func (s *Service) Cancel(id, note string) (model.CompanionTask, error) {
 		return t, reqErr(http.StatusNotFound, "no Companion task %q", id)
 	}
 	if t.State.Done() {
-		return t, reqErr(http.StatusConflict, "this %s is %s already", noun(t), t.State)
+		return t, alreadyEnded(t)
 	}
 	if note == "" {
 		note = "The owner cancelled the Companion " + noun(t) + "."
 	}
-	if t.RemoteID != "" && (t.State == model.CompanionWorking || t.State == model.CompanionInputRequired) {
-		if cl, _, err := s.client(s.settings()); err == nil {
+	if t.RemoteID != "" && t.State.Following() {
+		cl, _, cancelErr := s.client(s.settings())
+		if cancelErr == nil {
 			ctx, cancel := context.WithTimeout(s.ctx, 15*time.Second)
-			_, err := cl.Cancel(ctx, t.RemoteID)
-			cancel()
-			if e := AsError(err); err != nil && (e == nil || e.Reason != "TASK_NOT_CANCELABLE") {
-				s.log.Warn("cancel Companion task", "task", t.ID, "err", err)
+			defer cancel()
+			if ended, ok := s.checkCancelOutcome(ctx, cl, t); ok {
+				return ended, alreadyEnded(ended)
+			}
+			for attempt := 0; attempt < 3; attempt++ {
+				_, cancelErr = cl.Cancel(ctx, t.RemoteID)
+				e := AsError(cancelErr)
+				if cancelErr == nil {
+					if attempt > 0 {
+						note += fmt.Sprintf(" Companion confirmed after %d cancellation attempts.", attempt+1)
+					}
+					break
+				}
+				if ended, ok := s.checkCancelOutcome(ctx, cl, t); ok {
+					return ended, alreadyEnded(ended)
+				}
+				if e != nil && e.Reason == "TASK_NOT_CANCELABLE" {
+					return t, reqErr(http.StatusConflict, "Companion says this %s cannot be cancelled", noun(t))
+				}
+				if e == nil || e.Status != http.StatusServiceUnavailable || attempt == 2 {
+					break
+				}
+				select {
+				case <-ctx.Done():
+					cancelErr = ctx.Err()
+				case <-time.After(min(s.o.RetryMin, time.Second) * time.Duration(attempt+1)):
+				}
+				if ctx.Err() != nil {
+					break
+				}
 			}
 		}
+		if cancelErr != nil {
+			s.mu.Lock()
+			cur, readErr := s.o.Store.GetCompanionTask(id)
+			if readErr == nil && !cur.State.Done() {
+				note := "Cancellation not confirmed by Companion; it may still be running. Retry cancel: " + cancelErr.Error()
+				cur.Error = pollNote(cur.LinkDownAt, note, pollKeyNote(cur.Error))
+				_ = s.saveKeepTime(&cur)
+			}
+			s.mu.Unlock()
+			if readErr == nil && cur.State.Done() {
+				return cur, alreadyEnded(cur)
+			}
+			return cur, reqErr(http.StatusServiceUnavailable, "Companion did not confirm cancellation; retry cancel")
+		}
 	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	t, err = s.o.Store.GetCompanionTask(id)
@@ -687,7 +777,31 @@ func (s *Service) Cancel(id, note string) (model.CompanionTask, error) {
 		return t, nil
 	}
 	s.finishLocked(&t, model.CompanionCanceled, "", note)
+	s.wake()
 	return t, nil
+}
+
+func alreadyEnded(t model.CompanionTask) error {
+	return reqErr(http.StatusConflict, "this %s already ended (%s)", noun(t), t.State)
+}
+
+// checkCancelOutcome only applies terminal observations. Live runs still use
+// the existing cancel request and confirmation path.
+func (s *Service) checkCancelOutcome(ctx context.Context, cl *Client, t model.CompanionTask) (model.CompanionTask, bool) {
+	s.mu.Lock()
+	generation := s.answerGeneration
+	s.mu.Unlock()
+	rt, err := cl.Get(ctx, t.RemoteID)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur, readErr := s.o.Store.GetCompanionTask(t.ID)
+	if readErr != nil || cur.RemoteID != t.RemoteID {
+		return cur, false
+	}
+	if cur.State.Following() && !s.answering[t.ID] && generation == s.answerGeneration {
+		s.applyEndLocked(&cur, rt, err)
+	}
+	return cur, cur.State.Done()
 }
 
 // List returns the newest tasks.
@@ -731,32 +845,44 @@ func (s *Service) loop() {
 // step polls the task Companion is on, or sends the next queued one. It returns when to look
 // again.
 func (s *Service) step() time.Duration {
-	tasks, err := s.o.Store.ListCompanionTasks(0, model.CompanionQueued, model.CompanionWorking, model.CompanionInputRequired)
+	tasks, err := s.o.Store.ListCompanionTasks(0, model.CompanionQueued, model.CompanionWorking, model.CompanionInputRequired, model.CompanionUnknown)
 	if err != nil {
 		s.log.Warn("companion tasks", "err", err)
 		return time.Minute
 	}
 	idle := 5 * time.Minute
 	if s.recoverUnconfirmed() {
-		return s.o.Poll
-	}
-	if len(tasks) == 0 {
-		return idle
-	}
-	for _, t := range tasks {
-		if t.State == model.CompanionWorking || t.State == model.CompanionInputRequired {
-			s.poll(t)
-			if t.State == model.CompanionInputRequired {
-				return 3 * s.o.Poll // waiting for the owner; Companion keeps it parked
-			}
-			return s.o.Poll
+		idle = s.o.Poll
+		// Recovery may have made a task active. Refresh before sending anything
+		// else, but keep polling active tasks even if another send is unresolved.
+		tasks, err = s.o.Store.ListCompanionTasks(0, model.CompanionQueued, model.CompanionWorking, model.CompanionInputRequired, model.CompanionUnknown)
+		if err != nil {
+			return idle
 		}
+	}
+	next, blocking := s.followTasks(tasks, idle)
+	if blocking != "" {
+		for i := len(tasks) - 1; i >= 0; i-- {
+			t := tasks[i]
+			if t.State == model.CompanionQueued {
+				s.showQueueBlock(t.ID, queueBlockedPrefix+blocking+".")
+				break
+			}
+		}
+		return next
 	}
 	// Oldest queued first, one at a time. A newer one never overtakes it: what holds the
 	// oldest back (Companion busy or unreachable, tmx's key refused) holds the conversation.
 	now := model.Now()
 	for i := len(tasks) - 1; i >= 0; i-- {
 		t := tasks[i]
+		if t.State != model.CompanionQueued {
+			continue
+		}
+		if strings.HasPrefix(t.Error, queueBlockedPrefix) {
+			s.showQueueBlock(t.ID, "")
+			t.Error = ""
+		}
 		if now-t.CreatedAt > s.o.GiveUp.Milliseconds() {
 			s.mu.Lock()
 			s.finishLocked(&t, model.CompanionFailed, "", "Companion did not take the "+noun(t)+" within "+s.o.GiveUp.String()+": "+t.Error)
@@ -810,12 +936,27 @@ func (s *Service) send(t model.CompanionTask) {
 		return
 	}
 	t.State, t.Attempts, t.Error = model.CompanionSending, t.Attempts+1, ""
+	t.SentAt = model.Now()
+	t.MessageID = newMessageID()
 	_ = s.save(&t)
 	s.mu.Unlock()
 
-	ctx, cancel := context.WithTimeout(s.ctx, 30*time.Second)
-	rt, err := cl.Send(ctx, t.Text, "", "")
-	cancel()
+	rt, err := cl.sendRecover(s.ctx, t.Text, sendRecoveryPolicy{window: time.Minute, interval: 3 * time.Second, firstAttempt: time.UnixMilli(t.SentAt), messageID: t.MessageID, eligible: func(rt Task) bool { return s.remoteAvailable(t.ID, rt.ID) }}, func(attempt int, note string) bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		current, getErr := s.o.Store.GetCompanionTask(t.ID)
+		if getErr != nil || current.State != model.CompanionSending {
+			return false
+		}
+		if attempt > 1 {
+			t.Attempts++
+			current.Attempts = t.Attempts
+		}
+		current.Error = note
+		_ = s.save(&current)
+		s.log.Info("Companion send", "task", t.ID, "attempt", attempt, "outcome", note)
+		return true
+	})
 
 	s.mu.Lock()
 	if cur, gerr := s.o.Store.GetCompanionTask(t.ID); gerr == nil && cur.State != model.CompanionSending {
@@ -846,13 +987,14 @@ func (s *Service) send(t model.CompanionTask) {
 	}
 	e := AsError(err)
 	switch {
-	case e != nil && e.Unreachable:
+	case e != nil && e.Unreachable && !e.Unconfirmed:
 		t.State, t.Error = model.CompanionQueued, e.Msg+"; tmx tries again"
-		t.NextAt = model.Now() + s.backoff(t.Attempts).Milliseconds()
+		t.NextAt = model.Now() + max(s.backoff(t.Attempts), e.RetryAfter).Milliseconds()
 		_ = s.save(&t)
 	case e != nil && e.Status == http.StatusConflict && e.Reason == ReasonBusy:
-		t.State, t.Error = model.CompanionQueued, "Companion is busy in tmx's conversation; tmx tries again"
-		t.NextAt = model.Now() + s.backoff(t.Attempts).Milliseconds()
+		t.State, t.Error = model.CompanionQueued, "Companion is busy in tmx's conversation; waiting before retry (nothing was sent)"
+		t.NextAt = model.Now() + max(s.backoff(t.Attempts), e.RetryAfter).Milliseconds()
+		s.log.Info("Companion conversation busy; send queued", "task", t.ID, "next_at", t.NextAt)
 		_ = s.save(&t)
 	case e != nil && e.KeyRefused && keyID(s.settings().Token) != keyID(st.Token):
 		// The owner connected a new key while this went out with the old one: again, now.
@@ -873,24 +1015,36 @@ func (s *Service) send(t model.CompanionTask) {
 			s.finishLocked(&t, model.CompanionRefused, "", "Companion refused the task: "+e.Msg)
 		}
 	default:
-		t.SentAt = model.Now()
 		s.finishLocked(&t, model.CompanionUnconfirmed, "",
-			"The "+noun(t)+" may or may not have reached Companion ("+err.Error()+"); tmx does not send it again. Check in Companion.")
+			"The "+noun(t)+" may or may not have reached Companion ("+err.Error()+"); no automatic resend; tmx continues checking Companion for up to 15 minutes.")
 	}
 }
 
 // recoverWindow is how long after an unconfirmed send tmx looks for the task in Companion's
 // list (matching the exact text), so a send whose answer was lost is followed after all.
-const recoverWindow = 10 * time.Minute
+const recoverWindow = 15 * time.Minute
 
-// recoverUnconfirmed looks (at most every 30 s) for unconfirmed tasks among Companion's newest
-// tasks of this key; a match is followed as working. It never resends anything.
-func (s *Service) recoverUnconfirmed() bool {
-	if time.Since(s.lastRecover) < 30*time.Second {
+const notConfirmedNote = "not confirmed: check Companion; resend by hand"
+
+// Fail closed if bindings cannot be read; include completed and cancelled messages.
+func (s *Service) remoteAvailable(localID, remoteID string) bool {
+	tasks, err := s.o.Store.ListCompanionTasks(int(^uint(0) >> 1))
+	if err != nil {
 		return false
 	}
-	s.lastRecover = time.Now()
-	list, err := s.o.Store.ListCompanionTasks(10, model.CompanionUnconfirmed)
+	for _, t := range tasks {
+		if t.ID != localID && t.RemoteID == remoteID {
+			return false
+		}
+	}
+	return true
+}
+
+// recoverUnconfirmed looks (every 30 s after the first minute) for unconfirmed tasks among Companion's newest
+// tasks of this key; a match is followed as working. It never resends anything.
+// It returns true while recovery is pending, so an idle loop wakes promptly.
+func (s *Service) recoverUnconfirmed() bool {
+	list, err := s.o.Store.ListCompanionTasks(int(^uint(0)>>1), model.CompanionUnconfirmed)
 	if err != nil {
 		return false
 	}
@@ -898,112 +1052,401 @@ func (s *Service) recoverUnconfirmed() bool {
 	for _, t := range list {
 		if t.RemoteID == "" && t.SentAt > 0 && model.Now()-t.SentAt < recoverWindow.Milliseconds() {
 			open = append(open, t)
+		} else if t.RemoteID == "" && t.SentAt > 0 && t.Error != notConfirmedNote {
+			s.mu.Lock()
+			cur, getErr := s.o.Store.GetCompanionTask(t.ID)
+			if getErr == nil && cur.State == model.CompanionUnconfirmed && cur.RemoteID == "" {
+				s.finishLocked(&cur, model.CompanionUnconfirmed, "", notConfirmedNote)
+			}
+			s.mu.Unlock()
 		}
 	}
 	if len(open) == 0 {
 		return false
 	}
+	interval := 30 * time.Second
+	for _, t := range open {
+		if model.Now()-t.SentAt < time.Minute.Milliseconds() {
+			interval = 3 * time.Second
+		}
+	}
+	if time.Since(s.lastRecover) < interval {
+		return true
+	}
+	s.lastRecover = time.Now()
 	st := s.settings()
 	cl, _, err := s.client(st)
 	if err != nil || st.Token == "" {
-		return false
+		return true
 	}
 	ctx, cancel := context.WithTimeout(s.ctx, 10*time.Second)
-	recent, err := cl.Recent(ctx, 10)
+	recent, err := cl.Recent(ctx, 100)
 	cancel()
 	if err != nil {
-		return false
+		return true
 	}
-	found := false
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, t := range open {
-		for _, rt := range recent {
-			if strings.TrimSpace(rt.FirstUserText()) != strings.TrimSpace(t.Text) {
-				continue
-			}
-			cur, err := s.o.Store.GetCompanionTask(t.ID)
-			if err != nil || cur.State != model.CompanionUnconfirmed || cur.RemoteID != "" {
-				break
-			}
-			cur.RemoteID, cur.ContextID, cur.FinishedAt = rt.ID, rt.ContextID, 0
-			cur.State, cur.Error = model.CompanionWorking, ""
-			s.applyLocked(&cur, rt)
-			if cur.State == model.CompanionWorking {
-				_ = s.save(&cur)
-			}
-			found = true
-			break
+		rt, ok := findRecoveryTask(recent, t.Text, sendRecoveryPolicy{firstAttempt: time.UnixMilli(t.SentAt), messageID: t.MessageID, eligible: func(rt Task) bool { return s.remoteAvailable(t.ID, rt.ID) }})
+		if !ok {
+			continue
 		}
+		cur, err := s.o.Store.GetCompanionTask(t.ID)
+		if err != nil || cur.State != model.CompanionUnconfirmed || cur.RemoteID != "" {
+			continue
+		}
+		cur.RemoteID, cur.ContextID, cur.FinishedAt = rt.ID, rt.ContextID, 0
+		cur.State, cur.Error = model.CompanionWorking, ""
+		s.applyLocked(&cur, rt)
+		if cur.State == model.CompanionWorking {
+			_ = s.save(&cur)
+		}
+		s.log.Info("Companion task recovered; no resend", "task", cur.ID, "remote_task", rt.ID)
 	}
-	return found
+
+	return true
 }
 
-// poll reads the task Companion is on and applies what changed.
-func (s *Service) poll(t model.CompanionTask) {
+const (
+	unreachableLimit   = 2 * time.Hour
+	unchangedRunLimit  = 12 * time.Hour
+	questionQueueLimit = 2 * time.Hour
+)
+const releasedQuestionNote = "This task stopped blocking the queue after two hours and still accepts an answer."
+
+const queueBlockedPrefix = "Queue blocked by Companion task "
+
+type pollSchedule struct {
+	failures int
+	due      time.Time
+}
+
+func (s *Service) showQueueBlock(id, note string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t, err := s.o.Store.GetCompanionTask(id)
+	if err == nil && t.State == model.CompanionQueued && t.Error != note {
+		t.Error = note
+		_ = s.saveKeepTime(&t)
+	}
+}
+
+func (s *Service) followTasks(tasks []model.CompanionTask, next time.Duration) (time.Duration, string) {
+	active := make(map[string]bool)
+	var blocking string
+	for _, t := range tasks {
+		if !t.State.Following() {
+			continue
+		}
+		active[t.ID] = true
+		now := time.Now()
+		endAt, reason := followDeadline(t)
+		schedule := s.polls[t.ID]
+		if !now.Before(schedule.due) || reason != "" && !now.Before(endAt) {
+			delay := s.poll(t)
+			schedule = s.polls[t.ID]
+			schedule.due = time.Now().Add(delay)
+			s.polls[t.ID] = schedule
+			cur, err := s.o.Store.GetCompanionTask(t.ID)
+			if err != nil || !cur.State.Following() {
+				continue
+			}
+			t = cur
+		}
+		if t.State == model.CompanionWorking {
+			if at, why := followDeadline(t); why != "" && !now.Before(at) && s.expireFollow(t.ID, now) {
+				continue
+			}
+		}
+		next = min(next, max(0, time.Until(schedule.due)))
+		if t.AwaitingAnswer() && !t.QueueReleased {
+			at := questionQueueDeadline(t)
+			if !now.Before(at) {
+				t.QueueReleased = s.releaseQuestionQueue(t.ID, now)
+			} else {
+				next = min(next, time.Until(at))
+			}
+		} else if at, why := followDeadline(t); why != "" {
+			delay := time.Until(at)
+			if delay <= 0 {
+				delay = s.o.Poll // an answer may be in flight
+			}
+			next = min(next, delay)
+		}
+		if !t.QueueReleased {
+			blocking = t.ID
+		}
+	}
+	for id := range s.polls {
+		if !active[id] {
+			delete(s.polls, id)
+		}
+	}
+	return next, blocking
+}
+
+// fallbackClock gives rows written before the tracking clocks a stable start.
+func fallbackClock(t model.CompanionTask) int64 {
+	return max(t.SentAt, t.CreatedAt, t.UpdatedAt)
+}
+
+func followDeadline(t model.CompanionTask) (time.Time, string) {
+	if t.AwaitingAnswer() {
+		return time.Time{}, ""
+	}
+	if t.State == model.CompanionUnknown {
+		readAt := t.LastReadAt
+		if readAt == 0 {
+			return time.Time{}, "" // the first failed read seeds legacy rows
+		}
+		reason := "tmx could not read the Companion " + noun(t) + " for two hours without a final report."
+		if key := pollKeyNote(t.Error); key != "" {
+			reason = "Companion refused the key during two hours of reads without a final report. " + key
+		}
+		return time.UnixMilli(readAt).Add(unreachableLimit), reason
+	}
+	progressAt := t.ProgressAt
+	if progressAt == 0 {
+		progressAt = fallbackClock(t)
+	}
+	return time.UnixMilli(progressAt).Add(unchangedRunLimit), "Companion reported no progress on the " + noun(t) + " for twelve hours, and no final report arrived."
+}
+
+func (s *Service) expireFollow(id string, now time.Time) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur, err := s.o.Store.GetCompanionTask(id)
+	if err != nil || !cur.State.Following() {
+		return true
+	}
+	return s.expireFollowLocked(&cur, now)
+}
+
+func (s *Service) expireFollowLocked(cur *model.CompanionTask, now time.Time) bool {
+	at, reason := followDeadline(*cur)
+	if reason == "" || now.Before(at) || s.answering[cur.ID] {
+		return false
+	}
+	s.finishLocked(cur, model.CompanionEndedWithoutReport, "", reason)
+	return true
+}
+
+func questionQueueDeadline(t model.CompanionTask) time.Time {
+	askedAt := t.UpdatedAt
+	if n := len(t.Exchanges); n > 0 {
+		askedAt = t.Exchanges[n-1].AskedAt
+	}
+	if askedAt == 0 {
+		askedAt = fallbackClock(t)
+	}
+	return time.UnixMilli(askedAt).Add(questionQueueLimit)
+}
+
+func (s *Service) releaseQuestionQueue(id string, now time.Time) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t, err := s.o.Store.GetCompanionTask(id)
+	if err != nil || !t.AwaitingAnswer() || now.Before(questionQueueDeadline(t)) {
+		return false
+	}
+	t.QueueReleased = true
+	return s.saveKeepTime(&t) == nil
+}
+
+// progressKey ignores the remote timestamp. State, status message parts (including
+// data), progress, artifacts and history content can all signal an advancing run.
+func progressKey(rt Task) string {
+	var parts []Part
+	if rt.Status.Message != nil {
+		parts = rt.Status.Message.Parts
+	}
+	b, _ := json.Marshal([]any{rt.Status.State, parts, rt.Status.Progress, rt.Metadata.Progress, rt.Artifacts, rt.History})
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// nextPoll spaces out reads as a task ages, with independent failure backoff.
+func (s *Service) nextPoll(t model.CompanionTask, took time.Duration, err error) time.Duration {
+	p := s.polls[t.ID]
+	if err != nil || took >= 2*time.Second {
+		p.failures = min(p.failures+1, 6)
+	} else {
+		p.failures = 0
+	}
+	s.polls[t.ID] = p
+	d := s.o.Poll
+	if t.SentAt > 0 {
+		age := time.Duration(model.Now()-t.SentAt) * time.Millisecond
+		d = min(max(age/20, s.o.Poll), 10*s.o.Poll)
+	}
+	if t.State == model.CompanionInputRequired {
+		d = max(d, 3*s.o.Poll)
+	}
+	if p.failures > 0 {
+		d = max(d, min(s.o.Poll*time.Duration(1<<p.failures), 40*s.o.Poll), 5*took)
+		if e := AsError(err); e != nil {
+			d = max(d, e.RetryAfter)
+		}
+	}
+	return d
+}
+
+const keyNotePrefix = "Companion refused tmx's key: "
+
+func pollKeyNote(note string) string {
+	return pollNoteLine(note, keyNotePrefix)
+}
+
+func pollNote(downAt int64, cancelNote, keyNote string) string {
+	if downAt == 0 {
+		return cancelNote
+	}
+	note := "Unknown: link down since " + time.UnixMilli(downAt).Format(time.RFC3339)
+	if keyNote != "" {
+		note += "\n" + keyNote
+	}
+	if cancelNote != "" {
+		note += "\n" + cancelNote
+	}
+	return note
+}
+
+func cancellationNote(note string) string {
+	return pollNoteLine(note, "Cancellation not confirmed")
+}
+
+func pollNoteLine(note, prefix string) string {
+	for line := range strings.SplitSeq(note, "\n") {
+		if strings.HasPrefix(line, prefix) {
+			return line
+		}
+	}
+	return ""
+}
+
+// poll reads the remote run by ID. Each successful read reconciles the local
+// state, including the first read after an interrupted connection.
+func (s *Service) poll(t model.CompanionTask) time.Duration {
 	s.mu.Lock()
 	if s.answering[t.ID] {
 		s.mu.Unlock()
-		return
+		return s.o.Poll
 	}
 	generation := s.answerGeneration
 	s.mu.Unlock()
+
+	var rt Task
+	started := time.Now()
 	cl, _, err := s.client(s.settings())
-	if err != nil {
-		return
+	if err == nil {
+		ctx, cancel := context.WithTimeout(s.ctx, 15*time.Second)
+		rt, err = cl.Get(ctx, t.RemoteID)
+		cancel()
 	}
-	ctx, cancel := context.WithTimeout(s.ctx, 15*time.Second)
-	rt, err := cl.Get(ctx, t.RemoteID)
-	cancel()
+	took := time.Since(started)
+	delay := max(s.nextPoll(t, took, err), min(time.Minute, 2*took))
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.answering[t.ID] || generation != s.answerGeneration {
-		return // the answer handler records the exchange before applying its outcome
+	if s.ctx.Err() != nil || s.answering[t.ID] || generation != s.answerGeneration {
+		return delay
 	}
-	cur, gerr := s.o.Store.GetCompanionTask(t.ID)
-	if gerr != nil || cur.State != t.State {
-		return // changed meanwhile (answered, cancelled)
+	cur, readErr := s.o.Store.GetCompanionTask(t.ID)
+	if readErr != nil || cur.State != t.State || cur.RemoteID != t.RemoteID {
+		return delay
 	}
-	t = cur
-	if err == nil {
-		s.applyLocked(&t, rt)
-		return
+	if s.applyEndLocked(&cur, rt, err) {
+		return delay
 	}
-	if s.ctx.Err() != nil {
-		return
-	}
-	e := AsError(err)
-	switch {
-	case e != nil && e.Status == http.StatusNotFound:
-		s.finishLocked(&t, model.CompanionFailed, "", "Companion no longer knows this "+noun(t)+" (was tmx's key in Companion replaced?)")
-	case e != nil && e.KeyRefused && model.Now()-t.UpdatedAt <= (2*time.Hour).Milliseconds():
-		if t.Error != keyRefusedNote {
-			t.Error = keyRefusedNote
-			_ = s.saveKeepTime(&t)
+	if err != nil {
+		now := time.Now()
+		changed := false
+		if cur.LinkDownAt == 0 {
+			cur.State, cur.LinkDownAt = model.CompanionUnknown, now.UnixMilli()
+			changed = true
 		}
-	case model.Now()-t.UpdatedAt > (2 * time.Hour).Milliseconds():
-		s.finishLocked(&t, model.CompanionFailed, "", "tmx could not reach Companion for 2 hours to follow the "+noun(t)+": "+err.Error())
+		if cur.LastReadAt == 0 {
+			cur.LastReadAt = now.UnixMilli()
+			changed = true
+		}
+		keyNote := pollKeyNote(cur.Error)
+		if e := AsError(err); e != nil && (e.KeyRefused || e.Status == http.StatusUnauthorized || e.Status == http.StatusForbidden) {
+			keyNote = keyNotePrefix + strings.ReplaceAll(e.Msg, "\n", " ")
+		}
+		note := pollNote(cur.LinkDownAt, cancellationNote(cur.Error), keyNote)
+		if changed || cur.Error != note {
+			cur.Error = note
+			_ = s.saveKeepTime(&cur)
+		}
+		s.expireFollowLocked(&cur, now)
+		return delay
+	}
+	cancelNote := cancellationNote(cur.Error)
+	cur.PollStoppedAt, cur.LinkDownAt, cur.LastReadAt = 0, 0, model.Now()
+	if key := progressKey(rt); key != cur.ProgressKey {
+		cur.ProgressKey, cur.ProgressAt = key, cur.LastReadAt
+	}
+	if err := s.o.Store.PutCompanionTask(cur); err != nil {
+		s.log.Warn("companion: store polling clocks", "task", cur.ID, "err", err)
+	}
+	s.applyLocked(&cur, rt)
+	if cancelNote != "" && !cur.State.Done() && cur.Error != cancelNote {
+		cur.Error = cancelNote
+		_ = s.saveKeepTime(&cur)
+	}
+	return delay
+}
+
+func (s *Service) applyEndLocked(t *model.CompanionTask, rt Task, err error) bool {
+	if err != nil {
+		e := AsError(err)
+		if e == nil || (e.Status != http.StatusNotFound && e.Status != http.StatusGone && e.Reason != ReasonTaskNotFound) {
+			return false
+		}
+		s.finishLocked(t, model.CompanionEndedWithoutReport, "",
+			"The Companion "+noun(*t)+" ended without a report. Companion no longer knows this "+noun(*t)+" (was tmx's key in Companion replaced?).")
+		return true
+	}
+	switch rt.Status.State {
+	case StateCompleted, StateFailed, StateCanceled:
+		s.applyLocked(t, rt)
+		return true
 	default:
-		if t.Error != err.Error() {
-			t.Error = err.Error()
-			_ = s.saveKeepTime(&t)
-		}
+		return false
 	}
+}
+
+func (s *Service) endedWithoutReportLocked(t *model.CompanionTask) {
+	s.finishLocked(t, model.CompanionEndedWithoutReport, "", "The Companion "+noun(*t)+" ended without a report.")
 }
 
 // applyLocked maps Companion's task onto ours.
 func (s *Service) applyLocked(t *model.CompanionTask, rt Task) {
 	switch rt.Status.State {
 	case StateCompleted:
-		s.finishLocked(t, model.CompanionCompleted, strings.TrimSpace(rt.Result()), "")
+		result := rt.Result()
+		if result == "" {
+			result = rt.StatusText()
+		}
+		if result == "" {
+			s.endedWithoutReportLocked(t)
+			return
+		}
+		s.finishLocked(t, model.CompanionCompleted, result, "")
 	case StateFailed:
 		msg := rt.StatusText()
-		if msg == "" {
-			msg = "Companion reported the " + noun(*t) + " as failed."
+		result := rt.Result()
+		if msg == "" && result == "" {
+			s.endedWithoutReportLocked(t)
+			return
 		}
-		s.finishLocked(t, model.CompanionFailed, strings.TrimSpace(rt.Result()), msg)
+		s.finishLocked(t, model.CompanionFailed, result, msg)
 	case StateCanceled:
-		s.finishLocked(t, model.CompanionCanceled, "", "Companion cancelled the "+noun(*t)+".")
+		if result := rt.Result(); result != "" {
+			s.finishLocked(t, model.CompanionCanceled, result, "Companion cancelled the "+noun(*t)+".")
+		} else {
+			s.endedWithoutReportLocked(t)
+		}
 	case StateInputRequired:
 		q := rt.Question()
 		if q == "" {
@@ -1016,23 +1459,33 @@ func (s *Service) applyLocked(t *model.CompanionTask, rt Task) {
 				return
 			}
 			t.State, t.Question, t.Error = model.CompanionInputRequired, q, ""
-			askedLocked(t, q)
+			fresh := askedLocked(t, q)
+			if fresh {
+				t.QueueReleased = false
+			}
 			_ = s.save(t)
-			if t.Origin == "agent" && t.AgentID != "" {
+			if fresh && t.Origin == "agent" && t.AgentID != "" {
 				if _, err := s.o.Fleet.DeliverCompanion(t.AgentID, QuestionMail(*t, q)); err != nil {
 					s.log.Warn("companion question mail", "message", t.ID, "agent", t.AgentID, "err", err)
 				}
 			}
 			return
 		}
-		if t.State == model.CompanionInputRequired && t.Question == q && t.QuestionApprovalID != "" {
+		if (t.State == model.CompanionInputRequired || t.State == model.CompanionUnknown) &&
+			t.Question == q && t.QuestionApprovalID != "" {
+			if t.State == model.CompanionUnknown {
+				t.State, t.Error = model.CompanionInputRequired, ""
+				_ = s.save(t)
+			}
 			return
 		}
 		if t.QuestionApprovalID != "" {
 			s.o.Fleet.ExpireApproval(t.QuestionApprovalID, "Companion asked something else")
 		}
 		t.State, t.Question, t.Error = model.CompanionInputRequired, q, ""
-		askedLocked(t, q)
+		if askedLocked(t, q) {
+			t.QueueReleased = false
+		}
 		ap, err := s.o.Fleet.CompanionApproval(t.AgentID, model.ToolCompanionQuestion, q,
 			"Companion asks about the task “"+short(t.Spec.Goal, 80)+"”. Your answer goes to Companion; deny cancels the task.",
 			model.CompanionApprovalInput{TaskID: t.ID, Question: q})
@@ -1043,8 +1496,12 @@ func (s *Service) applyLocked(t *model.CompanionTask, rt Task) {
 		}
 		_ = s.save(t)
 	default: // submitted, working, or a state this tmx does not know
-		if t.State != model.CompanionWorking || t.Error != "" {
-			t.State, t.Error = model.CompanionWorking, ""
+		if t.State != model.CompanionWorking || t.Error != "" || t.QueueReleased || t.Question != "" {
+			if t.QuestionApprovalID != "" {
+				s.o.Fleet.ExpireApproval(t.QuestionApprovalID, "Companion resumed the task")
+			}
+			t.State, t.Error, t.QueueReleased = model.CompanionWorking, "", false
+			t.Question, t.QuestionApprovalID = "", ""
 			_ = s.save(t)
 		}
 	}
@@ -1062,6 +1519,7 @@ func (s *Service) finish(t *model.CompanionTask, state model.CompanionTaskState,
 // mail (the conversation shows them).
 func (s *Service) finishLocked(t *model.CompanionTask, state model.CompanionTaskState, result, note string) {
 	t.State, t.Result, t.Error, t.FinishedAt, t.NextAt = state, result, note, model.Now(), 0
+	t.PollStoppedAt, t.LinkDownAt, t.QueueReleased = 0, 0, false
 	if t.QuestionApprovalID != "" {
 		s.o.Fleet.ExpireApproval(t.QuestionApprovalID, "the Companion "+noun(*t)+" ended")
 		t.QuestionApprovalID = ""
@@ -1111,8 +1569,7 @@ func (s *Service) save(t *model.CompanionTask) error {
 	return s.saveKeepTime(t)
 }
 
-// saveKeepTime stores and publishes without touching UpdatedAt (poll errors keep the time of
-// the last real change, which bounds how long tmx keeps trying).
+// saveKeepTime stores and publishes without touching UpdatedAt.
 func (s *Service) saveKeepTime(t *model.CompanionTask) error {
 	if err := s.o.Store.PutCompanionTask(*t); err != nil {
 		return err

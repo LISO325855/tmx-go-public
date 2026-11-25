@@ -27,6 +27,7 @@ type deviceFixture struct {
 	now     time.Time
 	grace   string
 	paths   config.Paths
+	ua      string // the remote browser's User-Agent ("" = none: a computer)
 }
 
 func newDeviceFixture(t *testing.T) *deviceFixture {
@@ -84,6 +85,9 @@ func (f *deviceFixture) request(t *testing.T, method, path, host string, body an
 	if cookie != nil {
 		r.AddCookie(cookie)
 	}
+	if f.ua != "" && host != "localhost" {
+		r.Header.Set("User-Agent", f.ua)
+	}
 	w := httptest.NewRecorder()
 	f.handler.ServeHTTP(w, r)
 	return w
@@ -112,7 +116,7 @@ func responseString(t *testing.T, v map[string]json.RawMessage, key string) stri
 func responseCookie(t *testing.T, w *httptest.ResponseRecorder, name string) *http.Cookie {
 	t.Helper()
 	for _, c := range w.Result().Cookies() {
-		if c.Name == name {
+		if c.Name == name || strings.HasPrefix(c.Name, name+"-") { // a device session is named per port
 			return c
 		}
 	}

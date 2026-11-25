@@ -56,8 +56,8 @@ func TestChatBoardRoutes(t *testing.T) {
 	if s := alex.do("POST", "/api/chats/"+g.ID+"/board/log", map[string]string{"topic": tp.ID, "kind": "decision", "text": "casa mulin."}, nil); s != 200 {
 		t.Fatalf("the same line: %d", s)
 	}
-	if s := alex.do("POST", "/api/chats/"+g.ID+"/board/log", map[string]string{"topic": tp.ID, "kind": "info", "text": "token: abcdef123456"}, nil); s != 400 {
-		t.Fatalf("a secret: %d", s)
+	if s := alex.do("POST", "/api/chats/"+g.ID+"/board/log", map[string]string{"topic": tp.ID, "kind": "rumour", "text": "heard it somewhere"}, nil); s != 400 {
+		t.Fatalf("an unknown kind: %d", s)
 	}
 	if s := alex.do("PUT", "/api/chats/"+g.ID+"/board/order", map[string][]string{"ids": {tp.ID, "general"}}, nil); s != 200 {
 		t.Fatalf("order: %d", s)

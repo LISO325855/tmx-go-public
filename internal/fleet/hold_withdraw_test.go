@@ -18,6 +18,7 @@ func TestWithdrawHoldAndAllowedBefore(t *testing.T) {
 	e.chat.Last(head.ID).State(model.StateWorking)
 	waitState(t, f, "head", model.StateWorking)
 	req := HoldRequest{Tool: "Bash", Command: "sudo true", Rule: guard.RuleElevation, Cwd: "/w"}
+	holdRules(t, f, guard.RuleElevation)
 
 	ap, err := f.Hold(me, req)
 	if err != nil {
@@ -66,6 +67,10 @@ func TestWithdrawHoldAndAllowedBefore(t *testing.T) {
 	f.CancelHold(me, other.ID)
 
 	// Any other held rule: the same call allowed once is allowed again without a card.
+	// (git-rewrite is Allowed by default since defaults version 2: the owner holds it here.)
+	if _, err := f.SetRuleState(OwnerCaller, guard.RuleGitRewrite, guard.Hold); err != nil {
+		t.Fatal(err)
+	}
 	push := HoldRequest{Tool: "Bash", Command: "git push --force origin main", Rule: guard.RuleGitRewrite, Cwd: "/w"}
 	first, _ := f.Hold(me, push)
 	if _, err := f.Decide(OwnerCaller, first.ID, DecideRequest{Decision: "allow"}); err != nil {
@@ -103,7 +108,7 @@ func TestWithdrawHoldAndAllowedBefore(t *testing.T) {
 	}
 
 	// The settings PUT keeps the memory: only the git push (elevation is never recorded).
-	if s, _ := f.SetGuardSettings(OwnerCaller, guard.Settings{Enabled: true}); len(s.AllowedBefore) != 1 {
+	if s, _ := f.SetGuardSettings(OwnerCaller, guard.Settings{}); len(s.AllowedBefore) != 1 {
 		t.Fatalf("settings PUT dropped the memory: %v", s.AllowedBefore)
 	}
 }

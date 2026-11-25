@@ -78,12 +78,20 @@ func ClassifyBrowserCommand(goos string, allowBrowserAutomation bool, command st
 	// A launch may be chained after another command (;, &&, ||), piped, backgrounded, or
 	// wrapped (cmd /c, powershell/pwsh -c, the PowerShell call operator &): check every segment
 	// in command position, not just the first word of the whole line.
-	for _, seg := range commandSegments(command) {
+	// A here-document that is data (an inline Python script, a file's text) is not a list of
+	// commands: it is judged as a script (heredoc.go), the rest of the line as commands.
+	line, docs := splitHereDocs(command)
+	for _, d := range docs {
+		if scriptDrivesBrowser.MatchString(d.body) {
+			return BrowserCommand
+		}
+	}
+	for _, seg := range commandSegments(line) {
 		if segmentLaunchesBrowser(commandWords(seg)) {
 			return BrowserCommand
 		}
 	}
-	for _, w := range commandWords(command) {
+	for _, w := range commandWords(line) {
 		if remoteDebuggingFlag.MatchString(stripQuotes(w)) {
 			return BrowserCommand
 		}

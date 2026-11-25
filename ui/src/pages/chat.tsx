@@ -1,6 +1,10 @@
+import { focusComposer, canAutoFocusComposer } from "@/lib/composer-focus";
+import { reloadGate } from "@/lib/reload-guard";
+import { clearSubmittedDraft, ReloadSafeDrafts } from "@/lib/composer-draft";
 // One chat with other people's tmx: a calm message list (who wrote it: a person or their
 // agent; delivery state; time), the composer, the agent taking part, and the members /
 // contact panel.
+import { useClassic } from "@/hooks/use-classic";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { PinMessageButton } from "@/components/message-pins";
 import { ArrowUp, AtSign, Bot, Clock3, Download, Ellipsis, Info, Loader2, LogOut, MessagesSquare, PanelRight, QrCode, Trash2, Users, Waypoints } from "lucide-react";
@@ -16,6 +20,7 @@ import { ChatBoardView } from "@/components/chat/board-view";
 import { Markdown } from "@/components/markdown";
 import { AttachButton, AttachChips, DropOverlay, useAttachments } from "@/components/attach";
 import { DictateButton } from "@/components/dictate-button";
+import { DictationInline } from "@/components/dictation-inline";
 import { AttachmentList } from "@/components/conversation/attachments";
 import { formatSize, type AttachedFile } from "@/lib/attachments";
 import { matchMentionables, mentionQuery, withMentionLinks } from "@/lib/mentions";
@@ -29,7 +34,7 @@ import { chatApi, chatUI, loadEarlierMessages, loadMessages, senderName, useChat
 import { href, navigate, paths } from "@/lib/router";
 import { cn } from "@/lib/utils";
 
-const drafts = new Map<string, string>();
+const drafts = new ReloadSafeDrafts("tmx.chat-composer-drafts");
 const PANEL_KEY = "tmx.chat.panel";
 
 function dayLabel(ms: number): string {
@@ -110,6 +115,7 @@ function DownloadChatFile({ chatId, file }: { chatId: string; file: ChatFile }) 
 }
 
 function MessageRow({ chat, m, first }: { chat: Chat; m: ChatMessage; first: boolean }) {
+  const classic = useClassic();
   if (m.sender === CHAT_SYSTEM) {
     return (
       <div className="flex justify-center py-2">
@@ -140,7 +146,7 @@ function MessageRow({ chat, m, first }: { chat: Chat; m: ChatMessage; first: boo
             <span className="tabular text-2xs text-subtle-foreground" title={absoluteTime(m.at)}>
               {clockTime(t)}
             </span>
-            <TopicChip chatId={chat.id} topic={m.topic} />
+            {!classic && <TopicChip chatId={chat.id} topic={m.topic} />}
           </div>
         )}
         <div className="flex items-end gap-2">
@@ -188,8 +194,9 @@ function Banner({ chat }: { chat: Chat }) {
 /** The chat's composer. On the board it writes in one topic (topic set); in the chat a picker
  * chooses the topic. */
 function ChatComposer({ chat, topic: fixedTopic, placeholder, autoFocus }: { chat: Chat; topic?: string; placeholder?: string; autoFocus?: boolean }) {
+  const classic = useClassic();
   const [pickedTopic, setPickedTopic] = useTopicChoice(chat.id);
-  const topic = fixedTopic ?? pickedTopic;
+  const topic = classic ? "general" : fixedTopic ?? pickedTopic;
   const [text, setText] = useState(() => drafts.get(chat.id) ?? "");
   const [sending, setSending] = useState(false);
   const ta = useRef<HTMLTextAreaElement>(null);
@@ -236,7 +243,7 @@ function ChatComposer({ chat, topic: fixedTopic, placeholder, autoFocus }: { cha
     drafts.set(chat.id, next);
     setMq(null);
     requestAnimationFrame(() => {
-      el.focus();
+      focusComposer(el);
       el.setSelectionRange(pos, pos);
     });
   }
@@ -250,21 +257,25 @@ function ChatComposer({ chat, topic: fixedTopic, placeholder, autoFocus }: { cha
 
   const canSend = active && !sending && !att.uploading && (!!text.trim() || att.readyIds.length > 0);
 
-  async function send() {
-    const body = text.trim();
-    if (!canSend) return;
+  async function send(voiceText?: string, _voiceId?: string, signal?: AbortSignal) {
+    const voice = voiceText !== undefined;
+    const body = (voiceText ?? text).trim();
+    if (!voice && !canSend) return;
+    if (voice && !active) throw new Error("You cannot write here any more.");
+    const releaseReload = reloadGate.hold();
     setSending(true);
     try {
-      await chatApi.send(chat.id, body, att.readyIds, topic === "general" ? "" : topic);
-      setText("");
-      drafts.delete(chat.id);
-      att.clear();
-      setMq(null);
+      await chatApi.send(chat.id, body, voice ? [] : att.readyIds, topic === "general" ? "" : topic, signal);
+      if (!voice && clearSubmittedDraft(drafts, chat.id, text)) setText("");
+      if (!voice) att.clear();
+      if (!voice) setMq(null);
     } catch (e) {
+      if (voice) throw e;
       toast.error((e as Error).message || "The message wasn't sent.");
     } finally {
       setSending(false);
-      ta.current?.focus();
+      releaseReload();
+      if (!voice) focusComposer(ta.current);
     }
   }
 
@@ -288,6 +299,7 @@ function ChatComposer({ chat, topic: fixedTopic, placeholder, autoFocus }: { cha
   return (
     <div className={cn("shrink-0", fixedTopic === undefined ? "px-4 pt-2 pb-4 md:px-6" : "px-3 pb-3")}>
       <div className="mx-auto max-w-[51.25rem]">
+        <DictationInline boxId={"chat:" + chat.id} />
         <div
           className={cn(
             "relative rounded-xl border border-border-strong bg-card transition-[border-color,box-shadow] duration-150 focus-within:border-ring focus-within:ring-2 focus-within:ring-ring/25",
@@ -375,7 +387,7 @@ function ChatComposer({ chat, topic: fixedTopic, placeholder, autoFocus }: { cha
                 void send();
               }
             }}
-            autoFocus={autoFocus}
+            autoFocus={autoFocus && canAutoFocusComposer()}
             placeholder={active ? (placeholder ?? `Message ${chat.name}…`) : "You can't write here any more"}
             aria-label={`Message ${chat.name}`}
             aria-autocomplete="list"
@@ -388,10 +400,11 @@ function ChatComposer({ chat, topic: fixedTopic, placeholder, autoFocus }: { cha
               hint="Attach files (up to 25 MB) · or paste / drop them here"
               onFiles={(f) => {
                 att.add(f);
-                ta.current?.focus();
+                focusComposer(ta.current);
               }}
             />
             <DictateButton
+              onSend={send}
               target={ta}
               value={text}
               draft={{ id: "chat:" + chat.id, label: chat.name, path: paths.chat(chat.id), drafts, draftKey: chat.id }}
@@ -422,7 +435,7 @@ function ChatComposer({ chat, topic: fixedTopic, placeholder, autoFocus }: { cha
                     setMq({ start: pos - 1, query: "" });
                     setPick(0);
                     requestAnimationFrame(() => {
-                      el.focus();
+                      focusComposer(el);
                       el.setSelectionRange(pos, pos);
                     });
                   }}
@@ -432,7 +445,7 @@ function ChatComposer({ chat, topic: fixedTopic, placeholder, autoFocus }: { cha
               </TooltipTrigger>
               <TooltipContent>Mention someone · or type @</TooltipContent>
             </Tooltip>
-            {fixedTopic === undefined && <TopicPicker chat={chat} value={pickedTopic} onChange={setPickedTopic} disabled={!active} />}
+            {!classic && fixedTopic === undefined && <TopicPicker chat={chat} value={pickedTopic} onChange={setPickedTopic} disabled={!active} />}
             <span className="ml-1 flex min-w-0 items-center gap-1.5 truncate text-2xs text-subtle-foreground">
               {queuedCount > 0 && <Clock3 className="size-3 shrink-0" />}
               <span className="truncate">{hint}</span>
@@ -530,7 +543,8 @@ function readPanel(): boolean {
 }
 
 export function ChatPage({ id, view }: { id: string; view?: string }) {
-  const board = view === "board";
+  const classic = useClassic();
+  const board = !classic && view === "board";
   const chat = useChats((s) => s.chats[id]);
   const enabled = useChats((s) => s.enabled);
   const contact = useChats((s) => (chat?.peer_id ? s.contacts[chat.peer_id] : undefined));
@@ -598,7 +612,7 @@ export function ChatPage({ id, view }: { id: string; view?: string }) {
         <PageHeader
           actions={
             <>
-              <ViewSwitch chat={chat} board={board} />
+              {!classic && <ViewSwitch chat={chat} board={board} />}
               <AgentPicker chat={chat} className="hidden sm:flex" />
               <Tooltip>
                 <TooltipTrigger asChild>
@@ -669,7 +683,7 @@ export function ChatPage({ id, view }: { id: string; view?: string }) {
           <ChatBoardView
             chat={chat}
             composer={({ topic, title, autoFocus }) => (
-              <ChatComposer key={chat.id + "#" + topic} chat={chat} topic={topic} autoFocus={autoFocus} placeholder={`Write in ${title}…`} />
+              <ChatComposer key={chat.id + "#" + topic} chat={chat} topic={topic} autoFocus={autoFocus && canAutoFocusComposer()} placeholder={`Write in ${title}…`} />
             )}
           />
         ) : (

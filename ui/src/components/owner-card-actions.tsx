@@ -3,6 +3,9 @@ import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { DictateButton } from "@/components/dictate-button";
+import { DictationInline } from "@/components/dictation-inline";
+import { useClassic } from "@/hooks/use-classic";
+import { cardChoices, NOT_APPLICABLE_ANSWER, NOT_APPLICABLE_LABEL } from "@/lib/card-choices";
 import { api, dropApproval } from "@/lib/api";
 import { beginCardSend, endCardSend, cardSendFailed, clearUnchangedCardWords, boundedCardRequest, cardAnswerKey, cardDictationDrafts, clearCardAnswer, saveCardAnswer, saveCardDraft, useCardAnswers, useCardDrafts } from "@/lib/card-answers";
 import { useStore } from "@/lib/store";
@@ -22,6 +25,10 @@ export const OwnerCardActions = forwardRef<ApprovalActionsHandle, { a: Approval;
     const [failure, setFailure] = useState("");
     const [missing, setMissing] = useState(false);
     const input = useRef<HTMLTextAreaElement>(null);
+    const classic = useClassic();
+    // Classic (Python's cards): the recommended choice first and marked on its button. The default
+    // dashboard keeps the agent's order; the data attributes are there for both (phone layout).
+    const choices = cardChoices(a.options, classic ? a.card?.recommendation : undefined);
     const text = draft?.text || "";
     const original = draft?.card || a;
     const changed = !!current && (pending?.request.version ?? original.version) !== current.version;
@@ -80,7 +87,8 @@ export const OwnerCardActions = forwardRef<ApprovalActionsHandle, { a: Approval;
     }
 
     useImperativeHandle(ref, () => ({ allow() {}, deny() {}, pick(i) {
-      if (!pending && !changed && !closed && !a.deferred && !text && a.options?.[i]) void send("answer", a.options[i]);
+      // the number keys follow the buttons as shown
+      if (!pending && !changed && !closed && !a.deferred && !text && choices[i]) void send("answer", choices[i].label);
     } }));
 
     if (pending) return <div className="space-y-2 text-sm" role="status">
@@ -99,8 +107,9 @@ export const OwnerCardActions = forwardRef<ApprovalActionsHandle, { a: Approval;
     return <div className="space-y-2">
       {changed && <p role="status" className="text-sm">The question changed. Your words are saved; review the new question before sending.</p>}
       {closed && <p role="status" className="text-sm">This card closed or left the list. Your words are saved. Sending delivers correspondence, without changing a closed decision.</p>}
-      {!closed && !changed && !text && <div className="flex flex-wrap gap-1.5">{a.options?.map((option) => <Button key={option} variant="outline" size={size} disabled={busy} onClick={() => void send("answer", option)}>{option}</Button>)}</div>}
+      {!closed && !changed && !text && <div className="flex flex-wrap gap-1.5" data-card-choices>{choices.map((c) => <Button key={c.index} variant={c.recommended ? "default" : "outline"} size={size} disabled={busy} data-recommended={c.recommended || undefined} onClick={() => void send("answer", c.label)}>{c.label}{c.recommended && <span className="ml-1 text-2xs font-normal opacity-80">· recommended</span>}</Button>)}</div>}
       <form className="space-y-2" onSubmit={(e) => { e.preventDefault(); if (text.trim() && !changed) void send("answer", text, true); }}>
+        <DictationInline boxId={`card:${key}:${original.version}`} />
         <Textarea ref={input} value={text} onChange={(e) => edit(e.target.value)} aria-label="Your answer" placeholder="Your answer…" disabled={busy} />
         <div className="flex flex-wrap gap-1.5">
           <DictateButton target={input} value={text} onChange={edit} disabled={busy} draft={{ id: `card:${key}:${original.version}`, label: a.question || "this question", path: paths.inbox(), drafts: cardDictationDrafts(scope, original), draftKey: key }} />
@@ -108,6 +117,10 @@ export const OwnerCardActions = forwardRef<ApprovalActionsHandle, { a: Approval;
           {changed && <Button type="button" size={size} onClick={reviewCurrent}>Review answer for this question</Button>}
           {text && <Button type="button" size={size} variant="ghost" onClick={() => void copyAndClose()}>Copy answer and close</Button>}
           {!text && !closed && <Button type="button" size={size} variant="ghost" disabled={busy} onClick={() => void send(a.deferred ? "reask" : "defer")}>{a.deferred ? "Ask me again" : "Later"}</Button>}
+          {/* classic: Python's way to close a card that does not apply; the agent is told not to wait */}
+          {classic && !text && !closed && !a.deferred && (
+            <Button type="button" size={size} variant="ghost" className="text-muted-foreground" disabled={busy || changed} onClick={() => void send("answer", NOT_APPLICABLE_ANSWER)}>{NOT_APPLICABLE_LABEL}</Button>
+          )}
         </div>
       </form>
     </div>;

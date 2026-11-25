@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/blackcode-ch/tmx-go/internal/summarize"
@@ -17,7 +16,7 @@ const summarizeTimeout = summarize.RunTimeout + 2*time.Minute
 // SummarizeLocal has host's daemon run one generate on its own local model (summarize.Peer; summaries.via_peer).
 // The transcript and frames go to that machine of our own fleet only, over its pair-token route.
 func (c *Client) SummarizeLocal(ctx context.Context, host string, in summarize.PeerGenerate) (string, error) {
-	peer, ok := c.peers[strings.ToLower(host)]
+	peer, ok := c.lookup(host)
 	if !ok {
 		return "", fmt.Errorf("%s is not a fleet peer of this daemon (config \"peers\")", host)
 	}

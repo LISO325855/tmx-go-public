@@ -8,9 +8,8 @@ import (
 )
 
 // Peer-to-peer answers the owner's own config (3 Nov: the pair-token fleet transport doesn't cover
-// person-to-person contacts/chats, which is what this is for); automatic updates stay off
-// regardless (no signed release path yet - a separate concern).
-func TestProductionProfileHonoursP2PKeepsUpdatesOff(t *testing.T) {
+// person-to-person contacts/chats); explicit automatic update settings are honoured too.
+func TestProductionProfileHonoursP2PAndUpdates(t *testing.T) {
 	var c Config
 	err := json.Unmarshal([]byte(`{"profile":"production","p2p":{"enabled":true,"dht":true,"mdns":true,"nat_port_map":true},"whatsapp":{"enabled":true},"companion":{"enabled":true},"update":{"auto":true}}`), &c)
 	if err != nil {
@@ -23,8 +22,8 @@ func TestProductionProfileHonoursP2PKeepsUpdatesOff(t *testing.T) {
 	if !c.P2P.On() || !c.P2P.DHTOn() || !c.P2P.MDNSOn() || !c.P2P.NATPortMapOn() {
 		t.Fatal("production ignored the owner's peer-to-peer config")
 	}
-	if *c.Update.Resolved().Auto {
-		t.Fatal("production enabled automatic updates")
+	if !*c.Update.Resolved().Auto {
+		t.Fatal("production ignored automatic updates")
 	}
 	if !c.WhatsApp.On() || !c.Companion.On() {
 		t.Fatal("production ignored the owner's WhatsApp/Companion switches")

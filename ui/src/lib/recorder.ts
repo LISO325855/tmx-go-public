@@ -7,6 +7,7 @@
 // the one audio track and tapped as 16 kHz mono PCM16 for the WAV next to every segment, and a
 // still JPEG goes up every 30 s for the summaries. Closing the window ends the capture; the
 // daemon then marks the recording interrupted and keeps what arrived.
+import { bytesBase64 } from "./rec-upload";
 import { create } from "zustand";
 import { toast } from "sonner";
 import { useStore } from "./store";
@@ -102,7 +103,7 @@ interface Chunk {
   n: number;
   track: "media" | "pcm";
   offset: number;
-  data: Blob | Uint8Array;
+  data: Uint8Array | Blob;
   size: number;
   dur: number;
   at: number;
@@ -160,6 +161,9 @@ class Session {
   private timers: ReturnType<typeof setInterval>[] = [];
   private offUpdates: () => void;
   private recorders = new Set<MediaRecorder>();
+  private mediaReads: Promise<void> = Promise.resolve();
+  private pendingMedia = new Set<{ blob: Blob | null; size: number; at: number }>();
+  private mediaClosed = false;
   private lastMediaAt = Date.now();
   private stateSeq = 0; // bumped by every pause or resume made here
   private changing = false; // a pause or resume made here is on its way to the daemon
@@ -175,7 +179,7 @@ class Session {
   private looking = false;
   private keyAt = 0;
   private keyCount = 0;
-  private frameQ: { ms: number; blob: Blob; tries: number; key: boolean }[] = [];
+  private frameQ: { ms: number; data: Uint8Array; tries: number; key: boolean }[] = [];
   private frameSending = false;
   private frameWarned = false;
   ended = false;
@@ -233,11 +237,45 @@ class Session {
     const mr = new MediaRecorder(this.stream, opts);
     this.recorders.add(mr);
     mr.ondataavailable = (e) => {
-      if (!e.data || e.data.size === 0 || this.ended) return;
+      if (!e.data || e.data.size === 0 || this.ended || this.mediaClosed) return;
       this.lastMediaAt = Date.now();
       if (n === this.seg) this.segBytes += e.data.size;
       this.maxChunk = Math.max(this.maxChunk, e.data.size);
-      this.enqueue(n, "media", e.data, e.data.size);
+      const pending = { blob: e.data as Blob | null, size: e.data.size, at: Date.now() };
+      this.pendingMedia.add(pending);
+      this.updateBacklog(); // include unread Blobs in the same cap as converted bytes
+      if (this.ended) return;
+      // Capture a clearable holder, not the event: timeout/abort releases queued Blobs
+      // even if the first browser read never settles. Reads still preserve event order.
+      this.mediaReads = this.mediaReads.then(async () => {
+        if (this.ended || !pending.blob) return;
+        try {
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          let data: Uint8Array | Blob;
+          try {
+            const buffer = await Promise.race([
+              pending.blob.arrayBuffer(),
+              new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), 10_000); }),
+            ]);
+            if (!pending.blob || this.ended) return;
+            data = buffer === null ? pending.blob : new Uint8Array(buffer);
+          } finally {
+            clearTimeout(timer);
+          }
+          if (!this.ended && pending.blob) {
+            this.pendingMedia.delete(pending);
+            pending.blob = null;
+            this.enqueue(n, "media", data, pending.size, pending.at);
+          }
+        } catch (error) {
+          if (!this.ended && pending.blob) await this.abort("The recorded audio/video could not be read: " + String(error));
+        } finally {
+          pending.blob = null;
+          this.pendingMedia.delete(pending);
+          if (!this.ended) this.updateBacklog();
+        }
+      });
+
     };
     mr.onstop = () => this.recorders.delete(mr);
     mr.onerror = (e) => void this.abort("The recorder failed: " + ((e as unknown as { error?: Error }).error?.message ?? "unknown error"));
@@ -249,22 +287,46 @@ class Session {
     return this.segBase + (this.segSince ? now - this.segSince : 0);
   }
 
-  private enqueue(n: number, track: "media" | "pcm", data: Blob | Uint8Array, size: number) {
+  private enqueue(n: number, track: "media" | "pcm", data: Uint8Array | Blob, size: number, at = Date.now()) {
     const key = n + track;
     const offset = this.offsets.get(key) ?? 0;
     this.offsets.set(key, offset + size);
     const dur = n === this.seg ? this.segMs() : (this.segDur.get(n) ?? 0);
-    this.queue.push({ n, track, offset, data, size, dur, at: Date.now() });
+    this.queue.push({ n, track, offset, data, size, dur, at });
     this.updateBacklog();
     void this.pump();
   }
 
   private updateBacklog() {
-    const bytes = this.queue.reduce((a, c) => a + c.size, 0);
+    const pending = [...this.pendingMedia];
+    const bytes = this.queue.reduce((a, c) => a + c.size, 0) + pending.reduce((a, c) => a + c.size, 0);
     setLocal({ backlog: bytes });
-    const oldest = this.queue[0];
-    if (oldest && (Date.now() - oldest.at > MAX_BACKLOG_MS || bytes > MAX_BACKLOG_BYTES))
+    const oldest = pending.reduce((at, c) => Math.min(at, c.at), this.queue.reduce((at, c) => Math.min(at, c.at), Infinity));
+    if (Date.now() - oldest > MAX_BACKLOG_MS || bytes > MAX_BACKLOG_BYTES)
       void this.abort("The daemon stopped taking the recording, so it ended. What arrived before is kept.");
+  }
+
+  private discardPendingMedia() {
+    this.mediaClosed = true;
+    for (const pending of this.pendingMedia) pending.blob = null;
+    this.pendingMedia.clear();
+    this.mediaReads = Promise.resolve();
+  }
+
+  /** Stop must finish even when a browser Blob read never resolves. */
+  private async drainMedia(): Promise<number> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const complete = await Promise.race([
+      this.mediaReads.then(() => true),
+      new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), 25_000); }),
+    ]);
+    clearTimeout(timer);
+    if (complete) return 0;
+    const lost = this.pendingMedia.size;
+    this.discardPendingMedia();
+    this.updateBacklog();
+    console.warn(`recorder: timed out after 25 s reading media; keeping converted chunks, dropping ${lost} unread chunk(s).`);
+    return lost;
   }
 
   private async pump() {
@@ -319,7 +381,7 @@ class Session {
       await putRaw(this.t, `${path}/segments/${c.n}?track=${c.track}&offset=${c.offset}&dur=${Math.round(c.dur)}`, c.data, "application/octet-stream");
       return;
     }
-    const data = await toBase64(c.data);
+    const data = c.data instanceof Blob ? await blobBase64(c.data) : bytesBase64(c.data);
     await this.t.request("POST", `${path}/chunks`, { segment: c.n, track: c.track, offset: c.offset, dur_ms: Math.round(c.dur), data });
   }
 
@@ -330,15 +392,16 @@ class Session {
     ms = Math.round(ms);
     if (!this.grabber || this.frameCount >= MAX_FRAMES || this.framesAt.has(ms)) return;
     this.framesAt.add(ms);
-    let blob: Blob | null = null;
+    let data: Uint8Array | null = null;
     try {
-      blob = await this.grabber.grab();
+      const blob = await this.grabber.grab();
+      if (blob) data = new Uint8Array(await blob.arrayBuffer());
     } catch {
       /* no frame this time */
     }
-    if (!blob || this.ended) return;
+    if (!data || this.ended) return;
     this.frameCount++;
-    this.frameQ.push({ ms, blob, tries: 0, key });
+    this.frameQ.push({ ms, data, tries: 0, key });
     void this.pumpFrames();
   }
 
@@ -392,10 +455,10 @@ class Session {
     }
   }
 
-  private async sendFrame(f: { ms: number; blob: Blob; key: boolean }) {
+  private async sendFrame(f: { ms: number; data: Uint8Array; key: boolean }) {
     const path = `/api/recordings/${encodeURIComponent(this.rec.id)}/frames/${f.ms}`;
-    if (this.t.kind === "http") await putRaw(this.t, f.key ? path + "?key=1" : path, f.blob, "image/jpeg");
-    else await this.t.request("PUT", path, { data: await toBase64(f.blob), key: f.key });
+    if (this.t.kind === "http") await putRaw(this.t, f.key ? path + "?key=1" : path, f.data, "image/jpeg");
+    else await this.t.request("PUT", path, { data: bytesBase64(f.data), key: f.key });
   }
 
   /** Waits for the queued frames (at most until deadline). */
@@ -420,6 +483,8 @@ class Session {
   }
 
   private tick() {
+    this.updateBacklog();
+    if (this.ended) return;
     if (useCapture.getState().phase !== "recording") return;
     if (this.grabber) {
       const at = localElapsed(useCapture.getState());
@@ -565,6 +630,8 @@ class Session {
           }),
       ),
     );
+    const unread = await this.drainMedia(); // includes the final asynchronous Blob read
+    if (this.ended) return;
     this.flushPCM();
     await this.frame(useCapture.getState().base); // the last picture, while the tracks still run
     this.release();
@@ -581,7 +648,7 @@ class Session {
     try {
       const r = await recApi.setState(this.rec.id, "stopped");
       upsertRecording(r);
-      finish(r, lost ? `${lost} last chunk${lost === 1 ? "" : "s"} did not reach the daemon.` : "");
+      finish(r, [lost ? `${lost} last chunk${lost === 1 ? "" : "s"} did not reach the daemon.` : "", unread ? `${unread} media chunk(s) could not be read before stopping.` : ""].filter(Boolean).join(" "));
     } catch (e) {
       finish(this.rec, (e as Error).message);
     }
@@ -614,6 +681,7 @@ class Session {
   }
 
   private release() {
+    this.discardPendingMedia();
     this.pcm?.stop();
     this.pcm = null;
     this.grabber?.stop();
@@ -864,7 +932,7 @@ window.addEventListener("beforeunload", (e) => {
 // helpers
 
 /** PUTs raw bytes to the daemon (the http transport); a refusal is an ApiError with its JSON. */
-async function putRaw(t: Transport, path: string, body: Blob | Uint8Array, type: string): Promise<void> {
+async function putRaw(t: Transport, path: string, body: Uint8Array | Blob, type: string): Promise<void> {
   let res: Response;
   try {
     res = await fetch(`${t.baseURL}${path}`, {
@@ -885,14 +953,16 @@ async function putRaw(t: Transport, path: string, body: Blob | Uint8Array, type:
     }
     throw new ApiError(res.status, (data?.error as string) || `HTTP ${res.status}`, data);
   }
+  // Release each upload acknowledgement before sending the next chunk.
+  await res.text();
 }
 
-async function toBase64(d: Blob | Uint8Array): Promise<string> {
-  const blob = d instanceof Blob ? d : new Blob([d as BlobPart]);
-  return new Promise((res, rej) => {
-    const r = new FileReader();
-    r.onload = () => res(String(r.result).replace(/^data:[^,]*,/, ""));
-    r.onerror = () => rej(r.error);
-    r.readAsDataURL(blob);
+/** Only the timed-out conversion fallback uses the original Blob bridge path. */
+function blobBase64(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result).split(",", 2)[1] ?? "");
+    reader.onerror = () => reject(reader.error ?? new Error("Could not read recorded Blob"));
+    reader.readAsDataURL(blob);
   });
 }

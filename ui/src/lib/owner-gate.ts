@@ -8,6 +8,7 @@
 // Safety's dial; it only skips the OS prompt, the owner still decides each action). The daemon
 // keeps it in memory and announces every change as "gate.updated" (no data), so this re-reads
 // GET /api/gate.
+import { rememberGateFocus } from "./gate-focus";
 import { useEffect, useState } from "react";
 import { create } from "zustand";
 import { allowForeground, ApiError } from "./transport";
@@ -26,6 +27,10 @@ interface GateState {
 }
 
 export const useGate = create<GateState>(() => ({ confirming: null, safety: null, graceAsked: null, pinError: null }));
+
+useGate.subscribe((state, prev) => {
+  if (state.confirming && !prev.confirming) rememberGateFocus();
+});
 
 // The PIN sheet's pending answer (method "pin"): submitPin resolves it once the daemon took the PIN.
 // local: a gate confirmation at this machine (POST /api/gate/confirmations/{id}/pin); otherwise a

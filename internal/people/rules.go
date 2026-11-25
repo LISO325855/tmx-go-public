@@ -97,3 +97,21 @@ func DueFireAt(due string, loc *time.Location) (time.Time, error) {
 }
 
 func ValidStatus(s string) bool { return s == Open || s == Done || s == Dropped }
+
+// WhatsApp accepts a phone number or a direct-chat JID (including privacy IDs).
+func WhatsApp(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if strings.Contains(raw, "@") {
+		user, server, _ := strings.Cut(raw, "@")
+		if user == "" || (server != "s.whatsapp.net" && server != "lid") {
+			return "", fmt.Errorf("WhatsApp must be a direct-chat JID or phone number")
+		}
+		for _, c := range user {
+			if c < '0' || c > '9' {
+				return "", fmt.Errorf("invalid WhatsApp JID")
+			}
+		}
+		return raw, nil
+	}
+	return Phone(raw)
+}

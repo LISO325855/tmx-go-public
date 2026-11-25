@@ -254,7 +254,8 @@ are from the Go parity page of 3 Nov (60 stories).
 **B4. Restart, resume, watchdog, crash-loop limit** [O02, O03]
 - *Where:* `internal/fleet/recovery.go`, `internal/config/lock.go` (one daemon per machine),
   `internal/resources/watchdog.go`, `docs/lifecycle-recovery.md`.
-- *Status:* **Partial**. Live handover between daemons is not built.
+- *Status:* **Partial**. Live handover between daemons is not built. The head is told (one digest, urgent at
+  once): `internal/fleet/watch.go`, `watch_fleet.go`, `DESIGN.md` "Watch".
 
 **B5. Adopt outside agents** [O02, #20]
 - *Decided* *(decided 3 Nov 16:16, architect)*: **a non-goal; delete it.** Agents move by a fresh relaunch plus a brief.
@@ -459,6 +460,21 @@ are from the Go parity page of 3 Nov (60 stories).
   `internal/whatsapp/`, Matrix `tool` links.
 - *Status:* **Not built yet** in Go. On Python, the services run as fleet shells (phone, WhatsApp sender), the
   mail poller is stopped, and there is no `tmx tool` command yet (bc #201).
+
+**F4. Resources: one place for everything agents can use**
+- *Story* (the owner, 17 Nov): the section was "completely missing": one place for WhatsApp, the agents' mailbox,
+  Companion, the phone number, the 4G stick and its SIM, later an Android phone or a virtual Android for calls.
+- *Intended:* One list of channels, tools, accounts, devices and storage. Each line says what it is, who holds
+  it, how an agent uses it, under which rule, and whether it works right now. The owner reads it on the Resources
+  page; agents read the same list through tools. Full agentic access: the section adds no approval step. No
+  secret is ever shown: a record holds labels, never a number, an address or a key. F3's design is carried over
+  where the owner's later orders did not replace it.
+- *Where:* `docs/RESOURCES.md`. In Go: `internal/toolbox/`, `GET /api/toolbox`, the tools `resources` and
+  `resource`, the page `#/resources`.
+- *Status:* **Partial**. Built: the list, the page, the two read tools, and live lines for WhatsApp, the AI
+  accounts, the Companion link, system tools and "is the holder up". Not built yet: asking to use a resource
+  (`resource_use`) with the use log, correcting a line (`resource_set`), health checks with one warning, the
+  send cap, and SMS or mail as a direct call.
 
 ### 4.7 Machines and resources
 

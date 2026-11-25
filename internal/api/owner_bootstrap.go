@@ -64,7 +64,7 @@ func (s *Server) issueOwnerBootstrap(w http.ResponseWriter, r *http.Request) {
 	}
 	host := config.NormalizeTrustedHost(req.Host)
 	allowed := false
-	for _, h := range s.trustedHosts {
+	for _, h := range s.TrustedHosts() {
 		if config.ValidTrustedHost(h) && config.ValidTrustedHost(req.Host) && config.NormalizeTrustedHost(h) == host {
 			allowed = true
 		}
@@ -196,14 +196,14 @@ func (s *Server) recoveryStatus(w http.ResponseWriter, r *http.Request) {
 	d := s.devices
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	i, ok := d.find(r)
+	i, tok, ok := d.findToken(r)
 	if !ok {
 		writeError(w, 403, "device session required")
 		return
 	}
 	v := d.state.Devices[i]
 	if !v.Recovery {
-		setDeviceCookie(w, deviceCookie, cookieValue(r, deviceCookie), int(v.Expires.Sub(d.now()).Seconds()))
+		s.setSessionCookie(w, r, tok, int(v.Expires.Sub(d.now()).Seconds()))
 	}
 	writeJSON(w, 200, map[string]any{"id": v.ID, "recovery": v.Recovery, "expires": v.Expires, "runbook": "Keep the independent Python tmx/SSH host route available. Repair host authentication through its existing controls. In the host Owner devices UI, confirm Upgrade with a fresh host proof before this session expires. Until then this session cannot perform owner actions. If the host UI session is lost, keep Go stopped and use the independent route; do not delete gate markers or weaken sign-in."})
 }

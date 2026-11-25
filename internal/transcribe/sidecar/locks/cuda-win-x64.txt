@@ -1,0 +1,7 @@
+# The cuBLAS and CUDA runtime DLLs CTranslate2 needs on a Windows machine with an NVIDIA GPU
+# (cuDNN comes inside the ctranslate2 wheel). Installed only when the CUDA probe sees a GPU.
+# Hashes: the win_amd64 wheels on PyPI.
+nvidia-cublas-cu12==12.9.1.4 \
+    --hash=sha256:1e5fee10662e6e52bd71dec533fbbd4971bb70a5f24f3bc3793e5c2e9dc640bf
+nvidia-cuda-runtime-cu12==12.9.79 \
+    --hash=sha256:8e018af8fa02363876860388bd10ccb89eb9ab8fb0aa749aaf58430a9f7c4891

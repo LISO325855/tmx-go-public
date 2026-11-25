@@ -6,7 +6,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"sync"
 	"time"
 
@@ -156,7 +155,7 @@ func (f *Fake) SentNow() []whatsapp.Outgoing {
 	return append([]whatsapp.Outgoing(nil), f.Sent...)
 }
 
-func (f *Fake) Download(_ context.Context, ref whatsapp.MediaRef, file *os.File) error {
+func (f *Fake) Download(_ context.Context, ref whatsapp.MediaRef, file whatsapp.DownloadFile) error {
 	f.mu.Lock()
 	data, ok := f.Media[ref.DirectPath]
 	f.Downloads++

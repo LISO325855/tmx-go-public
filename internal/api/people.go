@@ -12,9 +12,10 @@ import (
 func (s *Server) peopleRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/team", s.listPeople)
 	mux.HandleFunc("POST /api/team", s.putPerson)
-	mux.HandleFunc("POST /api/team/import", s.ownerOnly(s.importPeople)) // before {key}
+	mux.HandleFunc("POST /api/team/import", s.managers(s.importPeople)) // before {key}
 	mux.HandleFunc("GET /api/team/{key}", s.getPerson)
-	mux.HandleFunc("DELETE /api/team/{key}", s.ownerOnly(s.deletePerson))
+	mux.HandleFunc("POST /api/team/{key}/message", s.agentOnly(s.personMessage)) // person_message.go
+	mux.HandleFunc("DELETE /api/team/{key}", s.managers(s.deletePerson))
 	mux.HandleFunc("GET /api/promises", s.listPromises)
 	mux.HandleFunc("POST /api/promises", s.putPromise)
 	mux.HandleFunc("POST /api/promises/{id}", s.putPromise)

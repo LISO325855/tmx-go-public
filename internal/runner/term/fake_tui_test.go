@@ -10,6 +10,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/blackcode-ch/tmx-go/internal/harness"
 	"github.com/blackcode-ch/tmx-go/internal/hiddenexec"
@@ -177,9 +178,14 @@ func fakeTUI() {
 			return
 		}
 		in.Write(buf[:n])
+	readInput:
 		for in.Len() > 0 {
 			s := in.String()
 			switch {
+			case s == "\x1b[" || s == "\x1b[2" || s == "\x1b[20" ||
+				s == "\x1b[200" || s == "\x1b[201":
+				// A PTY read can end in the middle of a paste or cursor sequence.
+				break readInput
 			case strings.HasPrefix(s, "\x1b[200~"):
 				pasting = true
 				in.Next(6)
@@ -187,9 +193,14 @@ func fakeTUI() {
 				pasting = false
 				in.Next(6)
 			case pasting:
-				r := []rune(s)[0]
+				if !utf8.FullRuneInString(s) {
+					break readInput
+				}
+				r, size := utf8.DecodeRuneInString(s)
 				paste.WriteRune(r)
-				in.Next(len(string(r)))
+				in.Next(size)
+			case strings.HasPrefix(s, "\x1b[F"):
+				in.Next(3) // End moves the cursor, it does not insert text.
 			case strings.HasPrefix(s, "\x1b[B") || strings.HasPrefix(s, "\x1b[A"):
 				in.Next(3)
 				mu.Lock()
@@ -210,7 +221,7 @@ func fakeTUI() {
 					m.done("(cancelled)")
 				}
 				mu.Unlock()
-			case s[0] == '\r':
+			case s[0] == '\r' || s[0] == '\n':
 				in.Next(1)
 				mu.Lock()
 				if m := cur; m != nil {
@@ -224,11 +235,17 @@ func fakeTUI() {
 					continue
 				}
 				mu.Unlock()
-				text := paste.String()
+				text := strings.TrimSpace(paste.String())
 				paste.Reset()
 				handle(text)
 			default:
-				in.Next(1)
+				// The runner may send before seeing bracketed-paste mode.
+				if !utf8.FullRuneInString(s) {
+					break readInput
+				}
+				r, size := utf8.DecodeRuneInString(s)
+				paste.WriteRune(r)
+				in.Next(size)
 			}
 		}
 	}

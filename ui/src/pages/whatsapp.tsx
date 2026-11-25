@@ -25,11 +25,13 @@ import { relativeTime } from "@/lib/format";
 import { href, navigate, paths } from "@/lib/router";
 import { useStore } from "@/lib/store";
 import { cn } from "@/lib/utils";
+import { accessList, isPrivate, otherProfiles, profileLabel, readsAnyway, withAccessChat, withPrivate } from "@/lib/wa-access";
 import {
   isLinked,
   loadEarlierWaMessages,
   loadWaMessages,
   markWaRead,
+  saveWaSettings,
   sortedWaChats,
   toggleWaChatSetting,
   useWa,
@@ -358,6 +360,9 @@ function ChatMenu({ chat, s }: { chat: WaChat; s: WaStatus }) {
   const allowed = allAllowed || (set.allowed_chats?.includes(chat.jid) ?? false);
   const toggle = (key: "allowed_chats" | "notify_head_chats", on: boolean) =>
     toggleWaChatSetting(key, chat.jid, on).catch((e: Error) => toast.error(e.message || "That didn't save."));
+  // Per-chat access: which profiles' agents may read this chat (lib/wa-access.ts).
+  const access = (profile: string, on: boolean) =>
+    saveWaSettings(withAccessChat(set, profile, "read", chat.jid, on)).catch((e: Error) => toast.error(e.message || "That didn't save."));
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
@@ -366,6 +371,32 @@ function ChatMenu({ chat, s }: { chat: WaChat; s: WaStatus }) {
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" className="w-72">
+        <DropdownMenuCheckboxItem
+          checked={isPrivate(set, chat.jid)}
+          onCheckedChange={(v) => void saveWaSettings(withPrivate(set, chat.jid, !!v)).catch((e: Error) => toast.error(e.message || "That didn't save."))}
+        >
+          <span className="flex flex-col">
+            Private: the head may not read this chat
+            <span className="text-2xs text-muted-foreground">Off: the head reads it like your other chats</span>
+          </span>
+        </DropdownMenuCheckboxItem>
+        {otherProfiles(set).map((p) => {
+          const anyway = readsAnyway(set, p, chat.jid);
+          return (
+            <DropdownMenuCheckboxItem
+              key={p}
+              checked={!!anyway || accessList(set, p, "read").includes(chat.jid)}
+              disabled={!!anyway}
+              onCheckedChange={(v) => void access(p, !!v)}
+            >
+              <span className="flex flex-col">
+                {profileLabel(p)} may read this chat
+                {anyway && <span className="text-2xs text-muted-foreground">Open because {anyway}</span>}
+              </span>
+            </DropdownMenuCheckboxItem>
+          );
+        })}
+        <DropdownMenuSeparator />
         <DropdownMenuCheckboxItem checked={notify} onCheckedChange={(v) => void toggle("notify_head_chats", !!v)}>
           Tell the head about new messages
         </DropdownMenuCheckboxItem>

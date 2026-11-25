@@ -1,9 +1,20 @@
 package fleet
 
 import (
+	"context"
 	"github.com/blackcode-ch/tmx-go/internal/model"
 	"time"
 )
+
+// StartContext links daemon shutdown to startup recovery as well as normal service.
+func (f *Fleet) StartContext(ctx context.Context) error {
+	stop := context.AfterFunc(ctx, f.cancel)
+	defer stop()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return f.Start()
+}
 
 // Start brings the fleet up after a (re)start of the daemon: nothing from the previous
 // daemon is alive, so live-looking states are reset and open permission requests expire;
@@ -20,7 +31,7 @@ func (f *Fleet) Start() error {
 	}
 
 	f.mu.Lock()
-	f.applyRuleDefaultsLocked() // log the rule-switch defaults once (the owner, 3 Nov 22:14)
+	f.applyRuleDefaultsLocked() // move to the current rule defaults, logged once per version
 	for i := range pending {
 		if pending[i].Kind == model.ApprovalPermission || pending[i].Kind == model.ApprovalGuard {
 			f.finishApprovalLocked(&pending[i], model.ApprovalExpired, "")
@@ -50,6 +61,9 @@ func (f *Fleet) Start() error {
 	f.mu.Unlock()
 
 	for _, id := range toStart {
+		if err := f.ctx.Err(); err != nil {
+			return err
+		}
 		if err := f.startAgentOpts(id, "", startOpts{reattach: true}); err != nil {
 			f.log.Warn("restart agent", "agent", id, "err", err)
 			f.mu.Lock()
@@ -60,9 +74,14 @@ func (f *Fleet) Start() error {
 			f.mu.Unlock()
 		}
 	}
+	if err := f.ctx.Err(); err != nil {
+		return err
+	}
 	f.adoptTools()
 	f.startShelveLoop()
+	f.startMailLoop()
 	f.startReminderLoop() // fires what came due while the daemon was down, then keeps time
+	f.startWatchLoop()    // watch_fleet.go: the head's digest of what tmx watches
 	return nil
 }
 

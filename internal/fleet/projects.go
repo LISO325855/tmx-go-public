@@ -44,6 +44,10 @@ type ProjectPatch struct {
 	Name   *string              `json:"name,omitempty"`
 	Brief  *string              `json:"brief,omitempty"`
 	Status *model.ProjectStatus `json:"status,omitempty"`
+	// Lead assigns the project's lead after creation: an existing lead or head by name, a remote
+	// one as name@host, "" or "none" for no lead. Nothing is launched. The owner; the head only
+	// where the project has no lead yet.
+	Lead *string `json:"lead,omitempty"`
 }
 
 // Slugify turns a project name into its slug: lowercase letters, digits and dashes.
@@ -328,14 +332,27 @@ func (f *Fleet) joinProjectLocked(by string, p *model.Project, r *agentRec) {
 
 // UpdateProject changes a project's name, brief or status (owner only).
 func (f *Fleet) UpdateProject(c Caller, idOrSlug string, patch ProjectPatch) (model.Project, error) {
-	if !c.Owner {
-		return model.Project{}, errf(KindForbidden, "only the owner can change a project")
-	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	p, err := f.projectLocked(idOrSlug)
 	if err != nil {
 		return model.Project{}, err
+	}
+	// The owner and the head change anything about a project; a lead its own project's name,
+	// brief and status (manage.go). Who leads a project is not the lead's to change.
+	me, err := f.manageProjectLocked(c, p, "change a project")
+	if err != nil {
+		return model.Project{}, err
+	}
+	if me != nil && !isHead(me) && patch.Lead != nil {
+		return model.Project{}, errf(KindForbidden, "only the owner or the head changes who leads a project")
+	}
+	newLead, setLead := "", false
+	if patch.Lead != nil {
+		if newLead, err = f.projectLeadLocked(*patch.Lead); err != nil {
+			return model.Project{}, err
+		}
+		setLead = newLead != p.LeadID
 	}
 	if patch.Name != nil {
 		if strings.TrimSpace(*patch.Name) == "" {
@@ -354,18 +371,30 @@ func (f *Fleet) UpdateProject(c Caller, idOrSlug string, patch ProjectPatch) (mo
 			return model.Project{}, errf(KindInvalid, "unknown project status %q", *patch.Status)
 		}
 	}
+	if setLead {
+		p.LeadID = newLead
+	}
 	if err := f.saveProjectLocked(p); err != nil {
 		return model.Project{}, err
+	}
+	if setLead {
+		if r := f.agents[newLead]; r != nil { // a local lead joins the project's thread, as at creation
+			if _, err := f.addLinkLocked(model.ThreadLink{ThreadID: f.projectThreadLocked(p.ID), Axis: model.AxisAgent, Ref: r.a.ID, Role: "lead", Label: r.a.Name, Why: "assigned to the project"}); err != nil {
+				f.log.Error("matrix: link assigned lead", "err", err)
+			}
+		}
+		f.log.Info("project lead assigned", "project", p.Slug, "lead", f.nameOfLocked(newLead))
 	}
 	return *p, nil
 }
 
 // DeleteProject stops and removes the project's agents and the project; the folder stays.
 func (f *Fleet) DeleteProject(c Caller, idOrSlug string) error {
-	if !c.Owner {
-		return errf(KindForbidden, "only the owner can delete a project")
-	}
 	f.mu.Lock()
+	if err := f.manageNodeLocked(c, "delete a project"); err != nil { // not a lead: it would remove itself
+		f.mu.Unlock()
+		return err
+	}
 	p, err := f.projectLocked(idOrSlug)
 	if err != nil {
 		f.mu.Unlock()
@@ -404,6 +433,8 @@ type ProjectSectionPatch struct {
 	// merged into the list, deduplicated by URL, a newer title winning (bc #244, 4 Nov).
 	ReplaceLinks bool    `json:"replace_links,omitempty"`
 	Lead         *string `json:"lead,omitempty"`
+	// Repo sets the project's repository address ("" clears it); the owner only (project_repo.go).
+	Repo *string `json:"repo,omitempty"`
 }
 
 func sectionText(s string, max int) string {
@@ -469,9 +500,20 @@ func (f *Fleet) SetProjectSection(c Caller, project string, patch ProjectSection
 	if patch.FinalOutput != nil && me != nil && me.a.ID != p.LeadID {
 		return model.ProjectSection{}, errf(KindForbidden, "only the project lead or owner can change final output")
 	}
+	if patch.Repo != nil && me != nil {
+		return model.ProjectSection{}, errf(KindForbidden, "only the owner sets a project's repository")
+	}
 	sec, err := f.sectionLocked(p)
 	if err != nil {
 		return sec, err
+	}
+	repoChanged := false
+	if patch.Repo != nil {
+		prev := sec.Repo
+		if sec.Repo, err = NormalizeProjectRepo(*patch.Repo); err != nil {
+			return sec, err
+		}
+		repoChanged = sec.Repo != prev
 	}
 	if patch.FinalOutput != nil {
 		sec.FinalOutput, err = validateProjectOutputs(*patch.FinalOutput)
@@ -482,13 +524,10 @@ func (f *Fleet) SetProjectSection(c Caller, project string, patch ProjectSection
 	if patch.Status != nil {
 		normalized := strings.NewReplacer("\r\n", "\n", "\r", "\n", "\v", "\n", "\f", "\n", "\u0085", "\n", "\u2028", "\n", "\u2029", "\n").Replace(strings.TrimSpace(*patch.Status))
 		lines := strings.Split(normalized, "\n")
-		if len(lines) > 3 {
-			return sec, errf(KindInvalid, "status must be at most 3 lines")
-		}
 		for i := range lines {
 			lines[i] = strings.TrimRight(lines[i], " \t\r")
 		}
-		sec.Status = sectionText(strings.Join(lines, "\n"), 600)
+		sec.Status = sectionText(strings.Join(lines, "\n"), 16000) // any number of lines; 600 characters in 3 lines until 17 Nov
 	}
 	if patch.Needs != nil {
 		old := map[string]bool{}
@@ -500,7 +539,7 @@ func (f *Fleet) SetProjectSection(c Caller, project string, patch ProjectSection
 			if i >= 20 {
 				break
 			}
-			if text := sectionText(value, 300); text != "" {
+			if text := sectionText(value, 4000); text != "" {
 				sec.Needs = append(sec.Needs, model.ProjectNeed{Text: text, Done: old[text]})
 			}
 		}
@@ -509,7 +548,7 @@ func (f *Fleet) SetProjectSection(c Caller, project string, patch ProjectSection
 		if len(sec.Needs) >= 20 {
 			break
 		}
-		text := sectionText(value, 300)
+		text := sectionText(value, 4000)
 		if text != "" && !slices.ContainsFunc(sec.Needs, func(n model.ProjectNeed) bool { return n.Text == text }) {
 			sec.Needs = append(sec.Needs, model.ProjectNeed{Text: text})
 		}
@@ -527,7 +566,7 @@ func (f *Fleet) SetProjectSection(c Caller, project string, patch ProjectSection
 			if at := strings.LastIndex(value, "|"); at >= 0 {
 				title, url = value[:at], value[at+1:]
 			}
-			url, title = sectionText(url, 300), sectionText(title, 300)
+			url, title = sectionText(url, 4000), sectionText(title, 4000)
 			if url == "" {
 				return sec, errf(KindInvalid, "a link needs a URL or path")
 			}
@@ -544,8 +583,8 @@ func (f *Fleet) SetProjectSection(c Caller, project string, patch ProjectSection
 			}
 			links = append(links, model.ProjectLink{Title: title, URL: url})
 		}
-		if len(links) > 20 {
-			return sec, errf(KindInvalid, "a section holds at most 20 links; replace the list (replace_links) to drop some")
+		if len(links) > 2000 { // a storage ceiling (20 until 17 Nov)
+			return sec, errf(KindInvalid, "a section holds at most 2000 links; replace the list (replace_links) to drop some")
 		}
 		if links == nil {
 			links = []model.ProjectLink{}
@@ -580,6 +619,9 @@ func (f *Fleet) SetProjectSection(c Caller, project string, patch ProjectSection
 		return sec, err
 	}
 	f.bus.Publish(model.BusEvent{Type: "project.section.updated", ProjectID: p.ID, Data: sec})
+	if repoChanged {
+		go f.notifyRepoChanged(p.ID, sec.Repo) // project_repo.go: one short mail to the project's lead
+	}
 	return sec, nil
 }
 
@@ -607,8 +649,8 @@ func outputKind(path string) string {
 }
 
 func validateProjectOutputs(in []model.ProjectOutput) ([]model.ProjectOutput, error) {
-	if len(in) > 20 {
-		return nil, errf(KindInvalid, "at most 20 final outputs")
+	if len(in) > 2000 { // a storage ceiling (20 until 17 Nov)
+		return nil, errf(KindInvalid, "at most 2000 final outputs")
 	}
 	out := make([]model.ProjectOutput, 0, len(in))
 	for _, v := range in {
@@ -772,7 +814,7 @@ func (f *Fleet) SendProjectFeedback(c Caller, project string, req ProjectFeedbac
 		if len(done) >= 20 {
 			break
 		}
-		if text := sectionText(value, 300); text != "" {
+		if text := sectionText(value, 4000); text != "" {
 			done = append(done, text)
 		}
 	}
@@ -789,7 +831,7 @@ func (f *Fleet) SendProjectFeedback(c Caller, project string, req ProjectFeedbac
 		if fresh {
 			f.bus.Publish(model.BusEvent{Type: model.EvMessageCreated, AgentID: m.To, Data: m})
 		}
-		f.deliverOwner(m)
+		f.deliverQueued(m.To, true)
 		if current, err := f.st.GetMessage(m.ID); err == nil {
 			rec.Messages[i] = current
 		}

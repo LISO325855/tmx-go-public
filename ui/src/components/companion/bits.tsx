@@ -63,6 +63,7 @@ function dotCls(s: CompanionTaskState): string {
     case "failed":
     case "refused":
     case "unconfirmed":
+    case "ended_without_report":
       return "bg-state-error";
     default:
       return "border-[1.5px] border-state-stopped";
@@ -105,14 +106,24 @@ export function TaskRow({ t, defaultOpen }: { t: CompanionTask; defaultOpen?: bo
           {t.origin === "agent" ? `asked by ${agent?.name ?? "an agent"}` : `for ${agent?.name ?? "the head"}`}
         </span>
         {t.effects !== "none" && <EffectsBadge effects={t.effects} className="hidden sm:inline-flex" />}
-        <TaskState state={t.state} className="col-start-2 row-start-2 justify-self-end sm:w-[8.25rem]" />
+        {t.queue_released ? (
+          <span className="col-start-2 row-start-2 justify-self-end text-xs text-muted-foreground" title={t.error}>
+            {t.error ? t.error + " " : ""}Question open · queue released
+          </span>
+        ) : t.state === "unknown" || (t.state === "queued" && t.error?.startsWith("Queue blocked by Companion task ")) ? (
+          <span className="col-start-2 row-start-2 justify-self-end text-xs text-muted-foreground" title={t.error}>
+            {t.error || TASK_STATE_LABEL.unknown}
+          </span>
+        ) : (
+          <TaskState state={t.state} className="col-start-2 row-start-2 justify-self-end sm:w-[8.25rem]" />
+        )}
         <span className="tabular hidden w-12 shrink-0 text-right text-2xs text-subtle-foreground sm:inline" title={absoluteTime(t.created_at)}>
           {relativeTime(t.created_at)}
         </span>
       </CollapsibleTrigger>
       <CollapsibleContent>
         <div className="space-y-2.5 px-4 pb-3.5 sm:pl-10">
-          {t.question && t.state === "input_required" && (
+          {t.question && (t.state === "input_required" || t.state === "unknown") && (
             <p className="text-xs">
               <span className="font-medium">Companion asks:</span> {t.question}{" "}
               {t.question_approval_id && (

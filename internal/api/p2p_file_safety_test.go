@@ -8,24 +8,16 @@ import (
 )
 
 func TestSensitiveP2PNames(t *testing.T) {
-	for _, name := range []string{"AppData", ".ssh", ".gnupg", ".config", ".aws", ".azure", ".docker", ".git", ".env", ".env.prod", "a.pem", "a.key", "a.p12", "a.pfx", "id_rsa.pub", "id_ed25519.pub", "myCredentials.json", "client-secret.txt", "hosts.yml", ".npmrc", ".pypirc", "x.npmrc", "x.pypirc", "cookies", "Login Data", "Local State", "Web Data", ".git-credentials", ".netrc", "signature.pdf", "a.py", "a.pyw", "a.ps1", "a.psm1", "a.sh", "a.bash", "a.bat", "a.cmd", "a.exe", "a.dll", "a.kdbx", "a.sqlite", "a.db", ".venv", "venv", "node_modules", "Default", "Profile 12", "User Data", ".claude", ".codex", "hosts.yml. "} {
+	for _, name := range []string{"AppData", ".ssh", ".gnupg", ".config", ".aws", ".azure", ".docker", ".git", ".env", ".env.prod", "a.pem", "a.key", "a.p12", "a.pfx", "id_rsa.pub", "id_ed25519.pub", "myCredentials.json", "client-secret.txt", "hosts.yml", ".npmrc", ".pypirc", "x.npmrc", "x.pypirc", "cookies", "Login Data", "Local State", "Web Data", ".git-credentials", ".netrc", "a.kdbx", "User Data", ".claude", ".codex", "hosts.yml. "} {
 		if !sensitiveFilePart(name) {
 			t.Errorf("allowed %s", name)
 		}
 	}
-	for _, name := range []string{"report.pdf", "photo.png", "worktree", "report.txt"} {
+	// Ordinary project files and folders: refused by a word or an extension until 17 Nov.
+	for _, name := range []string{"report.pdf", "photo.png", "worktree", "report.txt", "signature.pdf", "a.py", "a.go", "a.sh", "a.db",
+		".venv", "venv", "node_modules", "Default", "Profile 12", "tmx", ".github", ".vscode"} {
 		if sensitiveFilePart(name) {
 			t.Errorf("refused %s", name)
-		}
-	}
-}
-
-func TestP2PContentPatterns(t *testing.T) {
-	for _, token := range []string{"gh" + "p_" + strings.Repeat("x", 36), "gh" + "o_fixture", "github_" + "pat_fixture", "AK" + "IA" + strings.Repeat("A", 16), "-----BEGIN RSA " + "PRIVATE KEY-----", "-----BEGIN OPENSSH " + "PRIVATE KEY-----", "sk-" + "fixture", "bk_" + "live_fixture", "xox" + "b-fixture"} {
-		for _, data := range [][]byte{[]byte(token), []byte("\x00\xff" + token), []byte(strings.Repeat("a", 1<<20) + token)} {
-			if err := p2pContentRule(data); err == nil || !strings.Contains(err.Error(), "sanitized") || strings.Contains(err.Error(), token) {
-				t.Fatal("missing or unsafe content refusal")
-			}
 		}
 	}
 }

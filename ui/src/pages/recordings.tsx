@@ -174,7 +174,7 @@ export function RecordingsPage({ id }: { id?: string }) {
               ))}
             </ul>
           </div>
-          <div className={cn("min-w-0 flex-1", !id && "hidden lg:block")}>
+          <div className={cn("flex min-h-0 min-w-0 flex-1 flex-col", !id && "hidden lg:block")}>
             {rec ? (
               <RecordingDetail key={rec.id} rec={rec} />
             ) : id ? (
@@ -282,7 +282,7 @@ function RecordingDetail({ rec }: { rec: Recording }) {
   const lines = useMemo(() => momentLines(rec, transcripts.list), [rec, transcripts.list]);
 
   return (
-    <PageBody width="max-w-[55rem]" className="space-y-5">
+    <PageBody width="max-w-[55rem]" className="mx-0 space-y-5">
       <div className="flex items-start gap-3">
         <span className="mt-0.5 flex size-9 shrink-0 items-center justify-center rounded-lg border bg-card">
           <Icon className="size-4 text-muted-foreground" />

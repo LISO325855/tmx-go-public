@@ -52,54 +52,42 @@ func (f *Fleet) safetyLocked() *safetyState {
 	return f.safety
 }
 
-// GuardSettings returns the guard's on/off settings.
+// GuardSettings returns the guard's settings: the rule states and their log, the standing
+// allows, browser automation. There is no on/off switch.
 func (f *Fleet) GuardSettings() guard.Settings {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	s := f.safetyLocked().settings
-	s.OffFor = slices.Clone(s.OffFor)
-	if s.OffFor == nil {
-		s.OffFor = []string{}
-	}
+	s.LegacyEnabled, s.LegacyOffFor = nil, nil
 	s.AlwaysAllow = slices.Clone(s.AlwaysAllow)
 	s.RuleStates = maps.Clone(s.RuleStates)
 	s.RuleLog = slices.Clone(s.RuleLog)
 	return s
 }
 
-// SetGuardSettings changes them (owner only; the API asks the owner gate first when the change
-// protects fewer agents). Running agents keep their hook until they restart.
+// SetGuardSettings changes what PUT /api/safety/guard may change: browser automation (owner
+// only; the API asks the owner gate first when the change protects less). Everything else keeps
+// its stored value: the rule states change only through SetRuleState, the standing allows only
+// through Allow always and RevokeAlways. A master switch an older client still sends ("enabled",
+// "off_for") is ignored: the guard cannot be switched off.
 func (f *Fleet) SetGuardSettings(c Caller, s guard.Settings) (guard.Settings, error) {
 	if !c.Owner {
 		return guard.Settings{}, errf(KindForbidden, "only the owner changes the guard")
 	}
-	off := []string{}
-	for _, k := range s.OffFor {
-		k = strings.ToLower(strings.TrimSpace(k))
-		if k == "" || len(k) > 64 {
-			return guard.Settings{}, errf(KindInvalid, "%q is not a kind of agent", k)
-		}
-		if !slices.Contains(off, k) {
-			off = append(off, k)
-		}
-	}
-	s.OffFor = off
 	f.mu.Lock()
-	// The standing allows change only through Allow always and RevokeAlways (both owner-gated).
-	cur := f.safetyLocked().settings
-	s.AlwaysAllow = cur.AlwaysAllow
-	s.RuleStates, s.RuleLog, s.DefaultsVersion = cur.RuleStates, cur.RuleLog, cur.DefaultsVersion // only SetRuleState
-	s.AllowedBefore = cur.AllowedBefore
-	err := f.saveGuardLocked(s)
+	next := f.safetyLocked().settings
+	next.AllowBrowserAutomation = s.AllowBrowserAutomation
+	err := f.saveGuardLocked(next)
 	f.mu.Unlock()
 	if err != nil {
 		return guard.Settings{}, err
 	}
-	f.log.Info("guard settings changed", "enabled", s.Enabled, "off_for", s.OffFor)
+	f.log.Info("guard settings changed", "allow_browser_automation", next.AllowBrowserAutomation)
 	return f.GuardSettings(), nil
 }
 
 func (f *Fleet) saveGuardLocked(s guard.Settings) error {
+	s.LegacyEnabled, s.LegacyOffFor = nil, nil // the removed master switch is never written again
 	if f.opts.SaveGuard != nil {
 		if err := f.opts.SaveGuard(s); err != nil {
 			return err
@@ -163,13 +151,21 @@ func (f *Fleet) guardInfo(req HoldRequest, outcome guard.Outcome) (model.GuardHo
 		in = nil
 	}
 	return model.GuardHold{Outcome: string(outcome), Rule: r.ID, RuleName: r.Name, Why: r.Why,
-		Detail: req.Detail, Match: req.Match, Command: req.Command, Tool: req.Tool, ToolInput: in, Cwd: req.Cwd}, nil
+		Detail: req.Detail, Match: req.Match, Command: req.Command, Tool: req.Tool, ToolInput: in, Cwd: req.Cwd,
+		NoAlways: outcome != guard.Hold || !canAllowAlways(req.Command)}, nil
+}
+
+// canAllowAlways reports whether a held command can be remembered as a standing allow: it has
+// a command, and that command means the same thing every time it runs. A card offers "Allow
+// always" only then (GuardHold.NoAlways), and rememberAlwaysLocked refuses anything else.
+func canAllowAlways(command string) bool {
+	return command != "" && !guard.RunTimeDependent(command)
 }
 
 // Hold records a tool call the guard held (agent only): a pending Approval of kind guard in
 // Needs you, and the agent waits for it.
 func (f *Fleet) Hold(c Caller, req HoldRequest) (model.Approval, error) {
-	if req.Rule == guard.RuleP2PInvite || req.Rule == guard.RuleP2PJoin {
+	if req.Rule == guard.RuleP2PInvite || req.Rule == guard.RuleP2PJoin || req.Rule == guard.RuleP2PInviteWA {
 		return model.Approval{}, errf(KindForbidden, "use the dedicated pairing tools")
 	}
 	return f.hold(c, req)
@@ -210,7 +206,7 @@ func (f *Fleet) hold(c Caller, req HoldRequest) (model.Approval, error) {
 			Meta: map[string]any{"guard": info, "approval_id": ap.ID, "decision": string(model.ApprovalAllowed), "always_id": al.ID}})
 		return ap, nil
 	}
-	if at, ok := f.allowedAtLocked(guard.AllowedKey(info.Rule, info.Tool, info.Command, info.Cwd, key)); ok && guard.Rememberable[info.Rule] {
+	if at, ok := f.allowedAtLocked(guard.AllowedKey(info.Rule, info.Tool, info.Command, info.Cwd, key)); ok && guard.Rememberable[info.Rule] && !guard.RunTimeDependent(info.Command) {
 		// "The same thing never asks twice" (the owner, 3 Nov 22:30): allowed once, allowed again.
 		ap := model.Approval{ID: model.NewID(), AgentID: r.a.ID, Kind: model.ApprovalGuard, Tool: req.Tool,
 			Input: raw, Description: info.Detail, Options: []string{}, State: model.ApprovalAllowed,
@@ -229,6 +225,7 @@ func (f *Fleet) hold(c Caller, req HoldRequest) (model.Approval, error) {
 		return model.Approval{}, err
 	}
 	f.safetyLocked().holds[ap.ID] = make(chan struct{})
+	f.holdDeadlineLocked(ap.ID)
 	f.appendLocked(r, model.TimelineEntry{Kind: model.EntrySystem, Tool: req.Tool,
 		Text: "The guard held this for you: " + info.RuleName,
 		Meta: map[string]any{"guard": info, "approval_id": ap.ID}})
@@ -260,6 +257,33 @@ func (f *Fleet) WaitHold(ctx context.Context, c Caller, id string, wait time.Dur
 		}
 	}
 	return f.ApprovalByID(id)
+}
+
+// holdDeadline is when the daemon itself ends a hold nobody answered. The hook ends its own
+// hold after guard.HoldWait (CancelHold); this is the net under it, for a hook that was killed,
+// lost its connection or never came back: without it the card stayed open and the agent
+// "waiting" for good. A little later than the hook's own limit, so the hook normally wins and
+// the agent gets the hook's explanation.
+var holdDeadline = guard.HoldWait + time.Minute
+
+// holdDeadlineLocked arms the daemon's deadline for a hold just created.
+func (f *Fleet) holdDeadlineLocked(id string) {
+	time.AfterFunc(holdDeadline, func() {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if f.closed {
+			return
+		}
+		if _, open := f.safetyLocked().holds[id]; !open {
+			return
+		}
+		ap, err := f.st.GetApproval(id)
+		if err != nil || ap.State != model.ApprovalPending || IsP2PTool(ap.Tool) {
+			return // P2P approvals have their own lifetime (P2PApprovalTTL)
+		}
+		f.log.Warn("guard hold ended by the daemon: no answer and its hook did not end it", "approval", id, "agent", f.nameOfLocked(ap.AgentID))
+		f.resolveHoldLocked(&ap, model.ApprovalExpired, "", "No answer in time; not run: ")
+	})
 }
 
 // CancelHold expires one of the caller's holds (its hook gave up waiting).
@@ -339,21 +363,34 @@ func (f *Fleet) decideGuard(ap model.Approval, d DecideRequest) (model.Approval,
 		f.finishApprovalLocked(&ap, model.ApprovalExpired, "")
 		return ap, errf(KindConflict, "the agent is no longer waiting for this; the hold expired")
 	}
-	if (ap.Tool == ToolP2PInvite || ap.Tool == ToolP2PJoin) && model.Now()-ap.CreatedAt >= P2PApprovalTTL.Milliseconds() {
+	if IsP2PTool(ap.Tool) && model.Now()-ap.CreatedAt >= P2PApprovalTTL.Milliseconds() {
 		f.resolveHoldLocked(&ap, model.ApprovalExpired, "", "No answer in time; not run: ")
 		return ap, errf(KindConflict, "the pairing approval expired")
 	}
+	answer := d.Message
 	if d.Decision == DecisionAllowAlways {
+		// The owner has confirmed (the gate asked before this ran) and the agent is waiting: a
+		// rule that cannot be kept must not leave the card open. The call is allowed this once,
+		// and both sides are told that it was not remembered and why.
 		if err := f.rememberAlwaysLocked(ap, d.Scope); err != nil {
-			return model.Approval{}, err
+			why := err.Error()
+			f.log.Warn("guard allow-always not kept; allowed once", "approval", ap.ID, "err", why)
+			text = "You allowed it once (not always: " + limitRunes(why, 200) + "): "
+			if answer == "" {
+				answer = AllowedOnceNotAlways + why
+			}
 		}
 	}
 	if state == model.ApprovalAllowed {
 		f.rememberAllowedLocked(ap)
 	}
-	f.resolveHoldLocked(&ap, state, d.Message, text)
+	f.resolveHoldLocked(&ap, state, answer, text)
 	return ap, nil
 }
+
+// AllowedOnceNotAlways starts the Answer of a hold the owner allowed "always" that could only
+// be allowed once (the reason follows); the dashboard shows it instead of "Allowed always".
+const AllowedOnceNotAlways = "Allowed once, not always: "
 
 // dayOf shows an RFC 3339 time as its date ("2026-11-03"), or as given.
 func dayOf(at string) string {
@@ -388,6 +425,13 @@ func (f *Fleet) rememberAllowedLocked(ap model.Approval) {
 	if !guard.Rememberable[holdRule(ap)] {
 		return // asks every time: never recorded
 	}
+	// A command whose meaning is only known when it runs (a variable, a wildcard, a subshell)
+	// is not "the same thing" next time: `rm -rf "$DIR"` allowed once would cover any $DIR
+	// later. Like Allow always, the memory of an allowed call leaves such commands out.
+	var info model.GuardHold
+	if json.Unmarshal(ap.Input, &info) != nil || guard.RunTimeDependent(info.Command) {
+		return
+	}
 	k := f.holdKeyLocked(ap)
 	s := f.safetyLocked().settings
 	if _, ok := f.allowedAtLocked(k); ok {
@@ -408,6 +452,10 @@ func (f *Fleet) AllowedBefore(ap model.Approval) bool {
 	if ap.Kind != model.ApprovalGuard || !guard.Rememberable[holdRule(ap)] {
 		return false // not rememberable: always the fresh proof
 	}
+	var info model.GuardHold
+	if json.Unmarshal(ap.Input, &info) != nil || guard.RunTimeDependent(info.Command) {
+		return false // its meaning changes from run to run: an entry kept before this rule does not count
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	_, ok := f.allowedAtLocked(f.holdKeyLocked(ap))
@@ -426,21 +474,55 @@ func (f *Fleet) allowedAtLocked(key string) (string, bool) {
 
 // WithdrawHold: the agent that raised a pending hold takes it back (it decided not to run the
 // command), so it never reaches the owner as a question. It never allows anything.
+//
+// Also an agent above it: whoever may stop the agent (its lead, the head: authorizeActLocked)
+// may take back its holds, e.g. for a worker stuck waiting on a card nobody will answer. It
+// never runs or allows anything.
 func (f *Fleet) WithdrawHold(c Caller, id string) (model.Approval, error) {
 	if c.Owner || c.AgentID == "" {
-		return model.Approval{}, errf(KindForbidden, "only the agent that raised a hold withdraws it")
+		return model.Approval{}, errf(KindForbidden, "only the agent that raised a hold, or an agent above it, withdraws it")
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	ap, err := f.ownHoldLocked(c, id)
-	if err != nil {
-		return model.Approval{}, err
+	ap, err := f.st.GetApproval(id)
+	if err != nil || ap.Kind != model.ApprovalGuard {
+		return model.Approval{}, errf(KindNotFound, "no guard hold %q", id)
+	}
+	text := "Withdrawn by the agent; not run: "
+	if ap.AgentID != c.AgentID {
+		target, ok := f.agents[ap.AgentID]
+		if !ok {
+			return model.Approval{}, errf(KindForbidden, "this hold belongs to another agent")
+		}
+		if err := f.authorizeActLocked(c, target); err != nil {
+			return model.Approval{}, errf(KindForbidden, "this hold belongs to another agent, and %s is not yours to stop", target.a.Name)
+		}
+		// A pairing approval is the owner's decision about a person or a machine, and it
+		// outlives the agent that asked: an agent above it may not end it (review, 17 Nov).
+		if IsP2PTool(ap.Tool) {
+			return model.Approval{}, errf(KindForbidden, "a pairing approval is withdrawn only by the agent that asked for it")
+		}
+		text = "Withdrawn by " + f.nameOfLocked(c.AgentID) + "; not run: "
 	}
 	if ap.State != model.ApprovalPending {
 		return model.Approval{}, errf(KindConflict, "this hold is no longer pending (%s)", ap.State)
 	}
-	f.resolveHoldLocked(&ap, model.ApprovalExpired, AnswerWithdrawn, "Withdrawn by the agent; not run: ")
+	f.resolveHoldLocked(&ap, model.ApprovalExpired, AnswerWithdrawn, text)
 	return ap, nil
+}
+
+// stopHoldsLocked ends the pending holds of an agent that is being stopped, before its process
+// is asked to end: its hook is waiting inside the harness for the owner's answer, and a harness
+// with a running hook does not exit until the hook returns. Each hold ends as not run. Pairing
+// approvals are not hook holds and stay: the owner may still answer them after the stop.
+func (f *Fleet) stopHoldsLocked(agentID string) {
+	for id := range f.safetyLocked().holds {
+		ap, err := f.st.GetApproval(id)
+		if err != nil || ap.AgentID != agentID || ap.State != model.ApprovalPending || IsP2PTool(ap.Tool) {
+			continue // a pairing approval outlives the process that asked (expireHoldsLocked too)
+		}
+		f.resolveHoldLocked(&ap, model.ApprovalExpired, "", "The agent was stopped; not run: ")
+	}
 }
 
 // PendingHolds lists the caller's own pending guard holds (for withdraw_hold without an id).
@@ -474,7 +556,7 @@ func (f *Fleet) rememberAlwaysLocked(ap model.Approval, scope string) error {
 	if _, ok := guard.RuleByID(info.Rule); !ok || f.ruleStateOfLocked(info.Rule) != guard.Hold {
 		return errf(KindInvalid, "%q is not a hold rule of the guard", info.Rule)
 	}
-	if guard.RunTimeDependent(info.Command) {
+	if !canAllowAlways(info.Command) {
 		return errf(KindInvalid, "this command depends on values only known when it runs (variables, wildcards or subshells), so it cannot be allowed always; allow it once")
 	}
 	al := guard.AlwaysAllow{ID: model.NewID(), Rule: info.Rule, RuleName: info.RuleName, Tool: info.Tool,
@@ -536,7 +618,7 @@ func (f *Fleet) expireHoldsLocked(agentID string) {
 	st := f.safetyLocked()
 	for id, ch := range st.holds {
 		ap, err := f.st.GetApproval(id)
-		if err != nil || ap.AgentID != agentID || ap.Tool == ToolP2PInvite || ap.Tool == ToolP2PJoin {
+		if err != nil || ap.AgentID != agentID || IsP2PTool(ap.Tool) {
 			continue
 		}
 		close(ch)
@@ -547,19 +629,21 @@ func (f *Fleet) expireHoldsLocked(agentID string) {
 	}
 }
 
-// guardSpecLocked installs the enforced adapter or refuses the launch. Claude
-// supports PreToolUse in both modes; other harnesses cannot satisfy an enabled
-// guard yet. An explicit owner guard opt-out remains subject to launch policy.
+// guardSpecLocked installs the command guard for the agent's launch: the PreToolUse hook for
+// Claude, the parity shims for Codex on Windows. It never refuses (the owner, 17 Nov: agents always
+// start). An agent the guard cannot check (a harness without an adapter, or a Claude settings
+// file that sets disableAllHooks) starts with an error row in its timeline that says so.
 func (f *Fleet) guardSpecLocked(r *agentRec, spec *runner.Spec) error {
 	a := r.a
+	spec.AgentMachine = f.opts.AgentMachine
 	if a.Harness == model.HarnessShell {
 		return nil // owner terminal; agent authorization denies launching or typing into it
 	}
-	if err := f.guardAdmissionLocked(a); err != nil {
-		return err
-	}
-	if !f.safetyLocked().settings.On(string(a.Level), a.Profile) { // off_for may name a level or a profile
-		return nil
+	warn := f.guardWarningLocked(a)
+	if warn != nil {
+		f.appendLocked(r, model.TimelineEntry{Kind: model.EntryError, IsError: true, Text: warn.Text,
+			Meta: map[string]any{"guard_warning": warn}})
+		f.log.Warn("agent starts without the command guard", "agent", a.Name, "harness", a.Harness, "reason", warn.Reason, "where", warn.Where)
 	}
 	if f.codexParityEligibleLocked(a) {
 		spec.CodexGuardHome = filepath.Join(f.opts.Paths.AgentDir(a.ID), "codex-guard")
@@ -574,6 +658,11 @@ func (f *Fleet) guardSpecLocked(r *agentRec, spec *runner.Spec) error {
 		spec.Env = append(spec.Env, guard.EnvFolder+"="+a.Cwd, guard.EnvWorkspace+"="+f.opts.Workspace, guard.EnvState+"="+f.opts.Paths.Home)
 		return nil
 	}
+	if a.Harness != model.HarnessClaude {
+		return nil // no adapter for this harness: it starts, with the warning above
+	}
+	// The hook is installed also when hooks are disabled now: it works again as soon as the
+	// owner removes that setting and the agent restarts.
 	cfg := map[string]any{"hooks": map[string]any{"PreToolUse": []any{map[string]any{
 		"matcher": guard.Matcher,
 		"hooks": []any{map[string]any{"type": "command", "command": HookCommand(f.opts.Executable),
@@ -583,7 +672,8 @@ func (f *Fleet) guardSpecLocked(r *agentRec, spec *runner.Spec) error {
 	// Claude agent on the default mode ("auto") runs in bypass mode, like the Python fleet: the
 	// hook alone decides what reaches the owner (only machine-protection holds become cards).
 	// config.json "agent_bypass": false keeps Claude's own prompts.
-	if a.Harness == model.HarnessClaude && spec.PermissionMode == "auto" && f.agentBypass() {
+	// Only while the hook runs: an agent whose hooks are switched off keeps Claude's own prompts.
+	if warn == nil && spec.PermissionMode == "auto" && f.agentBypass() {
 		spec.PermissionMode = "bypassPermissions"
 		cfg["skipDangerousModePermissionPrompt"] = true
 	}
@@ -639,16 +729,20 @@ func (f *Fleet) SetRuleState(c Caller, rule string, state guard.Outcome) (guard.
 	f.mu.Lock()
 	s := f.safetyLocked().settings
 	old := s.Effective()[rule]
-	if old == state {
+	if _, set := s.RuleStates[rule]; old == state && set {
 		f.mu.Unlock()
 		return f.GuardSettings(), nil
 	}
+	// Also when the state is the default already: the entry in RuleStates is what makes the
+	// rule the owner's, so later defaults leave it alone. Only a real change is logged.
 	s.RuleStates = maps.Clone(s.RuleStates)
 	if s.RuleStates == nil {
 		s.RuleStates = map[string]guard.Outcome{}
 	}
 	s.RuleStates[rule] = state
-	s.RuleLog = appendRuleLog(s.RuleLog, guard.RuleChange{Rule: rule, Old: old, New: state, At: time.Now().UTC().Format(time.RFC3339), By: "owner"})
+	if old != state {
+		s.RuleLog = appendRuleLog(s.RuleLog, guard.RuleChange{Rule: rule, Old: old, New: state, At: time.Now().UTC().Format(time.RFC3339), By: "owner"})
+	}
 	err := f.saveGuardLocked(s)
 	f.mu.Unlock()
 	if err != nil {
@@ -666,9 +760,14 @@ func appendRuleLog(log []guard.RuleChange, ch ...guard.RuleChange) []guard.RuleC
 	return out
 }
 
-// applyRuleDefaultsLocked: the first start with rule switches logs, once, every rule whose
-// default differs from what this install did before (the strict built-in outcome). Existing
-// installs thereby move to the defaults of the owner's brief, visibly.
+// applyRuleDefaultsLocked moves an install to the current rule defaults, once per defaults
+// version (guard.DefaultsVersion), and logs every rule it changed as "tmx": old is the default
+// this install had applied before (guard.DefaultAt; the strict built-in outcome for an install
+// from before the rule switches), new is today's default. A rule the owner set (an entry in
+// RuleStates, written only by SetRuleState) keeps its value and is not logged.
+//
+// The step to version 2 also drops the master switch. An install that had the guard off, or off
+// for some kinds of agent, gets one log entry for that: from now on every agent starts guarded.
 func (f *Fleet) applyRuleDefaultsLocked() {
 	s := f.safetyLocked().settings
 	if s.DefaultsVersion >= guard.DefaultsVersion {
@@ -676,11 +775,37 @@ func (f *Fleet) applyRuleDefaultsLocked() {
 	}
 	at := time.Now().UTC().Format(time.RFC3339)
 	var ch []guard.RuleChange
+	if was := legacySwitchOff(s); was != "" {
+		ch = append(ch, guard.RuleChange{Rule: guard.LegacyMasterSwitch, Old: guard.Outcome(was), New: "always on", At: at, By: "tmx"})
+		f.log.Warn("guard: the on/off switch is gone; every agent now starts with the guard", "was", was)
+	}
 	for _, r := range guard.Rules() {
-		if _, set := s.RuleStates[r.ID]; !set && r.Default != r.Outcome {
-			ch = append(ch, guard.RuleChange{Rule: r.ID, Old: r.Outcome, New: r.Default, At: at, By: "tmx"})
+		if _, set := s.RuleStates[r.ID]; set {
+			continue
+		}
+		if old, ok := guard.DefaultAt(s.DefaultsVersion, r.ID); ok && old != r.Default {
+			ch = append(ch, guard.RuleChange{Rule: r.ID, Old: old, New: r.Default, At: at, By: "tmx"})
 		}
 	}
+	// A rule that lost its switch (kill-by-name: a fixed Block now): what it did before, the
+	// owner's own state included, is logged, and his entry is dropped: nothing reads it again.
+	for _, r := range guard.FixedRules() {
+		if !guard.HadSwitch(s.DefaultsVersion, r.ID) {
+			continue
+		}
+		old, _ := guard.DefaultAt(s.DefaultsVersion, r.ID)
+		if o, set := s.RuleStates[r.ID]; set {
+			if guard.ValidState(o) {
+				old = o
+			}
+			s.RuleStates = maps.Clone(s.RuleStates)
+			delete(s.RuleStates, r.ID)
+		}
+		if old != r.Outcome {
+			ch = append(ch, guard.RuleChange{Rule: r.ID, Old: old, New: r.Outcome, At: at, By: "tmx"})
+		}
+	}
+	from := s.DefaultsVersion
 	s.RuleLog = appendRuleLog(s.RuleLog, ch...)
 	s.DefaultsVersion = guard.DefaultsVersion
 	if err := f.saveGuardLocked(s); err != nil {
@@ -688,8 +813,26 @@ func (f *Fleet) applyRuleDefaultsLocked() {
 		return
 	}
 	if len(ch) > 0 {
-		f.log.Info("guard: rule defaults applied", "changed", len(ch))
+		f.log.Info("guard: rule defaults applied", "from", from, "to", guard.DefaultsVersion, "changed", len(ch))
 	}
+}
+
+// legacySwitchOff says how the removed master switch stood if it protected fewer agents than
+// all of them ("off", "off for worker, lead"); "" if it was on for everyone or absent.
+func legacySwitchOff(s guard.Settings) string {
+	if s.LegacyEnabled != nil && !*s.LegacyEnabled {
+		return "off"
+	}
+	var kinds []string
+	for _, k := range s.LegacyOffFor {
+		if k = strings.ToLower(strings.TrimSpace(k)); k != "" && !slices.Contains(kinds, k) {
+			kinds = append(kinds, k)
+		}
+	}
+	if len(kinds) == 0 {
+		return ""
+	}
+	return "off for " + strings.Join(kinds, ", ")
 }
 
 // HookCommand is the hook's command line, quoted for the shell Claude Code runs hooks with.

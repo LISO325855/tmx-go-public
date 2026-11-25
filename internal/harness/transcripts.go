@@ -194,6 +194,37 @@ func CodexRolloutExists(codexHome, id string) bool {
 	return len(m) > 0
 }
 
+// CodexRolloutPath is the rollout file of conversation id under codexHome ("" if there is
+// none; the newest if a conversation has several).
+func CodexRolloutPath(codexHome, id string) string {
+	if id == "" || strings.ContainsAny(id, `/\*?[`) {
+		return ""
+	}
+	m, _ := filepath.Glob(filepath.Join(codexHome, "sessions", "*", "*", "*", "rollout-*-"+id+".jsonl"))
+	if len(m) == 0 {
+		return ""
+	}
+	sort.Strings(m)
+	return m[len(m)-1]
+}
+
+// CodexRolloutIn reports whether conversation id has a rollout that was recorded in cwd: its
+// session_meta names both that id and that folder (compared like CodexConversations does).
+// The file name alone proves neither.
+func CodexRolloutIn(codexHome, cwd, id string) bool {
+	if id == "" || strings.ContainsAny(id, `/\*?[`) {
+		return false
+	}
+	want := strings.ToLower(resolve(cwd))
+	m, _ := filepath.Glob(filepath.Join(codexHome, "sessions", "*", "*", "*", "rollout-*-"+id+".jsonl"))
+	for _, path := range m {
+		if meta, _ := codexMeta(path); meta.ID == id && meta.Cwd != "" && strings.ToLower(resolve(meta.Cwd)) == want {
+			return true
+		}
+	}
+	return false
+}
+
 type rolloutFile struct {
 	path string
 	mod  time.Time

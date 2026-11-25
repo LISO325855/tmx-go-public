@@ -33,16 +33,21 @@ func TestAgyFirstPromptAndRestartInstructions(t *testing.T) {
 	}
 }
 
-func TestAgyGuardAdmissionFailsClosed(t *testing.T) {
+// tmx has no command guard for agy: on Windows too it starts (the owner, 17 Nov: agents always
+// start), with the warning in its timeline.
+func TestAgyStartsUnguardedWithWarning(t *testing.T) {
+	old := launchGOOS
+	launchGOOS = "windows"
+	t.Cleanup(func() { launchGOOS = old })
 	e := newEnv(t)
-	f := e.fleet()
+	f := e.started()
 	for _, h := range []model.Harness{"agy", "antigravity"} {
-		_, err := f.LaunchAgent(OwnerCaller, LaunchRequest{Name: string(h), Harness: h})
-		if KindOf(err) != KindForbidden {
-			t.Fatalf("guarded %s launch admitted: %v", h, err)
+		a, err := f.LaunchAgent(OwnerCaller, LaunchRequest{Name: string(h), Harness: h})
+		if err != nil || e.term.Last(a.ID) == nil {
+			t.Fatalf("%s launch refused: %v", h, err)
 		}
-		if _, err := f.Agent(string(h)); KindOf(err) != KindNotFound {
-			t.Fatalf("refused %s launch created an agent", h)
+		if n := guardWarnings(t, f, a.ID); n != 1 || !strings.Contains(lastGuardWarning(t, f, a.ID), string(h)) {
+			t.Fatalf("%s: %d guard warnings: %q", h, n, lastGuardWarning(t, f, a.ID))
 		}
 	}
 }

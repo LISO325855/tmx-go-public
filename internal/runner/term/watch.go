@@ -4,8 +4,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
-	"regexp"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -27,16 +28,18 @@ import (
 //     are answered instead (harness.Gate);
 //   - usage limit: working (mail must not be typed into it) and one timeline note.
 const (
-	evalEvery     = 250 * time.Millisecond
-	idleHold      = 600 * time.Millisecond
-	menuSettle    = 2
-	offMenuSettle = 3
-	keyGap        = 40 * time.Millisecond
-	gateRetry     = 3 * time.Second
-	typedSettle   = 1500 * time.Millisecond // after a message's Enter, before idle counts again
-	pickSettle    = 800 * time.Millisecond  // longest wait for a menu's cursor to move after one arrow
-	pickPoll      = 40 * time.Millisecond
-	pickRetries   = 3 // arrows that did not move the cursor before giving up
+	evalEvery       = 250 * time.Millisecond
+	idleHold        = 600 * time.Millisecond
+	menuSettle      = 2
+	offMenuSettle   = 3
+	keyGap          = 40 * time.Millisecond
+	gateRetry       = 3 * time.Second
+	progressSettle  = 300 * time.Millisecond  // settle meaningful content independently of cosmetic output
+	progressMaxWait = 2 * time.Second         // streaming output must not wait forever for a settled frame
+	typedSettle     = 1500 * time.Millisecond // after a message's Enter, before idle counts again
+	pickSettle      = 800 * time.Millisecond  // longest wait for a menu's cursor to move after one arrow
+	pickPoll        = 40 * time.Millisecond
+	pickRetries     = 3 // arrows that did not move the cursor before giving up
 )
 
 type watcher struct {
@@ -49,22 +52,30 @@ type watcher struct {
 	start   time.Time
 
 	// guarded by p.mu
-	lastOutput   time.Time
-	humanInputAt time.Time   // protects human input before the TUI has echoed it
-	ready        bool        // the input box has been seen: sends are typed, not queued
-	queued       []mailInput // sends waiting for the input box
-	pending      *pendingMenu
-	candidate    string // signature of a menu seen but not yet settled
-	candN        int
-	offMenu      int
-	idleSince    time.Time
-	busyUntil    time.Time
-	usageNoted   string
-	gateAt       map[string]time.Time
-	seq          int
-	tr           *transcript // Claude: its conversation file (transcript.go); nil otherwise
-	turnInput    bool        // something went in since it was last idle (a typed message, keys, transcript lines)
-	inFlight     int         // non-owner keys admitted and not written yet: no menu becomes an approval (guardedWrite)
+	lastOutput          time.Time
+	outputWriting       bool        // screen write in flight; a frame is not yet settled
+	humanInputAt        time.Time   // protects human input before the TUI has echoed it
+	ready               bool        // the input box has been seen: sends are typed, not queued
+	mailMenuHeld        bool        // only a menu that did not dismiss can hold live mail
+	mailTyping          bool        // selected mail owns the paste/Enter transaction, guarded by p.mu
+	queued              []mailInput // sends waiting for the input box
+	pending             *pendingMenu
+	candidate           string // signature of a menu seen but not yet settled
+	candN               int
+	offMenu             int
+	idleReported        time.Time // periodic positive idle evidence repairs a missed fleet transition
+	progressText        []string  // last meaningful screen content; cosmetic changes do not replace it
+	progressCandidate   []string  // normalized content being settled; never includes spinner/status churn
+	progressCandidateAt time.Time
+	progressPendingAt   time.Time // first meaningful difference from the settled baseline
+	idleSince           time.Time
+	busyUntil           time.Time
+	usageNoted          string
+	gateAt              map[string]time.Time
+	seq                 int
+	tr                  *transcript // Claude: its conversation file (transcript.go); nil otherwise
+	turnInput           bool        // something went in since it was last idle (a typed message, keys, transcript lines)
+	inFlight            int         // non-owner keys admitted and not written yet: no menu becomes an approval (guardedWrite)
 }
 
 type pendingMenu struct {
@@ -73,8 +84,14 @@ type pendingMenu struct {
 }
 
 type mailInput struct {
-	text string
-	ids  []string
+	queuedAt     time.Time
+	holdLoggedAt time.Time
+	menuWait     bool
+	launchPrompt bool
+	text         string
+	ids          []string
+	// now identifies owner mail for diagnostics; all sources share delivery rules.
+	now bool
 }
 
 func newWatcher(p *process, info harness.Info, spec runner.Spec, cmd harness.Command, cols, rows int) *watcher {
@@ -107,9 +124,14 @@ func newWatcher(p *process, info harness.Info, spec runner.Spec, cmd harness.Com
 }
 
 func (w *watcher) output(b []byte) {
+	w.p.mu.Lock()
+	w.outputWriting = true
+	w.lastOutput = time.Now()
+	w.p.mu.Unlock()
 	w.scr.Write(b)
 	w.p.mu.Lock()
 	w.lastOutput = time.Now()
+	w.outputWriting = false
 	w.p.mu.Unlock()
 }
 
@@ -142,14 +164,18 @@ func (w *watcher) classify() screen.Detection {
 
 // evaluate reads the screen once and emits what changed.
 func (w *watcher) evaluate() {
+	w.p.mu.Lock()
+	progressAt := w.lastOutput
+	w.p.mu.Unlock()
 	d := w.classify()
-	empty := emptyComposer(w.scr.Text(), w.info.Name)
+	progress := meaningfulScreen(w.scr.Lines())
+	empty := w.boxEmpty()
 	now := time.Now()
 	var gate string
-	var typed mailInput
 	p := w.p
 	p.mu.Lock()
 	w.followLocked()
+	w.logHeldLocked(now, d, empty)
 	switch {
 	case d.State.Menu():
 		w.offMenu, w.idleSince = 0, time.Time{}
@@ -184,6 +210,7 @@ func (w *watcher) evaluate() {
 		case screen.Working:
 			w.idleSince = time.Time{}
 			p.setStateLocked(model.StateWorking)
+
 		case screen.UsageLimit:
 			p.setStateLocked(model.StateWorking)
 			if w.usageNoted != d.Prompt {
@@ -192,11 +219,14 @@ func (w *watcher) evaluate() {
 					IsError: true, Text: fmt.Sprintf("%s hit its usage limit; try again at %s", w.info.Label, d.Prompt)}})
 			}
 		case screen.Idle:
+			if w.mailTyping {
+				break
+			}
 			if !empty {
 				w.idleSince = time.Time{}
 				break
 			}
-			if now.Before(w.busyUntil) {
+			if !w.submitSettledLocked(now) {
 				break
 			}
 			if w.idleSince.IsZero() {
@@ -206,36 +236,39 @@ func (w *watcher) evaluate() {
 				break
 			}
 			w.ready = true
-			if len(w.queued) > 0 {
-				if now.Sub(w.humanInputAt) < 20*time.Second {
-					break
+
+			if p.state != model.StateIdle { // back at its input box
+				if p.state == model.StateWorking || p.state == model.StateWaiting {
+					w.turnEndedLocked(now)
 				}
-				var parts []string
-				for _, input := range w.queued {
-					parts = append(parts, input.text)
-					typed.ids = append(typed.ids, input.ids...)
+				w.turnInput = false
+			}
+			wasIdle := p.state == model.StateIdle
+			p.setStateLocked(model.StateIdle)
+			if !wasIdle || now.Sub(w.idleReported) >= 2*time.Second {
+				if wasIdle {
+					p.emitLocked(runner.Event{Kind: runner.EvState, State: model.StateIdle})
 				}
-				typed.text = strings.Join(parts, "\n\n")
-				w.queued = nil
-				w.markBusyLocked()
-				p.setStateLocked(model.StateWorking)
-			} else {
-				if p.state != model.StateIdle { // back at its input box
-					if p.state == model.StateWorking || p.state == model.StateWaiting {
-						w.turnEndedLocked(now)
-					}
-					w.turnInput = false
-				}
-				p.setStateLocked(model.StateIdle)
+				w.idleReported = now
 			}
 		}
+	}
+	// A new PTY chunk before/during this reading invalidates its snapshot. Do
+	// not replace the settled baseline with a partial clear-and-restore frame.
+	if !w.outputWriting && w.lastOutput == progressAt {
+		w.settleProgressLocked(d.State, progress, time.Now())
 	}
 	p.mu.Unlock()
 	if gate != "" {
 		_ = w.pick(gate, nil)
 	}
-	if typed.text != "" {
-		w.typeMail(typed)
+	// State observation never gates delivery. A formerly open menu is the
+	// sole exception: resume the FIFO once a normal composer is observed.
+	if d.State == screen.Idle || d.State == screen.Working {
+		p.mu.Lock()
+		w.mailMenuHeld = false
+		p.mu.Unlock()
+		w.pumpMail()
 	}
 }
 
@@ -465,29 +498,54 @@ func (w *watcher) guardedWrite(b []byte, owner bool) error {
 	return err
 }
 
-// send types a message, or queues it until the input box is ready and idle: never into a
-// menu (pending, a candidate, or on the screen now and not yet read by the detector), where
-// the paste and its Enter would answer it, and never into a turn that is still running. The
-// queue is typed by evaluate once the screen held idle (idleHold).
+// Every source uses the same immediate, ordered paste/Enter stream.
 func (w *watcher) send(text string) error {
 	return w.sendMail(mailInput{text: text})
 }
 
 func (w *watcher) sendMail(input mailInput) error {
-	d := w.classify()
-	empty := emptyComposer(w.scr.Text(), w.info.Name)
-	p := w.p
-	p.mu.Lock()
-	if !w.ready || w.pending != nil || w.candN > 0 || d.State != screen.Idle || !empty || time.Since(w.humanInputAt) < 20*time.Second || p.state != model.StateIdle {
-		w.queued = append(w.queued, input)
-		p.mu.Unlock()
-		return nil
+	if input.queuedAt.IsZero() {
+		input.queuedAt = time.Now()
 	}
-	w.markBusyLocked()
-	p.setStateLocked(model.StateWorking)
-	p.mu.Unlock()
-	w.typeMail(input)
+	w.p.mu.Lock()
+	w.queued = append(w.queued, input)
+	w.mailStage(input, "input_queue")
+	w.p.mu.Unlock()
+	w.pumpMail()
 	return nil
+}
+
+// One FIFO for every source. Selection happens under p.mu before inputMu is
+// acquired, so a newer arrival cannot overtake a selected paste waiting on keys.
+func (w *watcher) pumpMail() {
+	select {
+	case <-w.p.done:
+		return
+	default:
+	}
+	w.p.mu.Lock()
+	if w.mailTyping || w.mailMenuHeld || len(w.queued) == 0 {
+		w.p.mu.Unlock()
+		return
+	}
+	input := w.queued[0]
+	// OpenCode needs a mounted composer. Claude's first launch prompt needs
+	// positive evidence that startup has finished before the paste/Enter pair.
+	if !w.ready && (w.info.Name == model.HarnessOpenCode || input.launchPrompt) {
+		w.p.mu.Unlock()
+		return
+	}
+	w.queued = w.queued[1:]
+	w.mailTyping = true
+	w.markBusyLocked() // state observation only; never a delivery gate
+	w.p.setStateLocked(model.StateWorking)
+	w.p.mu.Unlock()
+	w.typeMail(input)
+}
+
+// This timer protects idle state observation only; mail delivery ignores it.
+func (w *watcher) submitSettledLocked(now time.Time) bool {
+	return !now.Before(w.busyUntil)
 }
 
 func (w *watcher) markBusyLocked() {
@@ -503,17 +561,29 @@ func (w *watcher) typeText(text string) {
 
 func (w *watcher) typeMail(input mailInput) {
 	text := input.text
+	w.mailStage(input, "input_lock_wait")
 	w.inputMu.Lock()
-	// Recheck after acquiring the input lock: a human may have started a draft
-	// since send/evaluate inspected the screen. Leave the mail queued, untouched.
-	d := w.classify()
-	empty := emptyComposer(w.scr.Text(), w.info.Name)
-	w.p.mu.Lock()
-	if d.State != screen.Idle || !empty || time.Since(w.humanInputAt) < 20*time.Second {
+	w.mailStage(input, "composer_recheck")
+	// Esc may decline/cancel a tool approval. Never concatenate arbitrary text
+	// behind it until the menu has actually left the screen.
+	if !w.dismissMailMenu(input) {
+		input.menuWait = true
+		w.p.mu.Lock()
 		w.queued = append([]mailInput{input}, w.queued...)
+		w.mailTyping, w.mailMenuHeld = false, true
+		w.p.emitLocked(runner.Event{Kind: runner.EvMailDelivery, MessageIDs: input.ids, Delivery: "menu_wait"})
 		w.p.mu.Unlock()
 		w.inputMu.Unlock()
 		return
+	}
+	empty := w.boxEmpty()
+	w.p.mu.Lock()
+	if input.menuWait {
+		// Once pasting resumes, exit recovery must no longer treat this as unpasted.
+		w.p.emitLocked(runner.Event{Kind: runner.EvMailDelivery, MessageIDs: input.ids, Delivery: "dispatching"})
+	}
+	if input.now && !input.holdLoggedAt.IsZero() {
+		log.Printf("terminal owner queue released agent=%s messages=%v after=%.1fs", w.spec.AgentID, input.ids, time.Since(input.queuedAt).Seconds())
 	}
 	if w.tr != nil {
 		w.tr.note(text)
@@ -521,25 +591,155 @@ func (w *watcher) typeMail(input mailInput) {
 	w.turnInput = true
 	w.p.mu.Unlock()
 	text = strings.ReplaceAll(runner.PlainText(text), "\n", "\r")
-	err := w.p.write(w.scr.Paste(text))
+	w.mailStage(input, "paste_write")
+	var err error
+	if !empty {
+		// End navigation preserves an existing draft, including wrapped lines.
+		err = w.p.write([]byte(strings.Repeat("\x1b[F", len(w.scr.Lines())+1)))
+		if err == nil && w.menuNow() {
+			err = runner.ErrApprovalPending
+		}
+		text = "  " + text
+	}
+	if err == nil {
+		err = w.p.write(w.scr.Paste(text))
+	}
+	if err == nil {
+		w.mailStage(input, "submit_delay")
+	} else {
+		w.mailStage(input, "paste_failed")
+	}
 	time.AfterFunc(w.info.SubmitDelay, func() {
-		defer w.inputMu.Unlock()
+		defer func() {
+			// The next paste starts as soon as this Enter transaction ends.
+			// No idle, draft, human-typing, readiness or post-submit timer gate.
+			w.inputMu.Unlock()
+			w.p.mu.Lock()
+			w.mailTyping = false
+			w.p.mu.Unlock()
+			w.pumpMail()
+		}()
 		stage := "unconfirmed"
 		select {
 		case <-w.p.done:
 		default:
+			// A second look before Enter: a menu or an approval that came up since the text was
+			// typed (possible when it went into a working harness) would take the Enter as its
+			// answer. Then no Enter: the text stays in the box, the delivery is unconfirmed.
 			if err == nil {
+				w.mailStage(input, "submit_menu_check")
+			}
+			if err == nil && !w.menuNow() {
+				w.mailStage(input, "enter_write")
 				if err = w.p.write([]byte("\r")); err == nil {
 					stage = "submitted"
 				}
 			}
 		}
+		w.mailStage(input, stage)
 		if len(input.ids) > 0 {
 			w.p.mu.Lock()
 			w.p.emitLocked(runner.Event{Kind: runner.EvMailDelivery, MessageIDs: input.ids, Delivery: stage})
 			w.p.mu.Unlock()
 		}
 	})
+}
+
+// Called only while inputMu owns the entire mail transaction. A menu that
+// ignores Esc is reported explicitly; text is never fed into its option picker.
+func (w *watcher) dismissMailMenu(input mailInput) bool {
+	if !w.menuNow() {
+		return true
+	}
+	// A pending approval can outlive its screen. Clear that stale bookkeeping
+	// without sending Esc into an already-working agent.
+	if d := w.classify(); d.State == screen.Idle || d.State == screen.Working {
+		w.clearMailMenu()
+		return true
+	}
+	w.mailStage(input, "menu_escape")
+	if err := w.p.write([]byte{0x1b}); err != nil {
+		return false
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		d := w.classify()
+		if d.State == screen.Idle || d.State == screen.Working {
+			w.clearMailMenu()
+			return true
+		}
+		select {
+		case <-w.p.done:
+			return false
+		case <-time.After(pickPoll):
+		}
+	}
+	w.mailStage(input, "menu_wait")
+	return false
+}
+
+func (w *watcher) clearMailMenu() {
+	w.p.mu.Lock()
+	defer w.p.mu.Unlock()
+	if w.pending != nil {
+		w.p.emitLocked(runner.Event{Kind: runner.EvApprovalCancelled, Approval: &runner.ApprovalRequest{ID: w.pending.id}})
+	}
+	w.pending, w.candidate, w.candN = nil, "", 0
+}
+
+type mailProgress struct {
+	stage string
+	since int64
+}
+
+// mailStage logs identifiers and fixed stage names only; never owner words or
+// screen contents. Reads stay available while a PTY/input lock is blocked.
+func (w *watcher) mailStage(input mailInput, stage string) {
+	w.p.recordMailStage(w.spec.AgentID, input.ids, stage)
+}
+
+func (p *process) recordMailStage(agentID string, ids []string, stage string) {
+nextMessage:
+	for _, id := range ids {
+		next := mailProgress{stage: stage, since: time.Now().UnixMilli()}
+		for {
+			previous, loaded := p.deliveryStages.LoadOrStore(id, next)
+			if !loaded {
+				break
+			}
+			if previous.(mailProgress).stage == stage {
+				continue nextMessage
+			}
+			if p.deliveryStages.CompareAndSwap(id, previous, next) {
+				break
+			}
+		}
+		log.Printf("terminal mail stage agent=%s message=%s stage=%s", agentID, id, stage)
+	}
+}
+
+func (p *process) MailStage(id string) string {
+	stage, _ := p.MailProgress(id)
+	return stage
+}
+
+func (p *process) MailProgress(id string) (string, int64) {
+	if value, ok := p.deliveryStages.Load(id); ok {
+		progress := value.(mailProgress)
+		return progress.stage, progress.since
+	}
+	return "", 0
+}
+
+// ForgetMailStage is called only after the fleet consumes the submission receipt.
+func (p *process) ForgetMailStage(id string) { p.deliveryStages.Delete(id) }
+
+// menuNow: a menu is on the screen, or on its way to becoming an approval.
+func (w *watcher) menuNow() bool {
+	menu := w.classify().State.Menu()
+	w.p.mu.Lock()
+	defer w.p.mu.Unlock()
+	return menu || w.pending != nil || w.candN > 0
 }
 
 // press sends a key spec, one key at a time.
@@ -580,6 +780,16 @@ func (w *watcher) watchSession() {
 		if s.SessionID == "" && w.cmd.LaunchID != "" {
 			codexHome := harness.CodexHome(home)
 			probe = func() string { return harness.CodexFindByMarker(codexHome, s.Cwd, w.cmd.LaunchID, w.start) }
+		}
+	case model.HarnessOpenCode:
+		// A new conversation starts without -s (opencode refuses an id it did not create);
+		// its id is read back from opencode's database once it exists.
+		if s.SessionID == "" {
+			db := harness.OpenCodeDBPath(home)
+			if s.OpenCodeDataDir != "" {
+				db = filepath.Join(s.OpenCodeDataDir, "opencode", "opencode.db")
+			}
+			probe = func() string { return harness.OpenCodeFindNew(db, s.Cwd, w.start.Add(-2*time.Second)) }
 		}
 	}
 	if probe == nil {
@@ -622,16 +832,9 @@ func argAfter(args []string, flag string) string {
 	return ""
 }
 
-// queryReply matches what a terminal answers to a program's queries: cursor position (CPR),
-// device attributes (DA1/DA2), mode reports (DECRPM) and color reports (OSC 10/11/4).
-var queryReply = regexp.MustCompile(`\x1b\[\d+;\d+R|\x1b\[[?>][\d;]*c|\x1b\[\?[\d;]*\$y|\x1b\](?:1[0-9]|4;\d+);rgb:[0-9a-fA-F/]+(?:\x07|\x1b\\)`)
-
-func stripQueryReplies(b []byte) []byte {
-	if !strings.Contains(string(b), "\x1b") {
-		return b
-	}
-	return queryReply.ReplaceAll(b, nil)
-}
+// stripQueryReplies also protects direct runner callers; the fleet filters before
+// recording human input, and current viewers filter before sending.
+func stripQueryReplies(b []byte) []byte { return runner.StripTerminalQueryReplies(b) }
 
 // lastWords is the screen's last few non-empty lines, joined (for an exit error).
 func (w *watcher) lastWords() string {
@@ -643,4 +846,21 @@ func (w *watcher) lastWords() string {
 		}
 	}
 	return strings.Join(out, " / ")
+}
+
+// logHeldLocked records predicates only, never screen contents or owner words.
+// Called under p.mu; each claimed owner message is sampled at most every 30s.
+func (w *watcher) logHeldLocked(now time.Time, d screen.Detection, empty bool) {
+	for i := range w.queued {
+		in := &w.queued[i]
+		if !in.now || in.queuedAt.IsZero() || now.Sub(in.queuedAt) < 10*time.Second || (!in.holdLoggedAt.IsZero() && now.Sub(in.holdLoggedAt) < 30*time.Second) {
+			continue
+		}
+		humanAge := float64(-1)
+		if !w.humanInputAt.IsZero() {
+			humanAge = now.Sub(w.humanInputAt).Seconds()
+		}
+		log.Printf("terminal owner queue held agent=%s messages=%v after=%.1fs screen=%v process=%s menu=%t candidate=%t not_ready=%t draft_or_placeholder=%t recent_human=%t human_source=owner_terminal_write human_age_s=%.1f submit_settle=%t idle_settle=%t", w.spec.AgentID, in.ids, now.Sub(in.queuedAt).Seconds(), d.State, w.p.state, w.pending != nil || d.State.Menu(), w.candN > 0, !w.ready, !empty, humanAge >= 0 && humanAge < 20, humanAge, now.Before(w.busyUntil), w.idleSince.IsZero() || now.Sub(w.idleSince) < idleHold)
+		in.holdLoggedAt = now
+	}
 }

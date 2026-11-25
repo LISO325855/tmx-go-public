@@ -1,6 +1,9 @@
+import { usePath } from "@/lib/router";
+import { useClassic } from "@/hooks/use-classic";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useEffect, useState } from "react";
 import { ProcessList } from "@/components/process-list";
-import { ExternalLink, Laptop, Moon, Sun } from "lucide-react";
+import { ExternalLink, Laptop, Moon, Sun, WandSparkles } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectSeparator, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -9,6 +12,7 @@ import { DiscoverSection } from "@/components/discover-section";
 import { PageBody, PageHeader, PageTitle, Section } from "@/components/page";
 import { P2PSection } from "@/components/p2p-settings";
 import { ProfilesSection } from "@/components/profiles-section";
+import { FleetRulesSection } from "@/components/fleet-rules-settings";
 import { SafetySection } from "@/components/safety-settings";
 import { PhoneNotifications } from "@/components/phone-notifications";
 import { OwnerDevices } from "@/components/device-pairing";
@@ -22,13 +26,17 @@ import { Truncate } from "@/components/truncate";
 import { displayPath, modelName } from "@/lib/format";
 import { api } from "@/lib/api";
 import { useStore } from "@/lib/store";
+import { isComputerWindow } from "@/lib/onboarding-rules";
+import { ui } from "@/lib/ui";
 import { setTheme, useTheme, type ThemePref } from "@/lib/theme";
 import { applyTextSize, savedTextSize, TEXT_SIZES, type TextSize } from "@/lib/text-size";
 import { cn } from "@/lib/utils";
+import { KNOWN_MODELS } from "@/lib/models";
 import { chatApi } from "@/lib/chats";
 import { toast } from "sonner";
 
-export const KNOWN_MODELS = ["claude-opus-5-5", "claude-sonnet-5", "claude-haiku-4-5-20251001"];
+// the model choices live in lib/models.ts (Fable 5.2 added, the owner #11); re-exported for the profile editor
+export { KNOWN_MODELS };
 
 export const MODES: { value: string; label: string; hint: string }[] = [
   { value: "auto", label: "Auto", hint: "Claude's classifier decides; anything it escalates comes to Needs you." },
@@ -192,6 +200,7 @@ function ChatNameRow() {
 }
 
 function HeadHarnessSection() {
+  const classic = useClassic();
   const [value, setValue] = useState<string>("claude");
   const [loaded, setLoaded] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -199,8 +208,9 @@ function HeadHarnessSection() {
     api.getConfig().then((c) => {
       setValue(c.head_harness || "claude");
       setLoaded(true);
-    }).catch(() => setLoaded(true));
+    }).catch(() => {});
   }, []);
+  if (!loaded) return null;
   async function onChange(v: string) {
     const prev = value;
     setValue(v);
@@ -216,10 +226,10 @@ function HeadHarnessSection() {
     }
   }
   return (
-    <Section title="Head agent">
+    <Section title={classic ? "Architect" : "Head agent"}>
       <div className="rounded-xl border bg-card px-4 py-1">
-        <Row label="Head harness" hint="The harness for the head agent (the top of the tree). Chat-capable harnesses only. Takes effect after a daemon restart.">
-          <Select value={value} onValueChange={onChange} disabled={!loaded || busy}>
+        <Row label={classic ? "Architect harness" : "Head harness"} hint={classic ? "The harness for the Architect. Chat-capable harnesses only. Takes effect after a daemon restart." : "The harness for the head agent (the top of the tree). Chat-capable harnesses only. Takes effect after a daemon restart."}>
+          <Select value={value} onValueChange={onChange} disabled={busy}>
             <SelectTrigger className="w-full sm:w-72">
               <SelectValue />
             </SelectTrigger>
@@ -236,16 +246,30 @@ function HeadHarnessSection() {
 
 const SETTINGS_SECTIONS = [
   ["phone-notifications", "Phone notifications"], ["system-tools", "System tools"],
-  ["project-tools", "Project tools"], ["profiles", "Profiles"], ["head-agent", "Head agent"],
+  ["project-tools", "Project tools"], ["profiles", "Profiles"], ["fleet-rules", "Fleet rules"], ["head-agent", "Head agent"],
   ["safety", "Safety"], ["owner-devices", "Owner devices"], ["companion", "Companion"],
-  ["peer-to-peer", "Peer-to-peer"], ["resources", "Resources"], ["harnesses", "Harnesses"],
+  ["peer-to-peer", "Peer-to-peer"], ["resources", "Machine load"], ["harnesses", "Harnesses"],
   ["running-outside-tmx", "Running outside tmx"], ["updates", "Updates"], ["voice", "Voice"],
-  ["recordings", "Recordings"], ["whatsapp", "WhatsApp"], ["appearance", "Appearance"],
+  ["recordings", "Recordings"], ["whatsapp", "WhatsApp"], ["setup", "Setup"], ["appearance", "Appearance"],
   ["this-machine", "This machine"],
 ];
 
+const CLASSIC_TABS = [
+  ["agents", "Agents", ["profiles", "fleet-rules", "head-agent", "harnesses", "running-outside-tmx"]],
+  ["safety", "Safety", ["safety"]],
+  ["resources", "Machine load", ["resources"]],
+  ["integrations", "Integrations", ["companion", "peer-to-peer", "whatsapp"]],
+  ["voice", "Voice & recordings", ["voice", "recordings"]],
+  ["updates", "Updates", ["updates"]],
+  ["general", "General", ["phone-notifications", "owner-devices", "setup", "appearance", "this-machine"]],
+] as const;
+
 export function SettingsPage() {
+  const classic = useClassic();
+  const path = usePath();
   const [section, setSection] = useState(() => new URLSearchParams(window.location.hash.split("?")[1] ?? "").get("section") || "phone-notifications");
+  const [tab, setTab] = useState(() => CLASSIC_TABS.find(([, , sections]) => (sections as readonly string[]).includes(new URLSearchParams(window.location.hash.split("?")[1] ?? "").get("section") ?? ""))?.[0] ?? "agents");
+  const show = (group: string) => !classic || tab === group;
   const workspace = useStore((s) => s.workspace);
   const machine = useStore((s) => s.machine);
   const version = useStore((s) => s.version);
@@ -254,54 +278,55 @@ export function SettingsPage() {
   useEffect(() => {
     // #/settings?section=companion scrolls to that section.
     const section = new URLSearchParams(window.location.hash.split("?")[1] ?? "").get("section");
-    if (section) setTimeout(() => document.getElementById(section)?.scrollIntoView({ block: "start" }), 50);
-  }, []);
+    if (classic) setTab(CLASSIC_TABS.find(([, , sections]) => (sections as readonly string[]).includes(section ?? ""))?.[0] ?? "agents");
+    const timer = section ? setTimeout(() => document.getElementById(section)?.scrollIntoView({ block: "start" }), 50) : undefined;
+    return () => clearTimeout(timer);
+  }, [path, classic]);
 
   const browserURL = transport ? `${transport.baseURL}/#token=${encodeURIComponent(transport.token)}` : "";
   const via = transport?.kind === "mock" ? "Mock data" : transport?.kind === "bridge" ? "Desktop bridge" : transport?.desktop ? "Direct (desktop)" : "Direct";
 
-  return (
-    <div className="settings-page flex min-h-0 min-w-0 flex-1 flex-col">
-      <PageHeader>
-        <PageTitle>Settings</PageTitle>
-      </PageHeader>
-      <nav aria-label="Settings sections" className="shrink-0 border-b px-4 py-2 md:hidden">
-        <label htmlFor="settings-section" className="sr-only">Settings section</label>
-        <select id="settings-section" value={section} className="min-h-11 w-full min-w-0 rounded-md border bg-background px-3 text-[18px]" onChange={e => {
-          setSection(e.target.value);
-          document.getElementById(e.target.value)?.scrollIntoView({ block: "start" });
-        }}>
-          {SETTINGS_SECTIONS.map(([id, label]) => <option key={id} value={id}>{label}</option>)}
-        </select>
-      </nav>
-      <PageBody width="max-w-[51.25rem]" className="space-y-10">
-        <PhoneNotifications />
-        <ProcessList />
-        <ProcessList projectTools />
-        <ProfilesSection />
+  const content = (
+      <PageBody width="max-w-none" className="space-y-10">
+        {show("general") && <PhoneNotifications />}
+        {!classic && <ProcessList />}
+        {!classic && <ProcessList projectTools />}
+        {show("agents") && <ProfilesSection />}
+        {show("agents") && <FleetRulesSection />}
 
-        <HeadHarnessSection />
+        {show("agents") && <HeadHarnessSection />}
 
-        <SafetySection />
-        <OwnerDevices />
+        {show("safety") && <SafetySection />}
+        {show("general") && <OwnerDevices />}
 
-        <div id="companion" className="scroll-mt-6">
+        {show("integrations") && <div id="companion" className="scroll-mt-6">
           <CompanionSection />
-        </div>
+        </div>}
 
-        <P2PSection />
+        {show("integrations") && <P2PSection />}
 
-        <ResourceSettings />
-        <DiscoverSection />
+        {show("resources") && <ResourceSettings />}
+        {show("agents") && <DiscoverSection />}
 
-        <UpdateSection />
+        {show("updates") && <UpdateSection />}
 
-        <VoiceSection />
+        {show("voice") && <VoiceSection />}
 
-        <RecordingSettingsSection />
-        <WhatsAppSection />
+        {show("voice") && <RecordingSettingsSection />}
+        {show("integrations") && <WhatsAppSection />}
 
-        <Section title="Appearance">
+        {show("general") && isComputerWindow(transport) && <Section title="Setup">
+          <div className="rounded-xl border bg-card px-4 py-1">
+            <Row label="Set up tmx" hint="Connect WhatsApp, your phone and Companion, one easy step at a time. Anything you skipped is still here.">
+              <Button variant="outline" size="sm" onClick={() => ui.openOnboarding(true)}>
+                <WandSparkles />
+                Run setup again
+              </Button>
+            </Row>
+          </div>
+        </Section>}
+
+        {show("general") && <Section title="Appearance">
           <div className="rounded-xl border bg-card px-4 py-1">
             <Row label="Theme" hint="System follows your OS setting.">
               <ThemePicker />
@@ -310,9 +335,9 @@ export function SettingsPage() {
               <TextSizePicker />
             </Row>
           </div>
-        </Section>
+        </Section>}
 
-        <Section title="This machine">
+        {show("general") && <Section title="This machine">
           <div className="divide-y rounded-xl border bg-card px-4">
             <Row label="Machine">
               <p className="pt-1.5 text-sm">{machine}</p>
@@ -348,8 +373,30 @@ export function SettingsPage() {
               <p className="pt-1.5 font-mono text-[0.7812rem]">{version}</p>
             </Row>
           </div>
-        </Section>
+        </Section>}
       </PageBody>
-    </div>
+  );
+
+  return (
+    <Tabs value={tab} onValueChange={(v) => setTab(v as typeof tab)} className={cn("flex min-h-0 min-w-0 flex-1 flex-col gap-0", !classic && "settings-page")}>
+      <PageHeader>
+        <PageTitle>Settings</PageTitle>
+      </PageHeader>
+      {classic && <div className="shrink-0 overflow-x-auto border-b px-4">
+        <TabsList variant="line" aria-label="Settings sections">
+          {CLASSIC_TABS.map(([id, label]) => <TabsTrigger key={id} value={id} className="min-h-[34px] px-3">{label}</TabsTrigger>)}
+        </TabsList>
+      </div>}
+      {!classic && <nav aria-label="Settings sections" className="shrink-0 border-b px-4 py-2 md:hidden">
+        <label htmlFor="settings-section" className="sr-only">Settings section</label>
+        <select id="settings-section" value={section} className="min-h-11 w-full min-w-0 rounded-md border bg-background px-3 text-[18px]" onChange={e => {
+          setSection(e.target.value);
+          document.getElementById(e.target.value)?.scrollIntoView({ block: "start" });
+        }}>
+          {SETTINGS_SECTIONS.filter(([id]) => id !== "setup" || isComputerWindow(transport)).map(([id, label]) => <option key={id} value={id}>{label}</option>)}
+        </select>
+      </nav>}
+      {classic ? <TabsContent value={tab} className="mt-0 flex min-h-0 flex-1 flex-col">{content}</TabsContent> : content}
+    </Tabs>
   );
 }

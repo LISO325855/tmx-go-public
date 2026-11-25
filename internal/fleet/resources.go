@@ -32,6 +32,7 @@ type StartOptions struct {
 }
 
 type startOpts struct {
+	accountSwitch      bool
 	recovery           *agentRec
 	recoveryGeneration uint64
 	deliberate         bool
@@ -108,6 +109,7 @@ func (f *Fleet) LiveAgents() []model.Agent {
 // Publish puts an event on the bus (resource samples, slot changes, chat.* events).
 func (f *Fleet) Publish(ev model.BusEvent) {
 	f.auditApprovalEvent(ev)
+	f.watchSource(ev) // watch_fleet.go: guard events and samples feed the watch board
 	f.bus.Publish(ev)
 }
 
@@ -267,6 +269,9 @@ func (f *Fleet) StartAgentWith(c Caller, idOrName string, o StartOptions) (model
 	if err != nil {
 		return model.Agent{}, err
 	}
+	if err := f.agentStartsShell(c, id); err != nil {
+		return model.Agent{}, err
+	}
 	if err := f.startAgentOpts(id, "", startOpts{StartOptions: o, deliberate: true}); err != nil {
 		return model.Agent{}, err
 	}
@@ -376,6 +381,7 @@ func (f *Fleet) BrakeAgent(id, reason, detail string, ask bool) ([]sysinfo.Proc,
 		}
 	}
 	f.saveAgentLocked(r)
+	f.watchPausedLocked(r, reason, detail)
 	f.log.Warn("agent paused", "agent", r.a.Name, "reason", reason, "detail", detail, "processes", len(procs))
 	return procs, nil
 }
@@ -458,6 +464,7 @@ func (f *Fleet) resumeLocked(r *agentRec, p *pauseRec, why string) {
 // clearPauseLocked forgets the pause, restores the state and expires its Needs-you item.
 func (f *Fleet) clearPauseLocked(r *agentRec, p *pauseRec, why string) {
 	delete(f.res.paused, r.a.ID)
+	f.watchResumedLocked(r)
 	if r.a.State == model.StatePaused {
 		st := p.prev
 		if st == model.StateWaiting && r.waiting == 0 {

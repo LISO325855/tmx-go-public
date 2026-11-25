@@ -21,14 +21,26 @@ func (s *Service) FileLimit() int64 {
 // An allowlist deliberately excludes scripts, executables, active web documents,
 // macro-enabled Office documents and unknown extensions. Archives stay inert:
 // neither this service nor the fetch tool unpacks or executes them.
+// allowedFileName: any file but one a double-click or a shell runs. Until 17 Nov this was a list
+// of about fifty allowed extensions, which refused source code (.go, .py, .html) and every file
+// without an extension; now it is the list of what is refused. Programs are also refused by
+// their content (validateFile) and pages and scripts by their type (blockedFileType).
 func allowedFileName(name string) bool {
-	ext := strings.ToLower(filepath.Ext(name))
-	return strings.Contains("|.txt|.md|.csv|.tsv|.json|.yaml|.yml|.xml|.log|.pdf|.rtf|.doc|.docx|.xls|.xlsx|.ppt|.pptx|.odt|.ods|.odp|.epub|.png|.jpg|.jpeg|.gif|.webp|.bmp|.tif|.tiff|.heic|.avif|.mp3|.wav|.ogg|.flac|.m4a|.aac|.opus|.mp4|.webm|.mov|.mkv|.zip|.tar|.gz|.bz2|.xz|.7z|.rar|", "|"+ext+"|") && ext != ""
+	return !runnableExt[strings.ToLower(filepath.Ext(name))]
+}
+
+var runnableExt = map[string]bool{
+	".exe": true, ".dll": true, ".com": true, ".scr": true, ".pif": true, ".cpl": true, ".msi": true, ".msp": true, ".msix": true,
+	".bat": true, ".cmd": true, ".ps1": true, ".psm1": true, ".vbs": true, ".vbe": true, ".js": true, ".jse": true, ".wsf": true,
+	".wsh": true, ".hta": true, ".lnk": true, ".url": true, ".reg": true, ".inf": true, ".chm": true, ".jar": true,
+	".sh": true, ".bash": true, ".zsh": true, ".command": true, ".scpt": true, ".app": true, ".dmg": true, ".pkg": true,
+	".deb": true, ".rpm": true, ".appimage": true, ".apk": true, ".iso": true, ".img": true, ".vhd": true, ".vhdx": true,
+	".docm": true, ".xlsm": true, ".pptm": true, ".dotm": true, ".xlam": true, ".html": true, ".htm": true, ".xhtml": true, ".svg": true,
 }
 
 func validateFile(name string, data []byte) error {
 	if !allowedFileName(name) {
-		return invalid("file type is blocked; use a document, image, audio/video or archive")
+		return invalid("file type is blocked: a program, script or page that runs when opened")
 	}
 	for _, magic := range [][]byte{[]byte("MZ"), []byte("\x7fELF"), []byte("#!"), {0xcf, 0xfa, 0xed, 0xfe}, {0xfe, 0xed, 0xfa, 0xcf}, {0xce, 0xfa, 0xed, 0xfe}, {0xfe, 0xed, 0xfa, 0xce}, {0xca, 0xfe, 0xba, 0xbe}} {
 		if bytes.HasPrefix(data, magic) {

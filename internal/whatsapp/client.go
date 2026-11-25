@@ -13,6 +13,7 @@ package whatsapp
 
 import (
 	"context"
+	"io"
 	"os"
 	"time"
 
@@ -51,13 +52,23 @@ type Client interface {
 	// Send sends one message and returns WhatsApp's timestamp for it.
 	Send(ctx context.Context, m Outgoing) (time.Time, error)
 	// Download fetches an attachment into f (decrypted and checked).
-	Download(ctx context.Context, ref MediaRef, f *os.File) error
+	Download(ctx context.Context, ref MediaRef, f DownloadFile) error
 	// MarkRead sends read receipts for messages of one sender in a chat.
 	MarkRead(ctx context.Context, chat, sender string, ids []string) error
 	// ChatName looks a chat's name up (a group's subject, a contact's name); "" if unknown.
 	ChatName(ctx context.Context, jid string) string
 	// Close disconnects (the device stays linked).
 	Close()
+}
+
+// DownloadFile supports whatsmeow's streamed download and in-place decryption.
+// The service supplies a bounded implementation, never an unguarded *os.File.
+type DownloadFile interface {
+	io.ReadWriteSeeker
+	io.ReaderAt
+	io.WriterAt
+	Truncate(int64) error
+	Stat() (os.FileInfo, error)
 }
 
 // MediaRef says how to fetch an attachment from WhatsApp's servers. It holds the media's keys:

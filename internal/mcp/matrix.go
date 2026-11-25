@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 
@@ -26,7 +27,7 @@ type matrixArgs struct {
 	Ref    string `json:"ref,omitempty" jsonschema:"on, attach: what it points at (an agent's id, a path, a name; never a secret's value)"`
 	Role   string `json:"role,omitempty" jsonschema:"attach: e.g. reviewer"`
 	Label  string `json:"label,omitempty" jsonschema:"attach: what to show"`
-	Why    string `json:"why,omitempty" jsonschema:"attach: one line"`
+	Why    string `json:"why,omitempty" jsonschema:"state: where the thread stands now, one line; attach: why this link belongs"`
 	Link   string `json:"link,omitempty" jsonschema:"detach: the link's id (from get)"`
 	Past   bool   `json:"past,omitempty" jsonschema:"get: ended links too"`
 	All    bool   `json:"all,omitempty" jsonschema:"get: info lines too, not only events"`
@@ -38,6 +39,9 @@ type matrixArgs struct {
 	Owner     string `json:"owner,omitempty" jsonschema:"new: the agent accountable (default: you)"`
 	Status    string `json:"status,omitempty" jsonschema:"state: active, paused, waiting_on_owner, blocked or done"`
 	Lifecycle string `json:"lifecycle,omitempty" jsonschema:"new, state: task (ends) or ongoing (never ends)"`
+	// The owner's Board: one row per thread with how far it is and what it waits for.
+	Pct     *int    `json:"pct,omitempty" jsonschema:"state: how far the thread is, 0-100 (your honest estimate); say where it stands in why, one line"`
+	Blocker *string `json:"blocker,omitempty" jsonschema:"state: what the thread waits for, one line: what stops it (with status blocked), or exactly what the owner has to do (with status waiting_on_owner); an empty text clears it"`
 }
 
 type matrixView struct {
@@ -50,8 +54,9 @@ type matrixView struct {
 func (t *Tools) registerMatrix(s *sdk.Server) {
 	sdk.AddTool(s, &sdk.Tool{Name: "matrix", Description: "The Matrix: the owner's threads with everything on them. " +
 		"op=get: one thread (yours: your project's or one you are on) with its agents, shells, docs, files, secret names (never values) and its events, in one answer. " +
-		"op=mine: your threads with their status and counts. op=pivot: see by an axis (agent, shell, secret, ...). op=on: every thread one thing is on (axis + ref). " +
+		"op=mine: your threads in the owner's priority order (top first), with their status and counts. op=pivot: see by an axis (agent, shell, secret, ...). op=on: every thread one thing is on (axis + ref). " +
 		"op=new: open a thread for a request (leads: under your project), with the owner's words and the user story. op=state: active, paused, blocked, done (recorded as an event, with why). " +
+		"The owner reads his Board from these: with op=state also report pct (0-100, how far the thread is) with why = where it stands in one line, and blocker = what it waits for; either may be sent alone, without a status. " +
 		"op=attach / op=detach: link a doc, file, path or story to your thread. " +
 		"Record what matters with thread_add (start, decision, result, blocker, handoff, ask, done)."}, t.matrix)
 }
@@ -120,12 +125,29 @@ func (t *Tools) matrix(ctx context.Context, _ *sdk.CallToolRequest, in matrixArg
 		if len(cards) == 0 {
 			return text("You are on no thread yet."), nil, nil
 		}
+		// The owner's priority first (his order on the Board; position 1 = top), then the rest.
+		sort.SliceStable(cards, func(i, j int) bool {
+			a, b := cards[i].Thread.Position, cards[j].Thread.Position
+			return a > 0 && (b <= 0 || a < b)
+		})
 		var b strings.Builder
 		b.WriteString(matrixPrefix)
-		for _, c := range cards {
+		if cards[0].Thread.Position > 0 {
+			b.WriteString("In the owner's priority order (his Board): work top-first.\n")
+		}
+		for i, c := range cards {
 			silent := ""
+			if c.Thread.Position > 0 {
+				silent = fmt.Sprintf(" · priority %d", i+1)
+			}
+			if c.Thread.Progress != nil {
+				silent += fmt.Sprintf(" · %d%%", *c.Thread.Progress)
+			}
+			if c.Thread.Blocker != "" {
+				silent += " · waiting for: " + c.Thread.Blocker
+			}
 			if c.SilentHours > 0 {
-				silent = fmt.Sprintf(" · SILENT %dh: record an event, hand it over or change its state", c.SilentHours)
+				silent += fmt.Sprintf(" · SILENT %dh: record an event, hand it over or change its state", c.SilentHours)
 			}
 			fmt.Fprintf(&b, "- %q [%s] · %s%s%s\n", c.Thread.Title, c.Thread.ID, statusOf(c.Thread), countsOf(c.Counts), silent)
 		}
@@ -159,11 +181,24 @@ func (t *Tools) matrix(ctx context.Context, _ *sdk.CallToolRequest, in matrixArg
 		return text(fmt.Sprintf("Opened thread %q [%s]. Launch its agents with thread_id %s, and record its events with thread_add (topic %q).", th.Title, th.ID, th.ID, th.Title)), nil, nil
 	case "state":
 		var th model.Thread
-		body := map[string]string{"status": in.Status, "lifecycle": in.Lifecycle, "why": in.Why}
+		body := map[string]any{"status": in.Status, "lifecycle": in.Lifecycle, "why": in.Why}
+		if in.Pct != nil {
+			body["pct"] = *in.Pct
+		}
+		if in.Blocker != nil {
+			body["blocker"] = *in.Blocker
+		}
 		if err := t.c.Post(ctx, "/api/matrix/threads/"+client.Seg(in.Thread)+"/state", body, &th); err != nil {
 			return nil, nil, err
 		}
-		return text(fmt.Sprintf("%q is now %s.", th.Title, statusOf(th))), nil, nil
+		said := fmt.Sprintf("%q is now %s", th.Title, statusOf(th))
+		if th.Progress != nil {
+			said += fmt.Sprintf(", %d%%", *th.Progress)
+		}
+		if th.Blocker != "" {
+			said += ", waiting for: " + th.Blocker
+		}
+		return text(said + "."), nil, nil
 	default:
 		return nil, nil, fmt.Errorf("op must be get, mine, pivot, on, new, state, attach or detach")
 	}

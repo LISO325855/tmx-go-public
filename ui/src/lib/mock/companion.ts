@@ -90,6 +90,34 @@ export class MockCompanion {
     const off = scenario === "companion-off" || missing;
     const refused = scenario === "companion-key-refused"; // the key was rotated or removed in Companion
     const keyless = scenario === "companion-chat-off" || scenario === "companion-connect"; // installed, but tmx holds no key
+    if (scenario === "onboarding") {
+      // A new machine: Companion is on this computer but not running, tmx not installed into it, no
+      // key. Connect with Companion installs tmx at once, opens Companion, and its key follows.
+      this.status = {
+        install: {
+          aios_home: "/Users/you/.aios",
+          companion_dir: true,
+          mcp_path: "/Users/you/.aios/mcps/tmx/mcp.json",
+          skill_path: "/Users/you/.aios/skills/tmx/SKILL.md",
+          installed: false,
+          foreign: false,
+          current: false,
+          enabled: true,
+          skill: false,
+          skill_foreign: false,
+        },
+        link_token: false,
+        connected: false,
+        address: { url: "http://127.0.0.1:8010", source: "default" },
+        checked: true,
+        reachable: false,
+        error: "Companion is not running (nothing answers at its address)",
+        active: 0,
+        awaiting: 0,
+        checked_at: Date.now(),
+      };
+      return;
+    }
     this.status = {
       install: {
         aios_home: "/Users/you/.aios",

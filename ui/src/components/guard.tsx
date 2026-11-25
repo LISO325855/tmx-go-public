@@ -49,7 +49,7 @@ export function GuardCommand({ g, tone, cwd, className }: { g: GuardHold; tone: 
 export function GuardHoldBody({ a, agent, compact }: { a: Approval; agent?: Agent; compact?: boolean }) {
   const g = guardOf(a);
   if (!g) return null;
-  if (g.tool === "p2p_invite_create" || g.tool === "p2p_join") {
+  if (g.tool === "p2p_invite_create" || g.tool === "p2p_join" || g.tool === "p2p_invite_whatsapp") {
     return (
       <div className="space-y-2">
         <p className="text-sm font-medium [overflow-wrap:anywhere]">{g.detail}</p>

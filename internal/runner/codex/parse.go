@@ -44,6 +44,7 @@ type parser struct {
 	initID, threadReqID string
 	configReqID         string
 	guardExecutable     string
+	managedMCP          map[string]runner.MCPServer
 	guardContext        *guard.Context
 	guardStates         func() map[string]string // nil = the strict built-in outcomes
 	resumeID            string                   // conversation to resume ("" = new)
@@ -139,7 +140,7 @@ func (p *parser) response(o *out, m wireMsg) {
 		if p.guardExecutable == "" {
 			return
 		}
-		if err := codexguard.ValidateEffective(m.Result, p.guardExecutable); m.Error != nil || err != nil {
+		if err := codexguard.ValidateEffective(m.Result, p.guardExecutable, p.managedMCP); m.Error != nil || err != nil {
 			o.entry(model.TimelineEntry{Kind: model.EntryError, IsError: true, Text: "Codex effective configuration failed the Windows guard check; no turn was started"})
 			o.close = true
 			return
@@ -428,7 +429,18 @@ func (p *parser) serverRequest(o *out, m wireMsg) {
 		}
 		ap.Question = strings.Join(qs, "\n\n")
 	case mElicitation:
-		// An MCP server asks for input through codex; tmx's own tools never do.
+		// Codex asks through an elicitation whether a call of an MCP tool may run (its
+		// "_meta.codex_approval_kind" is "mcp_tool_call"). For the node's own server that is
+		// always yes: the tools check the caller themselves, and what they may do is tmx's rule,
+		// not a prompt nobody sees. Declining it made every tmxg tool of a Codex agent fail with
+		// "user rejected MCP tool call" (Hostc-Go, 17 Nov). Any other elicitation (an MCP
+		// server asking for input) is declined with a visible timeline explanation.
+		// Owner-selected profile servers have the same tool-call authorization.
+		if managedToolApproval(m.Params, p.managedMCP) {
+			o.replies = append(o.replies, response(m.ID, map[string]any{"action": "accept", "content": map[string]any{}, "_meta": nil}))
+			return
+		}
+		o.entry(model.TimelineEntry{Kind: model.EntrySystem, Text: "Codex MCP input request declined: this is not a tool-call approval for a selected server.", IsError: true})
 		o.replies = append(o.replies, response(m.ID, map[string]any{"action": "decline", "content": nil, "_meta": nil}))
 		return
 	default:
@@ -472,6 +484,11 @@ func (p *parser) serverRequest(o *out, m wireMsg) {
 		}
 		if v.Outcome == guard.Hold {
 			ap.Description = "tmx guard: " + v.Message()
+		}
+		if v.Outcome == guard.Allow {
+			p.pending[key] = req
+			_ = p.answer(o, key, runner.Decision{Allow: true})
+			return
 		}
 	}
 	p.pending[key] = req
@@ -518,6 +535,41 @@ func (p *parser) answer(o *out, key string, d runner.Decision) error {
 		p.workingOrWaiting(o)
 	}
 	return nil
+}
+
+// ownMCPServer is the name tmx gives its own MCP server in an agent's codex config
+// (harness/args.go: mcp_servers.tmxg).
+const ownMCPServer = "tmxg"
+
+// managedToolApproval recognizes tool-call approval requests for tmxg and the
+// owner's selected profile servers, including both Codex metadata layouts.
+func managedToolApproval(params json.RawMessage, managed map[string]runner.MCPServer) bool {
+	var p struct {
+		ServerName string          `json:"serverName"`
+		Meta       json.RawMessage `json:"_meta"`
+		Request    struct {
+			Meta json.RawMessage `json:"_meta"`
+		} `json:"request"`
+	}
+	if json.Unmarshal(params, &p) != nil {
+		return false
+	}
+	selected := p.ServerName == ownMCPServer
+	if _, ok := managed[p.ServerName]; ok {
+		selected = true
+	}
+	if !selected {
+		return false
+	}
+	for _, raw := range []json.RawMessage{p.Meta, p.Request.Meta} {
+		var meta struct {
+			Kind string `json:"codex_approval_kind"`
+		}
+		if len(raw) > 0 && json.Unmarshal(raw, &meta) == nil && meta.Kind == "mcp_tool_call" {
+			return true
+		}
+	}
+	return false
 }
 
 // grantAsAsked turns a RequestPermissionProfile ({network: X|null, fileSystem: Y|null})

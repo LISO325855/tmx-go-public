@@ -24,7 +24,10 @@ func (s *Store) PutThread(t model.Thread) error {
 	_, err := s.db.Exec(upsert("threads", threadCols),
 		t.ID, t.Title, t.Kind, t.ProjectID, t.ChatID, t.Color, boolInt(t.Archived), t.CreatedAt, t.UpdatedAt, t.Position,
 		t.ParentID, t.Status, t.Lifecycle, t.Owner, t.Story, t.IntentText, t.IntentSource, t.CanvasX, t.CanvasY)
-	return err
+	if err != nil {
+		return err
+	}
+	return s.putThreadBoard(t) // the Board's fields: thread_board.go
 }
 
 func (s *Store) GetThread(id string) (model.Thread, error) {
@@ -32,7 +35,12 @@ func (s *Store) GetThread(id string) (model.Thread, error) {
 	if errors.Is(err, sql.ErrNoRows) {
 		return t, ErrNotFound
 	}
-	return t, err
+	if err != nil {
+		return t, err
+	}
+	one := []model.Thread{t}
+	err = s.fillThreadBoard(one)
+	return one[0], err
 }
 
 func (s *Store) ListThreads() ([]model.Thread, error) {
@@ -49,7 +57,10 @@ func (s *Store) ListThreads() ([]model.Thread, error) {
 		}
 		out = append(out, t)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, s.fillThreadBoard(out)
 }
 
 // DeleteThread removes a thread; its entries and the mail waiting in it go to General, its open
@@ -66,6 +77,7 @@ func (s *Store) DeleteThread(id string, now int64) error {
 		`UPDATE approvals SET thread_id = '' WHERE thread_id = ?`,
 		`UPDATE thread_entries SET thread_id = 'general' WHERE thread_id = ?`,
 		`DELETE FROM threads WHERE id = ?`,
+		`DELETE FROM thread_board WHERE thread_id = ?`,
 	} {
 		if _, err := tx.Exec(q, id); err != nil {
 			return err

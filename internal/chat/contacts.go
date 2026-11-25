@@ -119,6 +119,9 @@ func (s *Service) Join(ctx context.Context, link string) (JoinResult, error) {
 	if err != nil {
 		if created {
 			s.mu.Lock()
+			if s.teamSt != nil {
+				_ = s.teamSt.DeleteGroup(pv.GroupID)
+			}
 			_ = s.st.DeleteChat(pv.GroupID)
 			s.mu.Unlock()
 		}

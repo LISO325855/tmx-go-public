@@ -27,7 +27,7 @@ import (
 func (s *Server) recordingRoutes(mux *http.ServeMux) {
 	o, on := s.ownerOnly, s.recOn
 	mux.HandleFunc("GET /api/recordings", on(s.listRecordings)) // owner, agents
-	mux.HandleFunc("POST /api/recordings", o(on(s.beginRecording)))
+	mux.HandleFunc("POST /api/recordings", o(on(s.captureAdmission(s.beginRecording))))
 	mux.HandleFunc("GET /api/recordings/active", o(on(s.activeRecording)))
 	mux.HandleFunc("GET /api/recordings/{id}", on(s.getRecording)) // owner, agents
 	mux.HandleFunc("PATCH /api/recordings/{id}", o(on(s.renameRecording)))

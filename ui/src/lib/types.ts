@@ -39,6 +39,7 @@ export interface Agent {
   protected?: boolean;
   turns: number;
   error: string;
+  mcp_warnings?: string[];
   queued: number;
   // Resource control (DESIGN.md "Resources"): state queued / paused.
   queue_pos?: number;
@@ -67,7 +68,7 @@ export interface Project {
   updated_at: number;
 }
 
-export type MessageState = "queued" | "delivered" | "read" | "failed";
+export type MessageState = "queued" | "sending" | "delivered" | "read" | "failed";
 
 export interface Message {
   retry_id?: string;
@@ -104,6 +105,8 @@ export interface Approval {
     context?: string;
     category?: string;
     recommendation?: string;
+    /** Set on a card a project import brought in (the migrated source); absent on a card asked here. */
+    origin?: { source: string; id: string; imported_by?: string; imported_at?: number; source_author?: string; source_state?: string };
     action?: { goal: string; steps: string[]; account?: string; success: string; do_not_touch?: string[]; effects: "none" | "money" | "outward" | "account" };
   };
   id: string;
@@ -163,6 +166,9 @@ export interface Policy {
 
 /** An agent type (DESIGN.md "Profiles"). Built-ins (head, lead, worker) keep their level and can only be reset. */
 export interface Profile {
+  harness?: Harness;
+  account?: string;
+  provider?: string;
   slug: string;
   name: string;
   description: string;
@@ -180,6 +186,9 @@ export interface Profile {
   can_launch: string[] | null;
   /** may hand tasks to Companion (MCP companion_task); every hand-off still waits for the owner's OK */
   companion_tasks?: boolean;
+  /** Claude Code MCP servers added next to tmxg (ClaudeServer ids); Claude agents only */
+  mcp_servers?: string[] | null;
+  mcp_warnings?: string[];
   built_in: boolean;
   /** a built-in that differs from its default */
   modified: boolean;
@@ -187,7 +196,41 @@ export interface Profile {
   updated_at: number;
 }
 
+/** One MCP server Claude Code has (claudeext.Server): no config values. */
+export interface ClaudeServer {
+  /** a user server's name, or "plugin:<plugin>:<server>" */
+  id: string;
+  name: string;
+  source: "user" | "plugin";
+  /** the plugin's id (name@marketplace) */
+  plugin?: string;
+  /** a plugin server: its plugin is enabled */
+  enabled: boolean;
+  transport: string;
+  /** the command (stdio) or the URL's host */
+  detail: string;
+}
+
+export interface ClaudePlugin {
+  id: string;
+  name: string;
+  version: string;
+  scope: string;
+  enabled: boolean;
+  servers: string[] | null;
+}
+
+/** GET /api/claude/extensions: what Claude Code has installed. */
+export interface ClaudeExtensions {
+  available: boolean;
+  error?: string;
+  servers: ClaudeServer[] | null;
+  plugins: ClaudePlugin[] | null;
+}
+
 export interface Snapshot {
+  /** set when the snapshot was asked for without shelved agents (?shelved=0): how many were left out */
+  shelved_omitted?: number;
   machine: string;
   version: string;
   head: Agent | null;
@@ -197,9 +240,12 @@ export interface Snapshot {
   policy: Policy;
   profiles?: Profile[] | null;
   workspace: string;
+  /** config.json "ui.profile": "classic" = be the Python dashboard (lib/ui-profile.ts); absent = the default */
+  ui_profile?: string;
 }
 
 export type BusEventType =
+  | "heartbeat"
   | "snapshot"
   | "agent.updated"
   | "agent.removed"
@@ -317,6 +363,8 @@ export interface GuardHold {
   tool: string;
   tool_input?: unknown;
   cwd?: string;
+  /** the call cannot be remembered (it depends on values only known when it runs): no "Allow always" */
+  no_always?: boolean;
 }
 
 export type RuleState = "block" | "hold" | "allow";
@@ -340,12 +388,18 @@ export interface GuardRule {
   examples: string[];
 }
 
+/** The guard has no on/off switch: the rule states (GuardRule.state) are the whole safety model. */
 export interface GuardSettings {
-  enabled: boolean;
-  /** kinds of agents the guard is off for: levels today, agent profiles later */
-  off_for: string[];
-  /** every flip of a rule switch, newest last */
-  rule_log?: { rule: string; old: RuleState; new: RuleState; at: string; by: "owner" | "tmx" }[];
+  /** agents may automate a browser (off by default; turning it on asks for a proof) */
+  allow_browser_automation?: boolean;
+  /** the rule defaults this daemon has applied (2 = no master switch) */
+  defaults_version?: number;
+  /**
+   * every flip of a rule switch, newest last. One entry is not about a rule: rule "master-switch"
+   * (old "off" or "off for worker", new "always on"), written once when an install that had the
+   * removed switch off was upgraded.
+   */
+  rule_log?: { rule: string; old: RuleState | string; new: RuleState | string; at: string; by: "owner" | "tmx" }[];
   /** the owner's standing "Allow always" answers; changed only through allow_always and revoke */
   always_allow?: GuardAlwaysAllow[];
 }
@@ -392,7 +446,6 @@ export interface SafetyInfo {
   guard: GuardSettings;
   rules: GuardRule[];
   gate: GateStatus;
-  levels: Level[];
 }
 
 /** direct = LAN, a public address or hole-punched; relayed = only through a circuit relay
@@ -452,7 +505,22 @@ export interface Confirmation {
 
 /** GET/PUT /api/config: the part of config.json Settings edits. */
 export interface ConfigView {
-  head_harness: string;
+  head_harness?: string;
+  /** When the owner finished or closed the first-run setup (Unix ms); 0 = never. In a PUT any
+   * other number means "now", 0 offers it again. */
+  onboarded_at?: number;
+  /** Read only: the exact HTTPS names the running daemon answers on besides 127.0.0.1
+   * (config.json api.trusted_hosts); none = this computer only. */
+  trusted_hosts?: string[];
+}
+
+/** GET /api/devices: a browser paired with this daemon through its HTTPS address. */
+export interface OwnerDevice {
+  id: string;
+  name: string;
+  host: string;
+  /** a restricted recovery session, not a full pairing */
+  recovery?: boolean;
 }
 
 /** GET /api/harnesses: what each harness is and whether it is installed here. */
@@ -541,6 +609,12 @@ export interface Thread {
   intent_source?: string;
   canvas_x?: number;
   canvas_y?: number;
+  /** how far it is, 0-100, set by its agents (the Board view: lib/matrix-board.ts); absent = never reported */
+  progress?: number | null;
+  /** the one line that came with the progress: where it stands */
+  progress_why?: string;
+  /** what it waits for: what stops it (blocked), or what the owner has to do (waiting on you) */
+  blocker?: string;
 }
 
 export type ThreadStatus = "active" | "paused" | "waiting_on_owner" | "blocked" | "done";

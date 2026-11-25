@@ -14,6 +14,7 @@ import { Section } from "@/components/page";
 import { displayPath, relativeTime } from "@/lib/format";
 import { companionApi, companionChat, loadCompanionStatus, sortedTasks, useCompanion, type CompanionStatus } from "@/lib/companion";
 import { useStore } from "@/lib/store";
+import { ApiError } from "@/lib/transport";
 import { cn } from "@/lib/utils";
 import { TaskRow } from "./bits";
 import { openHandOff } from "./hand-off-dialog";
@@ -432,11 +433,18 @@ export function CompanionSection() {
   const tasks = useCompanion((s) => s.tasks);
   const checking = useCompanion((s) => s.checking);
   const transport = useStore((s) => s.transport);
-  const [failed, setFailed] = useState(false);
-  const refresh = () => void loadCompanionStatus(false).catch(() => setFailed(true));
+  const [error, setError] = useState("");
+  const refresh = (probe: boolean) => {
+    setError("");
+    void loadCompanionStatus(probe).catch((err: unknown) => setError(
+      err instanceof ApiError && (err.status === 404 || err.status === 501)
+        ? "This daemon has no Companion support. Update tmx."
+        : "Could not read Companion status.",
+    ));
+  };
   useEffect(() => {
     if (!transport) return;
-    void loadCompanionStatus(true).catch(() => setFailed(true));
+    refresh(true);
   }, [transport]);
   const list = sortedTasks(tasks);
 
@@ -450,7 +458,7 @@ export function CompanionSection() {
       }
       right={
         st && (
-          <Button size="xs" variant="ghost" className="text-muted-foreground" onClick={() => void loadCompanionStatus(true)} disabled={checking}>
+          <Button size="xs" variant="ghost" className="text-muted-foreground" onClick={() => refresh(true)} disabled={checking}>
             {checking ? <Loader2 className="animate-spin" /> : <RefreshCw />}
             Check again
           </Button>
@@ -460,17 +468,17 @@ export function CompanionSection() {
       <p className="-mt-1 mb-3 text-xs text-muted-foreground">
         Your desktop assistant. It can look at tmx and message the head; tmx can hand it tasks that need your apps, browser or accounts.
       </p>
-      {!st ? (
-        failed ? (
-          <div className="rounded-xl border bg-card px-4 py-3 text-sm text-muted-foreground">This daemon has no Companion support. Update tmx.</div>
+      {!st || error ? (
+        error ? (
+          <div className="rounded-xl border bg-card px-4 py-3 text-sm text-muted-foreground">{error}</div>
         ) : (
           <Skeleton className="h-36 rounded-xl" />
         )
       ) : (
         <div className="space-y-5">
           <div className="divide-y rounded-xl border bg-card" data-companion-status>
-            <ReadLink st={st} onChange={refresh} />
-            <TaskLink st={st} onChange={refresh} />
+            <ReadLink st={st} onChange={() => refresh(false)} />
+            <TaskLink st={st} onChange={() => refresh(false)} />
           </div>
           <div>
             <div className="mb-2 flex h-7 items-center gap-2">

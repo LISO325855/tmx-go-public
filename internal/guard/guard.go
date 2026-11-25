@@ -74,9 +74,16 @@ type Context struct {
 	Own       string // the agent's own folder: recursive deletes inside it are fine
 	Workspace string // project folders: writes inside it are fine
 	StateDir  string // tmx's state directory: never written, secrets never read
-	Home      string
-	Temp      []string            // scratch folders (TMPDIR, /tmp, %TEMP%): writes and deletes are fine
-	Env       func(string) string // environment lookup for $VAR / %VAR%; nil = none
+	// AccountHome is the agent's own harness account home when the daemon keeps it in its state
+	// (<StateDir>/ai-accounts/homes/<harness>/<account>, the agent's CLAUDE_CONFIG_DIR on a
+	// named account). The harness keeps the agent's conversations, memory, plans and todos
+	// there, so those folders are the agent's own; the rest of the home (the sign-in, settings)
+	// and every other account's home stay closed. "" = none. Set by the daemon's launch, never
+	// from an environment the agent controls.
+	AccountHome string
+	Home        string
+	Temp        []string            // scratch folders (TMPDIR, /tmp, %TEMP%): writes and deletes are fine
+	Env         func(string) string // environment lookup for $VAR / %VAR%; nil = none
 	// TmxNames are extra names of the tmx executable (basenames or full paths) besides "tmx".
 	TmxNames []string
 	// Git answers "which branch is checked out in dir, and which is the remote's default?";
@@ -105,13 +112,17 @@ func (o Outcome) valid() bool { return o == Allow || o == Hold || o == Block }
 // ValidState reports whether o is a state a rule switch may take.
 func ValidState(o Outcome) bool { return o.valid() }
 
-// Settings is the owner's guard configuration (config.json "guard").
+// Settings is the owner's guard configuration (config.json "guard"). There is no master switch:
+// every agent starts with the guard, and the per-rule states (Blocked, Held for me, Allowed) are
+// the whole safety model.
 type Settings struct {
 	AllowBrowserAutomation bool `json:"allow_browser_automation"`
-	Enabled                bool `json:"enabled"`
-	// OffFor names the kinds of agents the guard is off for: levels today ("head", "lead",
-	// "worker"), agent profiles once they exist.
-	OffFor []string `json:"off_for"`
+	// LegacyEnabled and LegacyOffFor are the removed master switch ("enabled", "off_for") as an
+	// older config.json or client still sends them. They are read so that the upgrade can say,
+	// once, what it dropped (Fleet.applyRuleDefaultsLocked); nothing acts on them and they are
+	// never written again.
+	LegacyEnabled *bool    `json:"enabled,omitempty"`
+	LegacyOffFor  []string `json:"off_for,omitempty"`
 	// AlwaysAllow: the owner's standing "Allow always" answers to guard holds (Settings > Safety
 	// lists them). Only the owner-gated allow-always and revoke routes change it; PUT
 	// /api/safety/guard keeps the stored list whatever it is sent.
@@ -140,11 +151,17 @@ type AllowedEntry struct {
 // including any rule added later, asks every time with a fresh proof: it is never written to
 // allowed_before, never allowed without a card and never spared the PIN. Off the list on
 // purpose: the 9 Sep class (disk, delete-root, permissions-root, boot, permissions-outside), the
-// lockout rows (elevation, hello-key, firewall-tailscale), tmx's owner commands, and the fixed
-// holds (browser-unverified).
+// lockout rows (elevation, hello-key, firewall-tailscale) and tmx's owner commands. This
+// matters only for a rule the owner set to Held for me: no rule is held by default.
+//
+// browser-unverified is on the list since 17 Nov (the owner, through tmx-lead): a scripted browser
+// run was the most frequent card of a working day, and it asked again for the very script the
+// owner had just allowed. The same command in the same folder by the same kind of agent now asks
+// once; another script, another folder or another kind of agent still brings a card. The block
+// on a browser that reaches Windows Hello (browser-unsafe-launch) is untouched.
 var Rememberable = map[string]bool{
 	RuleWriteOutside: true, RuleDeleteOutside: true, RuleGitRewrite: true, RulePipeShell: true,
-	RuleDesktop: true, RuleClaudeConfig: true, RuleBrowserMention: true,
+	RuleDesktop: true, RuleClaudeConfig: true, RuleBrowserScript: true,
 }
 
 // AllowedBeforeMax is how many allowed calls are remembered (oldest dropped).
@@ -158,8 +175,64 @@ func AllowedKey(rule, tool, command, cwd, agentKind string) string {
 	return hex.EncodeToString(sum[:16])
 }
 
-// DefaultsVersion is the current set of rule defaults (1 = the owner's brief, 3 Nov 22:14).
-const DefaultsVersion = 1
+// DefaultsVersion is the current set of rule defaults:
+//
+//	1 = the owner's brief, 3 Nov 22:14 (the first rule switches).
+//	2 = the master switch is gone and the rule list is the only safety model (the owner, 17 Nov
+//	    16:05): Blocked = disk, delete-root, permissions-root, boot, and nothing else; every
+//	    other switchable rule is Allowed. No rule is Held by default: Held for me is the
+//	    owner's choice per rule. Against version 1 that moves tmx-cli, elevation, hello-key,
+//	    firewall-tailscale, delete-outside, permissions-outside and git-rewrite from Held to
+//	    Allowed. The four fixed holds of version 1 (browser-unverified and the three pairing
+//	    tools) became switchable rules, Allowed too; kill-by-name lost its switch and is a
+//	    fixed Block.
+const DefaultsVersion = 2
+
+// earlierDefaults holds, per defaults version, the state of every rule that then differed from
+// what the next version does with it: what DefaultAt needs to say truthfully what an upgrade
+// changed. It names fixed rules too: the state they had while they had a switch (kill-by-name),
+// and the fixed outcome of rules that got a switch later.
+var earlierDefaults = map[int]map[string]Outcome{
+	1: {
+		RuleTmxCLI: Hold, RuleElevation: Hold, RuleHelloKey: Hold, RuleNetwork: Hold,
+		RuleDeleteOutside: Hold, RulePermsOutside: Hold, RuleGitRewrite: Hold,
+		RuleBrowserScript: Hold, RuleP2PInvite: Hold, RuleP2PJoin: Hold, RuleP2PInviteWA: Hold,
+		RuleKillByName: Allow,
+	},
+}
+
+// DefaultAt is what rule did, the owner having set nothing, on an install whose applied
+// defaults were version: 0 (an install from before the rule switches) = the strict built-in
+// outcome; the current version or later = what it does today (its default, or its outcome if
+// it is fixed). ok is false for an unknown rule.
+func DefaultAt(version int, rule string) (Outcome, bool) {
+	r, ok := ruleByID[rule]
+	if !ok {
+		return "", false
+	}
+	if version <= 0 || version >= DefaultsVersion {
+		if r.Fixed || version <= 0 {
+			return r.Outcome, true
+		}
+		return r.Default, true
+	}
+	for v := version; v < DefaultsVersion; v++ {
+		if o, ok := earlierDefaults[v][rule]; ok {
+			return o, true
+		}
+	}
+	if r.Fixed {
+		return r.Outcome, true
+	}
+	return r.Default, true
+}
+
+// HadSwitch reports whether rule, fixed today, had a switch on an install whose applied
+// defaults were version: then an owner's entry for it in RuleStates was real, and the upgrade
+// says what became of it.
+func HadSwitch(version int, rule string) bool {
+	return version == 1 && rule == RuleKillByName
+}
 
 // RuleChange is one flip of a rule's switch (or the defaults applied at an upgrade: By "tmx").
 type RuleChange struct {
@@ -169,6 +242,11 @@ type RuleChange struct {
 	At   string  `json:"at"` // RFC 3339
 	By   string  `json:"by"` // "owner" | "tmx"
 }
+
+// LegacyMasterSwitch is the RuleChange.Rule of the one log entry written when an install that
+// had the removed on/off switch off (or off for some agents) moves to defaults version 2. Its
+// Old ("off", "off for worker") and New ("always on") are words, not rule states.
+const LegacyMasterSwitch = "master-switch"
 
 // RuleLogMax is how many changes the log keeps.
 const RuleLogMax = 200
@@ -224,43 +302,13 @@ func RunTimeDependent(command string) bool {
 	return false
 }
 
-// DefaultSettings: the guard is on for everyone.
-func DefaultSettings() Settings { return Settings{Enabled: true, OffFor: []string{}} }
+// DefaultSettings: every rule at its default, nothing remembered.
+func DefaultSettings() Settings { return Settings{} }
 
-// On reports whether the guard applies to an agent described by keys (its level, later its
-// profile): globally on and off for none of them.
-func (s Settings) On(keys ...string) bool {
-	if !s.Enabled {
-		return false
-	}
-	for _, k := range keys {
-		for _, off := range s.OffFor {
-			if k != "" && strings.EqualFold(k, off) {
-				return false
-			}
-		}
-	}
-	return true
-}
-
-// Weaker reports whether next protects fewer agents than s (switching it off globally or for
-// one more kind of agent): that change needs the owner's confirmation.
+// Weaker reports whether next protects less than s: that change needs the owner's confirmation.
+// The rule switches have their own owner-gated route; what is left here is browser automation.
 func (s Settings) Weaker(next Settings) bool {
-	if !s.AllowBrowserAutomation && next.AllowBrowserAutomation {
-		return true
-	}
-	if s.Enabled && !next.Enabled {
-		return true
-	}
-	if !next.Enabled {
-		return false
-	}
-	for _, k := range next.OffFor {
-		if s.On(k) {
-			return true
-		}
-	}
-	return false
+	return !s.AllowBrowserAutomation && next.AllowBrowserAutomation
 }
 
 // Environment the daemon gives a guarded agent (inherited by its hook).
@@ -278,8 +326,11 @@ const Matcher = ".*"
 
 // Check classifies one tool call.
 func Check(ctx Context, call Call) Verdict {
-	if v := checkBrowser(ctx, call.Tool); v.Outcome == Block {
-		return v
+	// Only this exact MCP server bypasses the browser tool-name rule.
+	if !strings.HasPrefix(call.Tool, "mcp__agent-browser-guard__") {
+		if v := checkBrowser(ctx, call.Tool); v.Outcome == Block {
+			return v
+		}
 	}
 	if call.Cwd != "" {
 		ctx.Cwd = call.Cwd
@@ -379,7 +430,7 @@ func CheckCommand(ctx Context, sh Shell, command string) Verdict {
 	if v.Outcome == Block {
 		return v
 	}
-	if browser := checkBrowser(ctx, command); browser.Outcome.rank() > v.Outcome.rank() {
+	if browser := checkBrowser(ctx, commandText(command, sh)); browser.Outcome.rank() > v.Outcome.rank() {
 		return browser
 	}
 	return v

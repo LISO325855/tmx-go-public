@@ -31,6 +31,7 @@ func (s *Server) safetyRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("PUT /api/safety/guard", s.ownerOnly(s.putGuard))
 	mux.HandleFunc("DELETE /api/safety/guard/always/{id}", s.ownerOnly(s.revokeAlways))
 	mux.HandleFunc("PUT /api/safety/guard/rules/{id}", s.ownerOnly(s.putRuleState))
+	mux.HandleFunc("PUT /api/safety/guard/rules", s.ownerOnly(s.putRuleStates)) // a batch, one confirmation (safety_batch.go)
 	mux.HandleFunc("GET /api/gate", s.ownerOnly(s.getGate))
 	mux.HandleFunc("PUT /api/gate", s.ownerOnly(s.putGate))
 	mux.HandleFunc("PUT /api/gate/grace", s.ownerOnly(s.putGrace))
@@ -192,10 +193,9 @@ func short(s string, n int) string {
 
 // SafetyInfo is GET /api/safety.
 type SafetyInfo struct {
-	Guard  guard.Settings `json:"guard"`
-	Rules  []RuleView     `json:"rules"`
-	Gate   gate.Status    `json:"gate"`
-	Levels []model.Level  `json:"levels"`
+	Guard guard.Settings `json:"guard"`
+	Rules []RuleView     `json:"rules"`
+	Gate  gate.Status    `json:"gate"`
 }
 
 func (s *Server) gateStatus(r *http.Request) gate.Status {
@@ -216,8 +216,7 @@ func (s *Server) gateStatus(r *http.Request) gate.Status {
 }
 
 func (s *Server) getSafety(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, SafetyInfo{Guard: s.f.GuardSettings(), Rules: s.ruleViews(), Gate: s.gateStatus(r),
-		Levels: []model.Level{model.LevelHead, model.LevelLead, model.LevelWorker}})
+	writeJSON(w, http.StatusOK, SafetyInfo{Guard: s.f.GuardSettings(), Rules: s.ruleViews(), Gate: s.gateStatus(r)})
 }
 
 func (s *Server) putGuard(w http.ResponseWriter, r *http.Request) {
@@ -225,9 +224,8 @@ func (s *Server) putGuard(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &next) {
 		return
 	}
-	if next.OffFor == nil {
-		next.OffFor = []string{}
-	}
+	// The guard has no on/off switch: "enabled" and "off_for" from an older client are ignored
+	// (SetGuardSettings). What this route changes is browser automation.
 	if s.f.GuardSettings().Weaker(next) && !s.RequireOwner(w, r, "relax agent safety settings", next) {
 		return
 	}
@@ -453,7 +451,7 @@ func (s *Server) postBlock(w http.ResponseWriter, r *http.Request) {
 // gateDecide asks the gate before the owner allows a guard hold. Denying never needs a proof.
 func (s *Server) gateDecide(w http.ResponseWriter, r *http.Request, id string, req fleet.DecideRequest) bool {
 	ap, err := s.f.ApprovalByID(id)
-	if err == nil && (ap.Tool == fleet.ToolP2PInvite || ap.Tool == fleet.ToolP2PJoin) && (req.Decision == "allow" || req.Decision == fleet.DecisionAllowAlways) {
+	if err == nil && fleet.IsP2PTool(ap.Tool) && (req.Decision == "allow" || req.Decision == fleet.DecisionAllowAlways) {
 		reason := ap.Description
 		if req.Decision == fleet.DecisionAllowAlways {
 			reason += "; always allow this pairing tool"
@@ -559,6 +557,6 @@ func gateCaller(r *http.Request) string {
 	if !validUISession(nonce) {
 		nonce = ""
 	}
-	sum := sha256.Sum256([]byte(r.Header.Get("Authorization") + "\n" + nonce + "\n" + requestHost(r) + "\n" + cookieValue(r, deviceCookie)))
+	sum := sha256.Sum256([]byte(r.Header.Get("Authorization") + "\n" + nonce + "\n" + requestHost(r) + "\n" + strings.Join(sessionTokens(r), ",")))
 	return hex.EncodeToString(sum[:])
 }

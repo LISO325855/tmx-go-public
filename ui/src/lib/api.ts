@@ -1,11 +1,16 @@
 // Typed calls for the API table in DESIGN.md.
 import type { Upload } from "./attachments";
 import { ownerAction, withConfirmation } from "./owner-gate";
+import type { MachineProcess, MachineRegistry } from "./machine-registry";
+import type { PairedDevice, PhoneCode, PhoneStatus, PhoneWay } from "./phone-connect";
+import type { LockSetting } from "./phone-lock-core";
+import type { ProjectArtifacts, ProjectSection } from "./project-page";
 import { useStore } from "./store";
 import type {
   Agent,
   AgentUpdate,
   Approval,
+  ClaudeExtensions,
   ConfigView,
   CreateAgentBody,
   CreateProjectBody,
@@ -39,6 +44,18 @@ function t() {
 const enc = encodeURIComponent;
 
 export const api = {
+  // Connect a phone (internal/api/phone.go): only at the computer.
+  phone: (setup = false) => t().request<PhoneStatus>("GET", `/api/phone${setup ? "?setup=1" : ""}`),
+  connectPhone: (via: PhoneWay, address?: string) =>
+    ownerAction((c) => t().request<PhoneCode>("POST", withConfirmation("/api/phone/connect", c), address ? { via, address } : { via })),
+  cancelPhoneCode: () => t().request<void>("DELETE", "/api/phone/connect"),
+  /** the same Wi-Fi fallback's switch (internal/api/phonelan.go) */
+  setPhoneWifi: (on: boolean) => ownerAction((c) => t().request<PhoneStatus["wifi"]>("PUT", withConfirmation("/api/phone/wifi", c), { on })),
+  tailscaleSignIn: () => t().request<{ opened?: boolean; link?: string }>("POST", "/api/phone/tailscale/signin"),
+  devices: () => t().request<PairedDevice[]>("GET", "/api/devices"),
+  // The phone lock's setting (internal/api/phonelock.go): only at the computer.
+  phoneLock: () => t().request<LockSetting>("GET", "/api/phone/lock"),
+  setPhoneLock: (s: { enabled: boolean; after_seconds: number }) => ownerAction((c) => t().request<LockSetting>("PUT", withConfirmation("/api/phone/lock", c), s)),
   // The owner PIN (ownerpin.go): set/changed at the machine, or changed with the current PIN.
   pinStatus: () => t().request<PinStatus>("GET", "/api/gate/pin"),
   setPin: (pin: string, oldPin?: string) => t().request<{ set: boolean }>("POST", "/api/gate/pin", oldPin ? { pin, old_pin: oldPin } : { pin }),
@@ -52,21 +69,37 @@ export const api = {
   // Gated actions go through ownerAction: a 428 asks for the owner's confirmation, then retries.
   deleteProject: (id: string) => ownerAction((c) => t().request<void>("DELETE", withConfirmation(`/api/projects/${enc(id)}`, c))),
 
+  /** a project's shared page: status, checklist, links (docs/project-sections.md; lib/project-page.ts) */
+  projectSection: (id: string) => t().request<ProjectSection>("GET", `/api/projects/${enc(id)}/section`),
+  /** sets (or with "" clears) the project's repository address; the owner only (internal/fleet/project_repo.go) */
+  setProjectRepo: (id: string, repo: string) => t().request<ProjectSection>("POST", `/api/projects/${enc(id)}/section`, { repo }),
+  /** its final outputs and each member's line */
+  projectArtifacts: (id: string) => t().request<ProjectArtifacts>("GET", `/api/projects/${enc(id)}/artifacts`),
+  /** the machine registry: what a project's agents have running (lib/machine-registry.ts) */
+  registry: (project = "") => t().request<MachineRegistry>("GET", `/api/registry?project=${enc(project)}`),
+  /** IDs go in the body: they contain colons */
+  registryStop: (id: string) => t().request<{ ok: boolean }>("POST", "/api/registry/stop", { id }),
+  registryRestart: (id: string) => t().request<MachineProcess>("POST", "/api/registry/restart", { id }),
   createAgent: (b: CreateAgentBody) => t().request<Agent>("POST", "/api/agents", b),
   agentAction: (id: string, action: "start" | "stop" | "restart" | "interrupt") =>
     t().request<void>("POST", `/api/agents/${enc(id)}/${action}`),
+  renameAgent: (id: string, name: string) => t().request<Agent>("POST", `/api/agents/${enc(id)}/rename`, { name }),
   deleteAgent: (id: string) => t().request<void>("DELETE", `/api/agents/${enc(id)}`),
+  /** presses keys on the agent's screen (owner only): "enter", "esc", "ctrl+c", "up", "1", "y"… (lib/terminal-keys.ts) */
+  pressKeys: (id: string, keys: string) => t().request<{ ok: boolean }>("POST", `/api/agents/${enc(id)}/keys`, { keys }),
+  /** types text into the agent's screen (owner only); submit false = put it in without Enter ("Paste only") */
+  typeText: (id: string, text: string, submit: boolean) => t().request<{ ok: boolean }>("POST", `/api/agents/${enc(id)}/type`, { text, submit }),
   patchAgent: (id: string, b: PatchAgentBody) => t().request<AgentUpdate>("PATCH", `/api/agents/${enc(id)}`, b),
   /** chat, or the harness's own screen (terminal), on the same conversation; mid-turn it waits */
   setMode: (id: string, mode: Mode) => t().request<ModeChange>("POST", `/api/agents/${enc(id)}/mode`, { mode }),
   /** thread: to the head, the board topic the message is filed under */
-  send: (id: string, text: string, uploads?: string[], thread?: string, retryId?: string) =>
+  send: (id: string, text: string, uploads?: string[], thread?: string, retryId?: string, signal?: AbortSignal) =>
     t().request<void>("POST", `/api/agents/${enc(id)}/send`, {
       text,
       ...(retryId ? { retry_id: retryId } : {}),
       ...(uploads?.length ? { uploads } : {}),
       ...(thread ? { thread_id: thread } : {}),
-    }),
+    }, signal),
   /** Stores a file for the agent's next message; data is base64. */
   upload: (id: string, f: { name: string; type: string; data: string }) =>
     t().request<Upload>("POST", `/api/agents/${enc(id)}/uploads`, f),
@@ -83,12 +116,22 @@ export const api = {
   getConfig: () => t().request<ConfigView>("GET", "/api/config"),
   putConfig: (c: ConfigView) => ownerAction((cc) => t().request<ConfigView>("PUT", withConfirmation("/api/config", cc), c)),
 
+  /** at the host only: approve the pairing code a new device shows; always asks for the owner's proof */
+  approveDevice: (code: string) => ownerAction((c) => t().request<{ approved: boolean }>("POST", withConfirmation("/api/devices/approve", c), { code })),
+
   // Profiles can grant bypassPermissions too, so writes go through the owner gate like the policy.
   createProfile: (p: Partial<Profile>) => ownerAction((c) => t().request<Profile>("POST", withConfirmation("/api/profiles", c), p)),
   putProfile: (slug: string, p: Partial<Profile>) =>
     ownerAction((c) => t().request<Profile>("PUT", withConfirmation(`/api/profiles/${enc(slug)}`, c), p)),
   deleteProfile: (slug: string) => t().request<void>("DELETE", `/api/profiles/${enc(slug)}`),
   resetProfile: (slug: string) => t().request<Profile>("POST", `/api/profiles/${enc(slug)}/reset`),
+
+  // Claude Code's MCP servers and plugins, offered to profiles; installing runs Claude Code itself (gated).
+  claudeExtensions: (fresh = false) => t().request<ClaudeExtensions>("GET", `/api/claude/extensions${fresh ? "?fresh=1" : ""}`),
+  installClaudePlugin: (plugin: string) =>
+    ownerAction((c) => t().request<ClaudeExtensions>("POST", withConfirmation("/api/claude/plugins", c), { plugin })),
+  addClaudeServer: (name: string, config: unknown) =>
+    ownerAction((c) => t().request<ClaudeExtensions>("POST", withConfirmation("/api/claude/mcp", c), { name, config })),
 
   harnesses: () => t().request<HarnessInfo[]>("GET", "/api/harnesses"),
   discover: () => t().request<{ agents: DiscoveredAgent[] | null }>("GET", "/api/discover"),
@@ -102,6 +145,9 @@ export const api = {
     ownerAction((c) =>
       t().request<{ guard: GuardSettings; rules: GuardRule[] }>("PUT", withConfirmation(`/api/safety/guard/rules/${enc(id)}`, c), { state }),
     ),
+  /** Saves several rule switches together: ONE fresh proof covers the whole batch. */
+  putRuleStates: (states: Record<string, RuleState>) =>
+    ownerAction((c) => t().request<{ guard: GuardSettings; rules: GuardRule[] }>("PUT", withConfirmation("/api/safety/guard/rules", c), { states })),
   /** Ends one standing "Allow always"; always asks for a fresh proof. */
   revokeAlways: (id: string) =>
     ownerAction((c) => t().request<GuardSettings>("DELETE", withConfirmation(`/api/safety/guard/always/${enc(id)}`, c))),

@@ -96,8 +96,8 @@ func TestSwitchToTheScreenAndBackKeepsTheSession(t *testing.T) {
 	if got.Mode != model.ModeTerminal || got.HomeMode != model.ModeChat || got.PendingMode != "" || got.SessionID != sid {
 		t.Fatalf("after the switch: %+v", got)
 	}
-	if stored, _ := e.st.GetAgent(a.ID); stored.Mode != model.ModeChat {
-		t.Fatalf("the store must keep the launch mode, has %s", stored.Mode)
+	if stored, _ := e.st.GetAgent(a.ID); stored.Mode != model.ModeTerminal {
+		t.Fatalf("the store must keep the selected terminal mode, has %s", stored.Mode)
 	}
 	if !hasEntry(t, f, "w", model.EntrySystem, "Switched to Claude Code's own screen") {
 		t.Fatal("no timeline note for the switch")
@@ -127,7 +127,7 @@ func hasArgs(args []string, flag, val string) bool {
 	return false
 }
 
-func TestSwitchWaitsForTheTurnAndHoldsMail(t *testing.T) {
+func TestSwitchWaitsForTheTurnWithoutHoldingOwnerMail(t *testing.T) {
 	quickSwitch(t)
 	e := newEnv(t)
 	f := e.started()
@@ -139,14 +139,14 @@ func TestSwitchWaitsForTheTurnAndHoldsMail(t *testing.T) {
 	if err != nil || !res.Pending || res.Agent.PendingMode != model.ModeTerminal {
 		t.Fatalf("mid-turn: %+v %v", res, err)
 	}
-	// The owner writes while the switch waits: the message is not pushed into the old process.
+	// A requested future switch must not hold mail for the live process.
 	n := len(chat.Sent())
 	if _, err := f.SendOwner("w", "what was the word?", ""); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(50 * time.Millisecond)
-	if len(chat.Sent()) != n || e.term.Last(a.ID) != nil {
-		t.Fatal("the turn was cut short or the mail went to the old process")
+	if len(chat.Sent()) != n || chat.Interrupts() != 1 || e.term.Last(a.ID) != nil {
+		t.Fatal("owner mail did not interrupt the current turn")
 	}
 	// Cancel and ask again: nothing changes until the turn ends.
 	if res, _ := f.SetMode(OwnerCaller, "w", ModeRequest{Mode: model.ModeChat}); res.Agent.PendingMode != "" {
@@ -157,6 +157,14 @@ func TestSwitchWaitsForTheTurnAndHoldsMail(t *testing.T) {
 	}
 
 	chat.Turn("done", 0, 1)
+	// Mail is not held for a requested switch, so when the turn ends either comes first: the
+	// switch (the mail then waits for the screen), or the interrupting owner mail as its own turn
+	// in the live process (the switch then follows once that turn has ended too).
+	inChat := func() bool { return strings.Contains(strings.Join(chat.Sent()[n:], "\n"), "what was the word?") }
+	eventually(t, "the switch or the owner mail", func() bool { return e.term.Last(a.ID) != nil || inChat() })
+	if e.term.Last(a.ID) == nil {
+		chat.Turn("kumquat", 0, 1)
+	}
 	tui := newProc(t, e.term, a.ID, nil)
 	if mustAgent(t, f, "w").Mode != model.ModeTerminal {
 		t.Fatal("not switched at the end of the turn")
@@ -165,9 +173,8 @@ func TestSwitchWaitsForTheTurnAndHoldsMail(t *testing.T) {
 		t.Fatal("mail typed before the screen was ready")
 	}
 	tui.State(model.StateIdle)
-	eventually(t, "the held message is typed into the screen", func() bool {
-		s := tui.Sent()
-		return len(s) == 1 && strings.Contains(s[0], "what was the word?")
+	eventually(t, "owner mail delivered once across switch", func() bool {
+		return strings.Count(strings.Join(chat.Sent()[n:], "\n")+"\n"+strings.Join(tui.Sent(), "\n"), "what was the word?") == 1
 	})
 }
 
@@ -281,7 +288,7 @@ func TestMailReachesTheAgentInBothModes(t *testing.T) {
 	eventually(t, "chat mail again", func() bool { s := back.Sent(); return len(s) == 1 && strings.Contains(s[0], "three") })
 }
 
-func TestDaemonRestartBringsASwitchedAgentHome(t *testing.T) {
+func TestDaemonRestartKeepsASwitchedWorkersMode(t *testing.T) {
 	quickSwitch(t)
 	e := newEnv(t)
 	f := e.started()
@@ -298,22 +305,12 @@ func TestDaemonRestartBringsASwitchedAgentHome(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	before := len(e.chat.Procs())
 	f2 := e.started()
 	got := mustAgent(t, f2, "w")
-	if got.Mode != model.ModeChat || got.HomeMode != "" {
+	if got.Mode != model.ModeTerminal || got.HomeMode != "" {
 		t.Fatalf("after a restart: %+v", got)
 	}
-	var p *fake.Process
-	eventually(t, "started in chat", func() bool {
-		for _, x := range e.chat.Procs()[before:] {
-			if x.Spec.AgentID == a.ID {
-				p = x
-				return true
-			}
-		}
-		return false
-	})
+	p := newProc(t, e.term, a.ID, tui)
 	if p.Spec.SessionID != a.SessionID {
 		t.Fatal("lost the session")
 	}
@@ -365,9 +362,9 @@ func TestSetModeRules(t *testing.T) {
 	if _, err := f.SetMode(OwnerCaller, "sh", ModeRequest{Mode: "tui"}); KindOf(err) != KindInvalid {
 		t.Fatal("unknown mode")
 	}
-	head := mustAgent(t, f, "head")
-	if _, err := f.SetMode(AgentCaller(head.ID), sh.Name, ModeRequest{Mode: model.ModeTerminal}); KindOf(err) != KindForbidden {
-		t.Fatalf("an agent switched a mode: %v", err)
+	// A worker switches nobody's mode; the head and a project's lead do (17 Nov; manage_test.go).
+	if _, err := f.SetMode(AgentCaller(mustAgent(t, f, "pi").ID), sh.Name, ModeRequest{Mode: model.ModeTerminal}); KindOf(err) != KindForbidden {
+		t.Fatalf("a worker switched a mode: %v", err)
 	}
 	if res, err := f.SetMode(OwnerCaller, "sh", ModeRequest{Mode: model.ModeTerminal}); err != nil || !strings.Contains(res.Note, "already") {
 		t.Fatalf("same mode: %+v %v", res, err)
@@ -544,5 +541,34 @@ func TestHeadBoardWhileInItsScreen(t *testing.T) {
 			t.Fatalf("cards never settled: topic card %+v; general card %+v", pricing, general)
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestPendingModeDoesNotHoldTerminalMailFromEitherSender(t *testing.T) {
+	_, f, _, a, proc := typeTextLead(t)
+	peer, err := f.LaunchAgent(OwnerCaller, LaunchRequest{ProjectID: workerProject(t, f), Name: "pending-peer"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	f.agents[a.ID].a.State = model.StateWorking
+	f.agents[a.ID].a.PendingMode = model.ModeChat
+	f.mu.Unlock()
+	before := len(proc.Sent())
+	if _, err := f.SendMessage(AgentCaller(peer.ID), SendRequest{To: a.ID, Body: "agent during pending switch"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.SendOwner(a.ID, "owner during pending switch", ""); err != nil {
+		t.Fatal(err)
+	}
+	sent := proc.Sent()[before:]
+	if len(sent) != 1 || !strings.Contains(sent[0], "agent during pending switch") || proc.Interrupts() != 1 {
+		t.Fatal(sent)
+	}
+	f.mu.Lock()
+	pending := f.agents[a.ID].a.PendingMode
+	f.mu.Unlock()
+	if pending != model.ModeChat {
+		t.Fatal("mail cancelled requested switch")
 	}
 }

@@ -202,7 +202,7 @@ func (s *Server) pinClear(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) pinSessionStart(w http.ResponseWriter, r *http.Request) {
-	if !s.browserReady(w, r) {
+	if !s.deviceReady(w, r) {
 		return
 	}
 	var req pinBody
@@ -231,7 +231,7 @@ func (s *Server) pinSessionStart(w http.ResponseWriter, r *http.Request) {
 // confirmWithPIN confirms one pending owner action (requireBrowserOwner's 428) with the PIN.
 // The confirmed action must then be retried within 5 minutes, once.
 func (s *Server) confirmWithPIN(w http.ResponseWriter, r *http.Request) {
-	if !s.browserReady(w, r) {
+	if !s.deviceReady(w, r) {
 		return
 	}
 	var req pinBody

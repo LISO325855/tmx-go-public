@@ -206,14 +206,9 @@ func (f *Fleet) DeliverCompanion(agentID, body string) (model.Message, error) {
 		return model.Message{}, errf(KindNotFound, "no agent %q", agentID)
 	}
 	m := model.Message{ID: model.NewID(), From: model.CompanionParty, To: agentID, Body: body, State: model.MsgQueued, CreatedAt: model.Now()}
-	n, err := f.st.CountQueued(agentID)
-	if err != nil {
+	if err := f.diskFloorLocked(m); err != nil {
 		f.mu.Unlock()
 		return model.Message{}, err
-	}
-	if n >= MaxQueued {
-		f.mu.Unlock()
-		return model.Message{}, errf(KindTooMany, "%s already has %d messages waiting", r.a.Name, n)
 	}
 	if err := f.st.PutMessage(m); err != nil {
 		f.mu.Unlock()
@@ -322,23 +317,6 @@ func (f *Fleet) companionSend(req SendRequest, wireID string, urgent bool) (mode
 	if err != nil {
 		f.mu.Unlock()
 		return model.Message{}, err
-	}
-	// Keep the link's total budget independent of how many agents it can reach.
-	// Task reports use the same party but not this label and retain their own path.
-	recent, err := f.st.ListMessages(store.MessageFilter{From: model.CompanionParty, BodyPrefix: CompanionLabel + "\n", Limit: MaxPerWindow})
-	if err != nil {
-		f.mu.Unlock()
-		return model.Message{}, err
-	}
-	n := 0
-	for _, m := range recent {
-		if m.CreatedAt >= model.Now()-RateWindow.Milliseconds() {
-			n++
-		}
-	}
-	if n >= MaxPerWindow {
-		f.mu.Unlock()
-		return model.Message{}, errf(KindTooMany, "Companion sent %d messages in the last 10 minutes; wait before sending more", n)
 	}
 	m := model.Message{ID: model.NewID(), From: model.CompanionParty, To: r.a.ID,
 		Body: peertext.Under(CompanionLabel, body, MaxBodyBytes), State: model.MsgQueued,

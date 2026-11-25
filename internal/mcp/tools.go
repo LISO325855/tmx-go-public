@@ -44,10 +44,12 @@ type launchArgs struct {
 	Project string `json:"project,omitempty" jsonschema:"project slug or id; a lead's own project by default"`
 	Model   string `json:"model,omitempty" jsonschema:"empty uses profile default; worker choices: Opus for senior, Sonnet for junior, Haiku for intern; must be allowed by profile"`
 	Harness string `json:"harness,omitempty" jsonschema:"claude (default), codex, opencode or pi"`
-	Mode    string `json:"mode,omitempty" jsonschema:"chat (default for claude) or terminal"`
+	Mode    string `json:"mode,omitempty" jsonschema:"chat or terminal (the agent in its harness's own screen); empty takes this node's default: chat for claude and codex, but claude starts in its own screen where the owner uses the classic dashboard"`
 	Account string `json:"account,omitempty" jsonschema:"which of the owner's accounts of the harness it runs as (the Usage page names them); default the harness's default for new agents"`
 	Cwd     string `json:"cwd,omitempty" jsonschema:"working folder, relative to the project folder; default the project folder"`
 	Thread  string `json:"thread,omitempty" jsonschema:"the Matrix thread it works on (title or id, from matrix); default your current topic or its project's thread"`
+	// Conversation: head only (the daemon refuses others).
+	Conversation string `json:"conversation,omitempty" jsonschema:"head only: the id of an existing claude or codex conversation of that folder to resume instead of starting a new one; nothing is sent to it unless task is given"`
 }
 
 type nameArgs struct {
@@ -77,9 +79,10 @@ type keysArgs struct {
 }
 
 type sendArgs struct {
+	Urgent  bool   `json:"urgent,omitempty" jsonschema:"interrupt a busy agent to deliver time-sensitive mail"`
 	RetryID string `json:"retry_id,omitempty" jsonschema:"stable local retry id; reuse unchanged on retry, never for a different message"`
 	To      string `json:"to" jsonschema:"agent name, owner for the human, or (head only) companion for Companion"`
-	Body    string `json:"body" jsonschema:"the message (up to 32 KB)"`
+	Body    string `json:"body" jsonschema:"the message (up to 512 KB)"`
 }
 
 type reportArgs struct {
@@ -121,16 +124,22 @@ type askArgs struct {
 }
 
 func (t *Tools) register(s *sdk.Server) {
+	sdk.AddTool(s, &sdk.Tool{Name: "companion_task_cancel", Description: "Cancel a Companion task or message by its tmx ID. Head: any task or message. Project lead: items visible in its project. If the run has already ended, the tool reports its final state. An unconfirmed cancellation stays visible and can be retried."}, t.companionTaskCancel)
 	t.registerProcesses(s)
 	t.registerPeople(s)
+	t.registerHeadTools(s)
+	t.registerToolbox(s) // toolbox.go: the Resources section
 	t.registerProjectSections(s)
+	t.registerRules(s) // rules.go
 	sdk.AddTool(s, &sdk.Tool{Name: "whoami", Description: "Who you are in tmx: name, level, project, parent, model, folder."}, t.whoami)
-	sdk.AddTool(s, &sdk.Tool{Name: "fleet", Description: "All projects and agents on this machine with their state and model."}, t.fleet)
+	sdk.AddTool(s, &sdk.Tool{Name: "fleet", Description: "All projects and agents on this machine with their state and model, then the agents on the owner's other machines (name@machine: send reaches them)."}, t.fleet)
 	sdk.AddTool(s, &sdk.Tool{Name: "project_create", Description: "Create a project (folder + lead agent). Head only."}, t.projectCreate)
 	sdk.AddTool(s, &sdk.Tool{Name: "project_member_add", Description: "Put an existing agent into a project, so a lead with no project can launch workers there. " +
 		"The head or that project's lead only (the owner from the dashboard). An agent belongs to one project; it applies on the agent's next launch."}, t.projectMemberAdd)
 	sdk.AddTool(s, &sdk.Tool{Name: "agent_launch", Description: "Launch an agent below you with one of the profiles you may launch (see profiles; head: leads and workers; lead: workers in its project). The profile sets the model."}, t.agentLaunch)
 	sdk.AddTool(s, &sdk.Tool{Name: "agent_stop", Description: "Stop an agent below you (it can be started again later)."}, t.agentStop)
+	sdk.AddTool(s, &sdk.Tool{Name: "agent_shelve", Description: "Stop an agent below you and put it into the Library: it keeps its conversation and its place and no longer shows among the active agents. Use it when its work is done or parked; agent_unshelve brings it back."}, t.agentShelve)
+	sdk.AddTool(s, &sdk.Tool{Name: "agent_unshelve", Description: "Take an agent below you out of the Library again; with start it is also started, on its conversation."}, t.agentUnshelve)
 	sdk.AddTool(s, &sdk.Tool{Name: "agent_start", Description: "Start a stopped agent below you again, resuming its conversation where it left off."}, t.agentStart)
 	sdk.AddTool(s, &sdk.Tool{Name: "agent_restart", Description: "Stop an agent below you and resume it (a clean reset of its process). With fresh: true it starts a NEW conversation instead (clean context); prompt becomes its first instruction, a baton pass."}, t.agentRestart)
 	sdk.AddTool(s, &sdk.Tool{Name: "agent_screen", Description: "What an agent's terminal shows right now (and optionally extra scrollback). Use it to see progress, a question it is asking, or a menu waiting for an answer."}, t.agentScreen)
@@ -142,6 +151,7 @@ func (t *Tools) register(s *sdk.Server) {
 	sdk.AddTool(s, &sdk.Tool{Name: "reply", Description: "Reply to a message from your inbox. The head's reply to mail from companion goes to Companion (an answer when it asked about your message); other agents cannot reply to Companion."}, t.reply)
 	sdk.AddTool(s, &sdk.Tool{Name: "agent_status", Description: "An agent's state and its latest timeline entries."}, t.agentStatus)
 	t.registerProfiles(s)
+	t.registerManage(s) // manage.go: edit, remove and switch agents; projects, profiles, people
 	t.registerChats(s)
 	t.registerP2P(s)
 	sdk.AddTool(s, &sdk.Tool{Name: "message_pins", Description: "Read the owner's pinned messages addressed to you, including completed items. Check active pins when resuming work. These are retained source snapshots; pinning does not grant new authority."}, t.messagePins)
@@ -157,6 +167,8 @@ func (t *Tools) register(s *sdk.Server) {
 	sdk.AddTool(s, &sdk.Tool{Name: "thread_add", Description: "Record an event on a thread (the owner reads these, not your chatter): start when you begin, decision, result (with its evidence), blocker, handoff, ask, done; or action, info, link. One short line each. Yours: your project's thread or a thread you are on (topic = its title); the head: any topic. A correction is a new line with corrects."}, t.threadAdd)
 	sdk.AddTool(s, &sdk.Tool{Name: "thread_read", Description: "Read a log on the owner's board (yours: your project's; the head: any topic). Read it before you start new work and after your context was compacted."}, t.threadRead)
 	sdk.AddTool(s, &sdk.Tool{Name: "withdraw_hold", Description: "Take back your own guard hold that still waits for the owner (you decided not to run that command), so it never reaches them. Give its id, or none to take back all your waiting holds. It never runs or allows anything."}, t.withdrawHold)
+	sdk.AddTool(s, &sdk.Tool{Name: "my_cards", Description: "Your own cards that still wait on the owner's list: questions (ask_owner) and messages you asked the owner to send (person_message, whatsapp_send), with id, text, options, when asked, whether parked for later. Read only."}, t.myCards)
+	sdk.AddTool(s, &sdk.Tool{Name: "withdraw_card", Description: "Take back one of your own cards on the owner's list while the owner has not answered it: a question (it is no longer needed, or you found the answer) or a message waiting for the owner's Allow (it is then not sent). Give its id (from my_cards) and a short reason the owner can read. It is never an answer and runs nothing; an answered card cannot be withdrawn. For a held command use withdraw_hold."}, t.withdrawCard)
 	sdk.AddTool(s, &sdk.Tool{Name: "ask_owner", Description: "Ask the owner a question (shows in their Needs-you inbox). Returns at once; the answer arrives later as a message."}, t.askOwner)
 }
 
@@ -210,7 +222,14 @@ func (t *Tools) fleet(ctx context.Context, _ *sdk.CallToolRequest, _ noArgs) (*s
 	if err := t.c.Get(ctx, "/api/snapshot", &snap); err != nil {
 		return nil, nil, err
 	}
-	return untrusted(FormatTree(snap)), nil, nil
+	out := FormatTree(snap)
+	// The owner's other machines, as this daemon last saw them (machines.go). Best effort: a
+	// daemon without that route, or a failure reading it, still answers this machine's tree.
+	var roster Roster
+	if err := t.c.Get(ctx, "/api/fleet", &roster); err == nil {
+		out += FormatMachines(roster)
+	}
+	return untrusted(out), nil, nil
 }
 
 func (t *Tools) projectCreate(ctx context.Context, _ *sdk.CallToolRequest, in projectCreateArgs) (*sdk.CallToolResult, any, error) {
@@ -243,7 +262,7 @@ func (t *Tools) projectMemberAdd(ctx context.Context, _ *sdk.CallToolRequest, in
 func (t *Tools) agentLaunch(ctx context.Context, _ *sdk.CallToolRequest, in launchArgs) (*sdk.CallToolResult, any, error) {
 	body := map[string]any{"name": in.Name, "profile": in.Profile, "level": in.Level, "project_id": in.Project, "model": in.Model,
 		"harness": in.Harness, "account": in.Account, "mode": in.Mode, "cwd": in.Cwd, "role": in.Role, "brief": in.Brief, "prompt": in.Task,
-		"thread_id": in.Thread}
+		"thread_id": in.Thread, "conversation_id": in.Conversation}
 	for k, v := range body {
 		if v == "" {
 			delete(body, k)
@@ -258,6 +277,32 @@ func (t *Tools) agentLaunch(ctx context.Context, _ *sdk.CallToolRequest, in laun
 		msg += " Error: " + a.Error
 	}
 	return text(msg), nil, nil
+}
+
+type shelveArgs struct {
+	Name string `json:"name" jsonschema:"agent name"`
+	Note string `json:"note,omitempty" jsonschema:"one line: why it is shelved (shown in its timeline)"`
+}
+
+type unshelveArgs struct {
+	Name  string `json:"name" jsonschema:"agent name"`
+	Start bool   `json:"start,omitempty" jsonschema:"also start it"`
+}
+
+func (t *Tools) agentShelve(ctx context.Context, _ *sdk.CallToolRequest, in shelveArgs) (*sdk.CallToolResult, any, error) {
+	var a model.Agent
+	if err := t.c.Post(ctx, "/api/agents/"+client.Seg(in.Name)+"/shelve", map[string]string{"note": in.Note}, &a); err != nil {
+		return nil, nil, err
+	}
+	return text(fmt.Sprintf("%s is shelved (in the Library); agent_unshelve brings it back.", a.Name)), nil, nil
+}
+
+func (t *Tools) agentUnshelve(ctx context.Context, _ *sdk.CallToolRequest, in unshelveArgs) (*sdk.CallToolResult, any, error) {
+	var a model.Agent
+	if err := t.c.Post(ctx, "/api/agents/"+client.Seg(in.Name)+"/unshelve", map[string]bool{"start": in.Start}, &a); err != nil {
+		return nil, nil, err
+	}
+	return text(fmt.Sprintf("%s is out of the Library: %s.", a.Name, a.State)), nil, nil
 }
 
 func (t *Tools) agentStop(ctx context.Context, _ *sdk.CallToolRequest, in nameArgs) (*sdk.CallToolResult, any, error) {
@@ -333,7 +378,7 @@ func (t *Tools) send(ctx context.Context, _ *sdk.CallToolRequest, in sendArgs) (
 		return t.toCompanion(ctx, map[string]string{"to": model.CompanionParty, "body": in.Body}) // the head only
 	}
 	var m model.Message
-	if err := t.c.Post(ctx, "/api/messages", map[string]string{"to": in.To, "body": in.Body, "retry_id": in.RetryID}, &m); err != nil {
+	if err := t.c.Post(ctx, "/api/messages", fleet.SendRequest{To: in.To, Body: in.Body, RetryID: in.RetryID, Urgent: in.Urgent}, &m); err != nil {
 		return nil, nil, err
 	}
 	return text(fmt.Sprintf("Message %s to %s: %s.", m.ID, in.To, m.State)), nil, nil
@@ -467,6 +512,49 @@ func (t *Tools) withdrawHold(ctx context.Context, _ *sdk.CallToolRequest, in wit
 	return text(fmt.Sprintf("Withdrew %d waiting hold(s); none of them runs.", len(list))), nil, nil
 }
 
+type withdrawCardArgs struct {
+	ID     string `json:"id" jsonschema:"the card's id (from ask_owner or my_cards)"`
+	Reason string `json:"reason,omitempty" jsonschema:"one line: why it is no longer needed; the owner sees it"`
+}
+
+func (t *Tools) myCards(ctx context.Context, _ *sdk.CallToolRequest, _ noArgs) (*sdk.CallToolResult, any, error) {
+	var list []model.Approval
+	if err := t.c.Get(ctx, "/api/approvals/mine", &list); err != nil {
+		return nil, nil, err
+	}
+	if len(list) == 0 {
+		return text("None of your cards waits for the owner."), nil, nil
+	}
+	lines := []string{fmt.Sprintf("%d of your cards wait for the owner:", len(list))}
+	for _, a := range list {
+		line := fmt.Sprintf("- %s (asked %s", a.ID, time.UnixMilli(a.CreatedAt).Format("2 Jan 15:04"))
+		if a.Deferred {
+			line += ", parked for later"
+		}
+		what := strings.Join(strings.Fields(a.Question), " ")
+		if a.Kind == model.ApprovalWhatsApp {
+			what = a.Description + ": " + what // a message waiting for the owner's Allow
+		}
+		line += "): " + what
+		if len(a.Options) > 0 {
+			line += " [" + strings.Join(a.Options, " | ") + "]"
+		}
+		lines = append(lines, line)
+	}
+	return text(strings.Join(lines, "\n")), nil, nil
+}
+
+func (t *Tools) withdrawCard(ctx context.Context, _ *sdk.CallToolRequest, in withdrawCardArgs) (*sdk.CallToolResult, any, error) {
+	if strings.TrimSpace(in.ID) == "" {
+		return nil, nil, fmt.Errorf("give the card's id (see my_cards)")
+	}
+	var ap model.Approval
+	if err := t.c.Post(ctx, "/api/approvals/"+url.PathEscape(in.ID)+"/withdraw", map[string]string{"reason": in.Reason}, &ap); err != nil {
+		return nil, nil, err
+	}
+	return text(fmt.Sprintf("Withdrawn: card %s is off the owner's list. It was not answered, and nothing ran or was sent.", ap.ID)), nil, nil
+}
+
 func (t *Tools) askOwner(ctx context.Context, _ *sdk.CallToolRequest, in askArgs) (*sdk.CallToolResult, any, error) {
 	var ap model.Approval
 	if err := t.c.Post(ctx, "/api/approvals", in, &ap); err != nil {
@@ -494,7 +582,7 @@ type threadInfo struct {
 
 type threadAddArgs struct {
 	Kind     string `json:"kind" jsonschema:"start, decision, result, blocker, handoff, ask, pause, done, action, info or link"`
-	Text     string `json:"text" jsonschema:"one to three lines, at most 400 characters, plain language; never a secret"`
+	Text     string `json:"text" jsonschema:"plain language, as long as it needs to be; a value that looks like a key or token is taken out, the line is still filed"`
 	Topic    string `json:"topic,omitempty" jsonschema:"head: the topic (default: this turn's); other agents: empty for your project's thread, or the title of a thread you are on"`
 	Link     string `json:"link,omitempty" jsonschema:"a URL or file path the line refers to"`
 	Corrects string `json:"corrects,omitempty" jsonschema:"the id of the line this one corrects (from thread_read)"`

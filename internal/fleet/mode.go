@@ -15,10 +15,13 @@ import (
 // mail rules are rebuilt exactly as at any start (specLocked).
 //
 // A switch never cuts a turn short: asked for during a turn (or while an approval is open), it
-// waits (Agent.PendingMode) until the agent has been idle for switchSettle, and mail waits with
-// it. A switch lives in memory only: the store keeps the launch mode (Agent.HomeMode while
-// switched), so a daemon restart brings the agent back the way it was launched. A switched
-// process that ends by itself (the owner typed /exit in the screen, or it crashed) goes home too.
+// waits (Agent.PendingMode) until the agent has been idle for switchSettle. Mail continues into
+// the live process while the switch is pending. The current mode is persisted after the switch,
+// so an agent without a live host reopens in that mode. A switched agent whose process outlived the daemon in its session host stays
+// where it runs: the next daemon finds the host in the other mode and takes it over as that
+// (hosting.go, runner.ErrHostMode), never ending a possibly working process to bring it home.
+// A switched process that ends by itself (the owner typed /exit in the screen, or it crashed)
+// goes home.
 
 // switchSettle: how long an agent must have been idle before its process is switched. Claude
 // starts a message it queued during a turn right after that turn's result; the wait keeps a
@@ -37,14 +40,12 @@ type ModeChange struct {
 	Note    string      `json:"note"`
 }
 
-// SetMode switches an agent between chat mode and its harness's own screen (owner only).
+// SetMode switches an agent between chat mode and its harness's own screen: the owner, the head,
+// or a lead for an agent of its own project (manage.go).
 // A stopped agent only changes the mode it starts in; a running one switches at once when it
 // is idle, else when its current turn ends. Asking for the mode it is in cancels a pending
 // switch.
 func (f *Fleet) SetMode(c Caller, idOrName string, req ModeRequest) (ModeChange, error) {
-	if !c.Owner {
-		return ModeChange{}, errf(KindForbidden, "only the owner switches an agent between chat and its own screen")
-	}
 	to := req.Mode
 	if to != model.ModeChat && to != model.ModeTerminal {
 		return ModeChange{}, errf(KindInvalid, "mode must be chat or terminal")
@@ -53,6 +54,9 @@ func (f *Fleet) SetMode(c Caller, idOrName string, req ModeRequest) (ModeChange,
 	defer f.mu.Unlock()
 	r, err := f.resolveLocked(idOrName)
 	if err != nil {
+		return ModeChange{}, err
+	}
+	if err := f.manageAgentLocked(c, r, "switch an agent between chat and its own screen"); err != nil {
 		return ModeChange{}, err
 	}
 	if _, _, err := f.harnessModeLocked(r.a.Harness, to); err != nil {
@@ -280,10 +284,9 @@ func (f *Fleet) afterSwitchExit(r *agentRec) {
 	})
 }
 
-// mailHeldLocked: mail waits while a switch is pending (a new turn would put it off) or the
-// process is being stopped; it is delivered once the agent runs in its new mode.
+// mailHeldLocked protects an actual process replacement, not a requested future switch.
 func mailHeldLocked(r *agentRec) bool {
-	return r.a.PendingMode != "" || r.stopping || r.switching
+	return r.stopping || r.switching
 }
 
 // typedInScreen: a message someone typed into the agent's own screen (read from its transcript).

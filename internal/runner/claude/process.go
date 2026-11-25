@@ -18,6 +18,7 @@ import (
 	"github.com/blackcode-ch/tmx-go/internal/runner"
 	"github.com/blackcode-ch/tmx-go/internal/runner/host"
 	"github.com/blackcode-ch/tmx-go/internal/sysinfo"
+	"github.com/blackcode-ch/tmx-go/internal/winshim"
 )
 
 // EventBuffer is the capacity of Process.Events. The consumer must drain the channel
@@ -27,6 +28,8 @@ const EventBuffer = 1024
 const (
 	stderrTail = 8 << 10
 	killGrace  = 3 * time.Second
+	// killedGrace: how long Stop still waits for the end of a process it has killed.
+	killedGrace = 10 * time.Second
 )
 
 type chatRunner struct{ log *slog.Logger }
@@ -54,6 +57,9 @@ func (r chatRunner) Start(ctx context.Context, spec runner.Spec) (runner.Process
 	if spec.LowPriority {
 		argv0, args = sysinfo.LowPriorityCommand(path, args) // macOS: low disk I/O policy
 	}
+	// A .cmd shim would go through cmd.exe, which cuts the arguments at the first line break
+	// (the agent's instructions): start what the shim starts (winshim).
+	argv0, args = winshim.Apply(argv0, args)
 	cmd := hiddenexec.Command(argv0, args...)
 	cmd.Dir = spec.Cwd
 	cmd.Env = MergeEnv(BaseEnv(), spec.Env...)
@@ -145,6 +151,13 @@ func (r chatRunner) Reattach(ctx context.Context, spec runner.Spec) (runner.Proc
 	hc, err := host.Dial(spec.HostDir, from)
 	if err != nil {
 		return nil, "", err
+	}
+	if !hc.Piped() {
+		// The host runs Claude Code's own screen (the agent was switched there and the switch is
+		// not stored): stream-json written into a terminal is never answered. Leave the host
+		// and its state as they are for the terminal runner.
+		_ = hc.Close()
+		return nil, "", runner.ErrHostMode
 	}
 	host.ClearState(spec.HostDir) // taken over: a crash of this daemon must not replay it again
 	sysinfo.RegisterHosted(hc.PID(), hc.HostPID(), hc.HostStart(), false)
@@ -348,8 +361,14 @@ func (p *process) Stop(ctx context.Context) error {
 	case <-time.After(killGrace):
 	}
 	p.c.Kill()
-	<-p.done
-	return nil
+	// Never wait without an end: a process that survives the kill (or whose host does not
+	// report its end) must not hang the stop, and with it the API call and the caller.
+	select {
+	case <-p.done:
+		return nil
+	case <-time.After(killedGrace):
+		return errors.New("the process did not end after it was killed")
+	}
 }
 
 func (p *process) emitAll(evs []runner.Event) {

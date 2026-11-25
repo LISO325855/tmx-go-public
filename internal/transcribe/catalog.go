@@ -77,6 +77,10 @@ const (
 // DefaultModel is the model jobs use unless config voice.model names another.
 const DefaultModel = "base-q5_1"
 
+// DefaultRemoteModel is the model field Fae requests use unless config voice.remote_model
+// names another.
+const DefaultRemoteModel = "large-v3-turbo"
+
 // Models are the speech models, smallest first. All are multilingual.
 var Models = []Model{
 	{Name: "base-q5_1", File: "ggml-base-q5_1.bin", Label: "Base", Size: 59707625,

@@ -4,6 +4,7 @@ import (
 	"io"
 
 	pty "github.com/aymanbagabas/go-pty"
+	"github.com/blackcode-ch/tmx-go/internal/winshim"
 )
 
 // conduit is how a process reaches its program: a pty of the daemon's own (localConduit) or a
@@ -36,6 +37,9 @@ func startLocal(path string, args []string, dir string, env []string, cols, rows
 		pt.Close()
 		return nil, err
 	}
+	// A .cmd shim would go through cmd.exe, which cuts the arguments at the first line break
+	// (the agent's instructions): start what the shim starts (winshim).
+	path, args = winshim.Apply(path, args)
 	cmd := pt.Command(path, args...)
 	cmd.Dir = dir
 	prepareCommand(cmd)

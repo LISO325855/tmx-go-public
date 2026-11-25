@@ -1,6 +1,8 @@
 // A tiny hash router: #/agents/abc. Hash routing works the same when the daemon serves the UI
 // at / and inside the Wails window, and needs no server-side fallback for deep links.
-import { useSyncExternalStore } from "react";
+import { useEffect, useSyncExternalStore } from "react";
+import { useClassic } from "@/hooks/use-classic";
+import { useChats } from "./chats";
 
 export type Route =
   | { name: "overview" }
@@ -10,16 +12,23 @@ export type Route =
   | { name: "profile"; slug: string }
   | { name: "agent"; id: string; tab?: string }
   | { name: "project"; id: string }
+  | { name: "agents" }
+  | { name: "projects" }
+  | { name: "shells" }
   | { name: "chats" }
   | { name: "chat"; id: string; view?: string }
   | { name: "recordings"; id?: string }
   | { name: "whatsapp"; jid?: string }
   | { name: "companion" }
+  | { name: "resources"; id?: string }
   | { name: "usage" }
   | { name: "features" }
   | { name: "people" }
   | { name: "clients" }
   | { name: "promises" }
+  | { name: "machine"; host: string }
+  | { name: "watchdog"; machine?: string }
+  | { name: "team" }
   | { name: "notfound"; path: string };
 
 function currentPath(): string {
@@ -38,6 +47,9 @@ export function parse(path: string): Route {
   if (parts[0] === "matrix" && parts.length === 1) return { name: "matrix" };
   if (parts[0] === "settings" && parts.length === 1) return { name: "settings" };
   if (parts[0] === "settings" && parts[1] === "profiles" && parts[2] && parts.length === 3) return { name: "profile", slug: parts[2] };
+  if (parts[0] === "agents" && parts.length === 1) return { name: "agents" };
+  if (parts[0] === "shells" && parts.length === 1) return { name: "shells" };
+  if (parts[0] === "projects" && parts.length === 1) return { name: "projects" };
   if (parts[0] === "agents" && parts[1]) return { name: "agent", id: parts[1], tab: parts[2] };
   if (parts[0] === "projects" && parts[1]) return { name: "project", id: parts[1] };
   if (parts[0] === "chats" && parts.length === 1) return { name: "chats" };
@@ -45,11 +57,15 @@ export function parse(path: string): Route {
   if (parts[0] === "recordings" && parts.length <= 2) return { name: "recordings", id: parts[1] };
   if (parts[0] === "whatsapp" && parts.length <= 2) return { name: "whatsapp", jid: parts[1] };
   if (parts[0] === "companion" && parts.length === 1) return { name: "companion" };
+  if (parts[0] === "resources" && parts.length <= 2) return { name: "resources", id: parts[1] };
   if (parts[0] === "usage" && parts.length === 1) return { name: "usage" };
   if (parts[0] === "features" && parts.length === 1) return { name: "features" };
   if (parts[0] === "people" && parts.length === 1) return { name: "people" };
   if (parts[0] === "clients" && parts.length === 1) return { name: "clients" };
   if (parts[0] === "promises" && parts.length === 1) return { name: "promises" };
+  if (parts[0] === "machines" && parts[1] && parts.length === 2) return { name: "machine", host: parts[1] };
+  if (parts[0] === "watchdog" && parts.length <= 2) return { name: "watchdog", machine: parts[1] };
+  if (parts[0] === "team" && parts.length === 1) return { name: "team" };
   return { name: "notfound", path: p };
 }
 
@@ -66,7 +82,14 @@ export function usePath(): string {
 }
 
 export function useRoute(): Route {
-  return parse(usePath());
+  const route = parse(usePath());
+  const classic = useClassic();
+  const group = useChats((s) => route.name === "chat" && s.chats[route.id]?.kind === "group");
+  const hidden = classic && (route.name === "features" || (route.name === "chat" && (route.view === "board" || group)));
+  useEffect(() => {
+    if (hidden) navigate(paths.overview(), { replace: true });
+  }, [hidden]);
+  return hidden ? { name: "overview" } : route;
 }
 
 export function navigate(path: string, opts: { replace?: boolean } = {}) {
@@ -90,6 +113,10 @@ export const paths = {
   profile: (slug: string) => `/settings/profiles/${encodeURIComponent(slug)}`,
   agent: (id: string, tab?: string) => `/agents/${encodeURIComponent(id)}${tab ? "/" + tab : ""}`,
   project: (id: string) => `/projects/${encodeURIComponent(id)}`,
+  /** the flat agent list and the project tiles behind the phone's bottom bar (lib/phone.ts) */
+  agents: () => "/agents",
+  projects: () => "/projects",
+  shells: () => "/shells",
   chats: () => "/chats",
   chat: (id: string) => `/chats/${encodeURIComponent(id)}`,
   /** a chat's board (DESIGN.md "Chat boards") */
@@ -102,6 +129,8 @@ export const paths = {
   /** the 1:1 conversation with Companion (DESIGN.md "Companion") */
   companion: () => "/companion",
   /** AI accounts and how much of their quota is used */
+  /** everything the agents can reach (docs/RESOURCES.md); an id opens that line */
+  resources: (id?: string) => `/resources${id ? "/" + encodeURIComponent(id) : ""}`,
   usage: () => "/usage",
   /** every ordered feature with its status and evidence */
   features: () => "/features",
@@ -109,6 +138,12 @@ export const paths = {
   people: () => "/people",
   clients: () => "/clients",
   promises: () => "/promises",
+  /** one of the owner's other machines: its agents, from this window (pages/machine.tsx) */
+  machine: (host: string) => `/machines/${encodeURIComponent(host)}`,
+  /** a machine's resource history and limits (pages/watchdog.tsx); no name = this machine */
+  watchdog: (machine?: string) => (machine ? `/watchdog/${encodeURIComponent(machine)}` : "/watchdog"),
+  /** team status: the computers of the people in your groups who share theirs (pages/team.tsx) */
+  team: () => "/team",
 };
 
 export function href(path: string): string {

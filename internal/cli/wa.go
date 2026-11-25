@@ -26,12 +26,14 @@ import (
 	"github.com/blackcode-ch/tmx-go/internal/mcp"
 	"github.com/blackcode-ch/tmx-go/internal/model"
 	"github.com/blackcode-ch/tmx-go/internal/store"
+	"github.com/blackcode-ch/tmx-go/internal/transcribe"
 	"github.com/blackcode-ch/tmx-go/internal/whatsapp"
 )
 
 // tmx wa: the owner's WhatsApp, linked to the daemon (DESIGN.md "WhatsApp").
 const waUsage = `usage: tmx wa status | link [--phone +41…] | unlink --yes | chats [--limit N] [SEARCH...]
-              | read CHAT [--limit N] | send CHAT [-f FILE]... TEXT...
+              | read CHAT [--limit N] | download CHAT MESSAGE_ID | send CHAT [-f FILE]... TEXT...
+  (download retains media in the daemon's whatsapp/media directory)
   (CHAT: a name, a phone number with country code, or the JID that tmx wa chats shows)`
 
 // WaRisk is the warning shown before linking.
@@ -125,6 +127,30 @@ func cmdWa(e *env, args []string) error {
 			for _, m := range msgs {
 				fmt.Fprint(e.out, mcp.FormatWaMessage(m))
 			}
+			return nil
+		})
+	case "download":
+		if len(args) < 3 {
+			return usageErr(waUsage)
+		}
+		return withOwner(e, func(c *client.Client, cx context.Context) error {
+			ch, err := waResolve(c, cx, strings.Join(args[1:len(args)-1], " "))
+			if err != nil {
+				return err
+			}
+			var out struct {
+				Path string `json:"path"`
+				Size int64  `json:"size"`
+			}
+			// Media retrieval may wait up to three minutes for WhatsApp.
+			hc := *c.HTTP
+			hc.Timeout = 4 * time.Minute
+			cc := *c
+			cc.HTTP = &hc
+			if err := cc.Post(cx, "/api/whatsapp/media/"+client.Seg(ch.JID)+"/"+client.Seg(args[len(args)-1])+"/download", nil, &out); err != nil {
+				return err
+			}
+			fmt.Fprintf(e.out, "Stored on daemon: %s (%d bytes)\n", out.Path, out.Size)
 			return nil
 		})
 	case "send":
@@ -342,8 +368,18 @@ func cut(s string, n int) string {
 
 // newWhatsApp is the daemon's WhatsApp service: whatsmeow with its keys in
 // secrets/whatsapp.db, settings in config.json "whatsapp" (read at every use).
-func newWhatsApp(paths config.Paths, st *store.Store, f *fleet.Fleet, log *slog.Logger) *whatsapp.Service {
+func newWhatsApp(paths config.Paths, st *store.Store, f *fleet.Fleet, log *slog.Logger, voice *transcribe.Service) *whatsapp.Service {
 	return whatsapp.New(whatsapp.Options{Store: st, Client: whatsapp.NewMeow(paths.WhatsAppDB(), log), MediaDir: paths.WhatsAppMediaDir(),
+		AutoMedia: true,
+		Transcribe: func(ctx context.Context, path string) (string, error) {
+			file, err := os.Open(path)
+			if err != nil {
+				return "", err
+			}
+			defer file.Close()
+			result, err := voice.TranscribeLocalFile(ctx, file, "")
+			return result.Text, err
+		},
 		Publish: f.Publish, Fleet: f, Logger: log,
 		Config: func() *config.WhatsAppConfig {
 			if c, err := config.Load(paths); err == nil {

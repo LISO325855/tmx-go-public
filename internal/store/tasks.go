@@ -44,7 +44,7 @@ func (s *Store) AcceptTask(t model.TaskRecord, m model.Message) error {
 		if _, err := tx.Exec(`INSERT INTO task_receipts(id,agent_id,state,data) VALUES(?,?,?,?)`, t.Receipt.ID, t.AgentID, t.Receipt.State, b); err != nil {
 			return err
 		}
-		_, err := tx.Exec(`INSERT INTO messages (`+messageCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`, m.ID, m.From, m.To, m.Body, m.State, nullable(m.ReplyTo), m.CreatedAt, m.DeliveredAt, m.ThreadID, m.RetryID, m.RetryHash, m.Receipt, m.ReceiptAt)
+		_, err := tx.Exec(`INSERT INTO messages (`+messageCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, m.ID, m.From, m.To, m.Body, m.State, nullable(m.ReplyTo), m.CreatedAt, m.DeliveredAt, m.ThreadID, m.RetryID, m.RetryHash, m.Receipt, m.ReceiptAt, m.Urgent)
 		return err
 	})
 }

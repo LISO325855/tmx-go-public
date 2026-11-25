@@ -3,12 +3,16 @@ package codexguard
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
+	"slices"
+
+	"github.com/blackcode-ch/tmx-go/internal/runner"
 )
 
 // ValidateEffective checks app-server config/read before any thread/model turn.
-// Only tmx's own MCP command is accepted. This validates merged effective values,
+// Only tmx and the exact profile-selected MCP commands are accepted. This validates merged effective values,
 // not just the generated file, because Codex also has project/system layers.
-func ValidateEffective(result json.RawMessage, tmx string) error {
+func ValidateEffective(result json.RawMessage, tmx string, managed ...map[string]runner.MCPServer) error {
 	var response struct {
 		Config map[string]json.RawMessage `json:"config"`
 	}
@@ -52,15 +56,36 @@ func ValidateEffective(result json.RawMessage, tmx string) error {
 		Args    []string          `json:"args"`
 		URL     string            `json:"url"`
 		Env     map[string]string `json:"env"`
+		EnvVars []string          `json:"env_vars"`
 	}
 	if len(c["mcp_servers"]) > 0 && json.Unmarshal(c["mcp_servers"], &servers) != nil {
 		return fmt.Errorf("invalid Codex MCP configuration")
+	}
+	expected := map[string]runner.MCPServer{}
+	if len(managed) > 0 {
+		for name, server := range managed[0] {
+			expected[name] = server
+		}
+	}
+	if tmx != "" {
+		own := expected["tmxg"]
+		own.Command, own.Args, own.Env = tmx, []string{"mcp"}, nil
+		expected["tmxg"] = own
+	}
+	for name, want := range expected {
+		server, ok := servers[name]
+		if !ok || (server.Enabled != nil && !*server.Enabled) {
+			return fmt.Errorf("managed Codex MCP server %s is missing or disabled", name)
+		}
+		if server.Command != want.Command || server.URL != "" || !slices.Equal(server.Args, want.Args) || !maps.Equal(server.Env, want.Env) || !slices.Equal(server.EnvVars, want.EnvKeys) {
+			return fmt.Errorf("managed Codex MCP server %s differs from its launch configuration", name)
+		}
 	}
 	for name, server := range servers {
 		if server.Enabled != nil && !*server.Enabled {
 			continue
 		}
-		if name != "tmxg" || server.Command != tmx || server.URL != "" || len(server.Env) != 0 || len(server.Args) != 1 || server.Args[0] != "mcp" {
+		if _, ok := expected[name]; !ok {
 			return fmt.Errorf("unmanaged Codex MCP server is not allowed")
 		}
 	}

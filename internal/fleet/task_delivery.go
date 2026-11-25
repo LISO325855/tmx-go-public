@@ -71,7 +71,7 @@ func (f *Fleet) taskSubmissionLocked(to string, ids []string, receipt string) {
 				t.Receipt.State = "running"
 				t.Receipt.UpdatedAt = max(model.TaskNow(), t.Receipt.UpdatedAt)
 			}
-		case "unconfirmed":
+		case "unconfirmed", "stalled":
 			t.Receipt.Finish("uncertain", "Submission could not be proved; this input will not be replayed.", "")
 		default:
 			continue

@@ -72,8 +72,8 @@ export const chatApi = {
   messages: (id: string, before = 0, limit = 100) =>
     t().request<ChatPage>("GET", `/api/chats/${enc(id)}/messages?limit=${limit}${before ? `&before=${before}` : ""}`),
   /** topic: a board topic's id ("" = General) */
-  send: (id: string, body: string, files?: string[], topic?: string) =>
-    t().request<ChatMessage>("POST", `/api/chats/${enc(id)}/messages`, { body, ...(files?.length ? { files } : {}), ...(topic ? { topic } : {}) }),
+  send: (id: string, body: string, files?: string[], topic?: string, signal?: AbortSignal) =>
+    t().request<ChatMessage>("POST", `/api/chats/${enc(id)}/messages`, { body, ...(files?.length ? { files } : {}), ...(topic ? { topic } : {}) }, signal),
   /** Uploads a file for the next message (data = base64). */
   uploadFile: (id: string, f: { name: string; type: string; data: string }) =>
     t().request<ChatFile>("POST", `/api/chats/${enc(id)}/files`, f),
@@ -88,7 +88,7 @@ export const chatApi = {
 // loading
 
 function offFrom(e: unknown): boolean {
-  if (e instanceof ApiError && e.status === 503) {
+  if (e instanceof ApiError && e.status === 503 && e.message.startsWith("peer-to-peer is off")) {
     set({ enabled: false, offMessage: e.message });
     return true;
   }
@@ -109,7 +109,7 @@ export async function loadChats() {
     // Catch up open chats (messages that arrived while the stream was down).
     for (const id of Object.keys(get().messages)) if (byId[id]) void loadMessages(id);
   } catch (e) {
-    offFrom(e);
+    if (!offFrom(e)) set({ enabled: null, offMessage: "" });
   }
 }
 
@@ -163,6 +163,7 @@ function merge(a: ChatMessage[], b: ChatMessage[]): ChatMessage[] {
 function handle(ev: BusEvent) {
   switch (ev.type) {
     case "snapshot":
+      if (useStore.getState().conn !== "open") set({ enabled: null, offMessage: "" });
       void loadChats();
       break;
     case "chat.message": {

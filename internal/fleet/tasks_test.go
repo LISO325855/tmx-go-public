@@ -104,7 +104,7 @@ func TestTaskReplayAndObservedTurn(t *testing.T) {
 	f.mu.Unlock()
 }
 
-func TestTaskAuthorityAndAmbiguousBatch(t *testing.T) {
+func TestTaskAuthorityAndSeparateOwnerTurns(t *testing.T) {
 	e := newUnguardedEnv(t)
 	f := e.started()
 	a := taskTarget(t, f)
@@ -140,13 +140,13 @@ func TestTaskAuthorityAndAmbiguousBatch(t *testing.T) {
 	f.agents[a.ID].a.State = model.StateIdle
 	f.mu.Unlock()
 	f.tryDeliver(a.ID)
-	for _, id := range []string{req.ID, second.ID} {
+	for id, state := range map[string]string{req.ID: "running", second.ID: "queued"} {
 		got, err := f.GetTask(OwnerCaller, id)
-		if err != nil || got.Task.State != "uncertain" {
+		if err != nil || got.Task.State != state {
 			t.Fatal(got, err)
 		}
 	}
 	if len(e.chat.Last(a.ID).Sent()) != 1 {
-		t.Fatal("batch effect count")
+		t.Fatal("one owner turn should be delivered")
 	}
 }

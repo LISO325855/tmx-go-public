@@ -34,6 +34,11 @@ func ValidateCodexLaunch(spec runner.Spec) error {
 	if err := validateCodexSpec(spec, runner.Elevated()); err != nil {
 		return err
 	}
+	if sandbox, _ := CodexPolicy(spec); sandbox == "workspace-write" || sandbox == "read-only" {
+		if err := checkCodexSandbox(); err != nil {
+			return err
+		}
+	}
 	if spec.CodexFullAccess && spec.PermissionMode != "plan" {
 		slog.Warn("Codex full access explicitly enabled for agent", "agent", spec.AgentID, "name", spec.Name, "cwd", spec.Cwd)
 	}

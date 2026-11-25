@@ -37,6 +37,8 @@ export interface Recording {
   duration_ms: number;
   /** while recording: when the current stretch began (elapsed = duration_ms + now - resumed_at) */
   resumed_at?: number;
+  /** while live: how much recorded time has reached the computer ("saved so far") */
+  saved_ms?: number;
   error?: string;
   started_at: number;
   ended_at?: number;

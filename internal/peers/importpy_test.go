@@ -31,6 +31,39 @@ func prodConfig() config.Config {
 		{Name: "hosta", URL: "https://hosta.example.ts.net"}, {Name: "hostc", URL: "https://hostc.example.ts.net"}}}
 }
 
+func TestImportCurrentDoesNotRestoreRemovedPeer(t *testing.T) {
+	p := config.Paths{Home: t.TempDir()}
+	cfg, err := config.Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Profile, cfg.Machine, cfg.Peers = config.ProfileProduction, "hostb", prodConfig().Peers
+	if err := config.Save(p, cfg); err != nil {
+		t.Fatal(err)
+	}
+	old := NewPairToken()
+	py := pythonState(t, `{"hosta":{"token":"`+old+`","role":"full"}}`, `{}`)
+	edit := MutationMutex(p.PeersFile())
+	edit.Lock()
+	entered, done := make(chan struct{}), make(chan error, 1)
+	go func() { close(entered); _, err := ImportPythonCurrent(p, py); done <- err }()
+	<-entered
+	// An import waiting behind removal must reload config, not use the former list.
+	cfg.Peers = nil
+	err = config.Save(p, cfg)
+	edit.Unlock()
+	result := <-done
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result == nil {
+		t.Fatal("import used a stale peer list")
+	}
+	if NewTokens(p.PeersFile()).For("hosta") != "" {
+		t.Fatal("import restored a removed credential")
+	}
+}
+
 func statuses(rows []Imported) map[string]string {
 	m := map[string]string{}
 	for _, r := range rows {

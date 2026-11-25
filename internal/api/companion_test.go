@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -251,12 +252,94 @@ func TestOwnerHandsOverNeedsYouItem(t *testing.T) {
 	}
 }
 
+func TestCompanionTaskApprovalByEffectAndOwnerOrder(t *testing.T) {
+	d := apitest.New(t)
+	owner := tc.New(d.URL, d.OwnerToken)
+	f := connect(t, d)
+	head := tc.New(d.URL, d.AgentToken(t, "head"))
+	enableCompanion(t, owner, "head")
+	create := func(spec model.CompanionSpec, orderID string) model.CompanionTask {
+		t.Helper()
+		var task model.CompanionTask
+		req := companion.PreviewRequest{Spec: spec, OwnerOrderID: orderID}
+		if code, _ := call(t, head, "POST", "/api/companion/tasks", req, &task); code != 0 {
+			t.Fatalf("hand-off: %d", code)
+		}
+		return task
+	}
+	order := func(body string) string {
+		t.Helper()
+		m, err := d.Fleet.SendOwner("head", body, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return m.ID
+	}
+	complete := func(task model.CompanionTask) {
+		t.Helper()
+		task = waitTask(t, owner, task.ID, model.CompanionWorking)
+		f.Complete(task.RemoteID, "Done")
+		waitTask(t, owner, task.ID, model.CompanionCompleted)
+	}
+	for _, tc := range []struct{ goal, effects string }{
+		{"Self-test: reply with OK", model.EffectsNone},
+		{"Sign in to the test account", model.EffectsAccount},
+	} {
+		task := create(model.CompanionSpec{Goal: tc.goal}, "")
+		if task.Effects != tc.effects || task.State != model.CompanionQueued || task.ApprovalID != "" {
+			t.Fatalf("immediate task: %+v", task)
+		}
+		complete(task)
+	}
+	outward := "Reply to the client with the approved delivery date"
+	money := "Pay invoice 123 for 20 CHF"
+	for _, goal := range []string{outward, money} {
+		id := order(goal)
+		task := create(model.CompanionSpec{Goal: goal}, id)
+		if task.State != model.CompanionQueued || task.ApprovalID != "" || task.OwnerOrderID != id ||
+			!strings.Contains(task.Text, "Owner's order (verbatim):\n"+goal+"\n") {
+			t.Fatalf("ordered task: %+v", task)
+		}
+		if retry := create(model.CompanionSpec{Goal: goal}, id); retry.ID != task.ID {
+			t.Fatalf("order replay created a second task: %+v", retry)
+		}
+		complete(task)
+	}
+	before := f.SentCount()
+	question := "Should we pay invoice 123 for 20 CHF?"
+	worker := mkWorker(t, d)
+	workerMail, err := d.Fleet.SendMessage(fleet.AgentCaller(worker), fleet.SendRequest{To: "head", Body: money})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		spec model.CompanionSpec
+		id   string
+	}{
+		{model.CompanionSpec{Goal: money}, order(outward)},
+		{model.CompanionSpec{Goal: money, Context: "Owner said: " + money}, "invented"},
+		{model.CompanionSpec{Goal: money}, workerMail.ID},
+		{model.CompanionSpec{Goal: money, Steps: []string{"Pay invoice 456 instead"}}, order(money)},
+		{model.CompanionSpec{Goal: question}, order(question)},
+		{model.CompanionSpec{Goal: money}, ""},
+		{model.CompanionSpec{Goal: outward}, ""},
+	} {
+		task := create(tc.spec, tc.id)
+		if task.State != model.CompanionAwaitingApproval || task.ApprovalID == "" || task.OwnerOrderID != "" {
+			t.Fatalf("unverified task: %+v", task)
+		}
+	}
+	if got := f.SentCount(); got != before {
+		t.Fatalf("unapproved task reached Companion: %d sends, previously %d", got, before)
+	}
+}
+
 func TestAgentHandOffNeedsProfileAndApproval(t *testing.T) {
 	d := apitest.New(t)
 	owner := tc.New(d.URL, d.OwnerToken)
 	f := connect(t, d)
 	head := tc.New(d.URL, d.AgentToken(t, "head"))
-	spec := map[string]any{"spec": model.CompanionSpec{Goal: "Look up tomorrow's weather in Zurich"}}
+	spec := map[string]any{"spec": model.CompanionSpec{Goal: "Send tomorrow's weather in Zurich to the client"}}
 	if code, _ := call(t, head, "POST", "/api/companion/tasks", spec, nil); code != http.StatusForbidden {
 		t.Fatalf("hand-off with the tool off: %d", code)
 	}
@@ -328,8 +411,10 @@ func TestAgentHandOffNeedsProfileAndApproval(t *testing.T) {
 	if code, _ := call(t, other, "GET", "/api/companion/tasks/"+task.ID, nil, nil); code != http.StatusNotFound {
 		t.Fatalf("someone else's task: %d", code)
 	}
-	if code, _ := call(t, other, "GET", "/api/companion/tasks", nil, nil); code != http.StatusForbidden {
-		t.Fatalf("agent listing tasks: %d", code)
+	// The list shows an agent what it may see (17 Nov): a worker only its own tasks, here none.
+	var seen []model.CompanionTask
+	if code, _ := call(t, other, "GET", "/api/companion/tasks", nil, &seen); code != 0 || len(seen) != 0 {
+		t.Fatalf("a worker listing tasks: %d %+v", code, seen)
 	}
 }
 
@@ -377,12 +462,12 @@ func TestCompanionGate(t *testing.T) {
 	f.Complete(task.RemoteID, "paid")
 	waitTask(t, owner, task.ID, model.CompanionCompleted)
 
-	// An agent's hand-off touching accounts: allowing needs a proof; denying never does.
+	// An agent's outward hand-off: allowing needs a proof; denying never does.
 	head := tc.New(d.URL, d.AgentToken(t, "head"))
-	if code, _ := call(t, head, "POST", "/api/companion/tasks", map[string]any{"spec": model.CompanionSpec{Goal: "Reset the password of the router"}}, &task); code != 0 {
+	if code, _ := call(t, head, "POST", "/api/companion/tasks", map[string]any{"spec": model.CompanionSpec{Goal: "Send the forecast to the client"}}, &task); code != 0 {
 		t.Fatal(code)
 	}
-	if task.Effects != "account" {
+	if task.Effects != model.EffectsOutward {
 		t.Fatalf("effects: %s", task.Effects)
 	}
 	code, conf = call(t, owner, "POST", "/api/approvals/"+task.ApprovalID, map[string]string{"decision": "allow"}, nil)
@@ -393,12 +478,18 @@ func TestCompanionGate(t *testing.T) {
 		t.Fatalf("allow with proof: %d", code)
 	}
 	waitTask(t, owner, task.ID, model.CompanionWorking)
-	// A harmless one passes without a prompt.
-	if code, _ := call(t, head, "POST", "/api/companion/tasks", map[string]any{"spec": model.CompanionSpec{Goal: "Read the weather"}}, &task); code != 0 {
+	if code, _ := call(t, head, "POST", "/api/companion/tasks", map[string]any{"spec": model.CompanionSpec{Goal: "Send the forecast to a different client"}}, &task); code != 0 {
 		t.Fatal(code)
 	}
 	if code, _ := call(t, owner, "POST", "/api/approvals/"+task.ApprovalID, map[string]string{"decision": "deny"}, nil); code != 0 {
 		t.Fatalf("deny with the gate on: %d", code)
+	}
+
+	task = model.CompanionTask{}
+	body = map[string]any{"spec": model.CompanionSpec{Goal: "Sign in to the test account"}}
+	if code, _ := call(t, owner, "POST", "/api/companion/tasks", body, &task); code != 0 ||
+		task.Effects != model.EffectsAccount || task.State != model.CompanionQueued || task.ApprovalID != "" {
+		t.Fatalf("account task with the gate on: %d %+v", code, task)
 	}
 }
 
@@ -452,9 +543,11 @@ func TestCompanionRefusalBusyAndCancel(t *testing.T) {
 	waitTask(t, owner, third.ID, model.CompanionWorking)
 
 	// Companion gone: a queued task waits (nothing sent), reporting why.
+	if _, err := d.Companion.Cancel(third.ID, ""); err != nil {
+		t.Fatal(err)
+	}
 	f.Close()
 	var fourth model.CompanionTask
-	_, _ = d.Companion.Cancel(third.ID, "")
 	if code, _ := call(t, owner, "POST", "/api/companion/tasks", map[string]any{"spec": model.CompanionSpec{Goal: "Fourth"}}, &fourth); code != 0 {
 		t.Fatal(code)
 	}
@@ -558,9 +651,9 @@ func TestCompanionReplacedKeyWaitsAndResumes(t *testing.T) {
 	waitTask(t, owner, b.ID, model.CompanionWorking)
 }
 
-// Companion unable to check any key (its list of agents unreadable, a 503 from its auth layer)
-// ran nothing: the task is retried, never written off as unconfirmed.
-func TestCompanionKeyCheckDownRetries(t *testing.T) {
+// A 503 can arrive before or after task creation. Even an auth-shaped error is
+// never resent: even successful empty lookups cannot prove nothing was sent.
+func TestCompanionKeyCheckDownDoesNotResend(t *testing.T) {
 	d := apitest.New(t)
 	owner := tc.New(d.URL, d.OwnerToken)
 	f := connect(t, d)
@@ -570,17 +663,26 @@ func TestCompanionKeyCheckDownRetries(t *testing.T) {
 		t.Fatal(code)
 	}
 	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) && !(task.Attempts > 0 && task.State == model.CompanionQueued) {
+	for time.Now().Before(deadline) && !strings.Contains(task.Error, "checking Companion tasks") {
 		_ = owner.Get(context.Background(), "/api/companion/tasks/"+task.ID, &task)
 		time.Sleep(10 * time.Millisecond)
 	}
-	// The synthetic key contains "agen", also present in the server's "agents"
-	// diagnostic. The key-echo guard withholds that text but must retain retry.
-	if task.State != model.CompanionQueued || !strings.Contains(task.Error, "withheld because it contained key material") || !strings.Contains(task.Error, "tmx tries again") {
-		t.Fatalf("with Companion's key check down: %s (%s), want queued", task.State, task.Error)
+	if task.State != model.CompanionSending || !strings.Contains(task.Error, "checking Companion tasks") {
+		t.Fatalf("with Companion's key check down: %s (%s), want look-back", task.State, task.Error)
+	}
+	if f.SentCount() != 0 {
+		t.Fatal("sent through failed key check")
 	}
 	f.RegistryDown(false)
-	waitTask(t, owner, task.ID, model.CompanionWorking)
+	// After the observation window, it stays unconfirmed even with a healthy registry.
+	deadline = time.Now().Add(70 * time.Second)
+	for time.Now().Before(deadline) && task.State != model.CompanionUnconfirmed {
+		_ = owner.Get(context.Background(), "/api/companion/tasks/"+task.ID, &task)
+		time.Sleep(20 * time.Millisecond)
+	}
+	if task.State != model.CompanionUnconfirmed || f.SentCount() != 0 {
+		t.Fatalf("registry recovered: state %s, sent %d, error %s", task.State, f.SentCount(), task.Error)
+	}
 }
 
 // An address configured earlier that no longer answers is dropped when connecting again
@@ -737,4 +839,39 @@ func turnGateOn(t *testing.T, d *apitest.Daemon, owner *tc.Client) {
 		t.Fatalf("gate on with proof: %d", code)
 	}
 	waitIdle(t, d.Gate, owner)
+}
+
+func TestCompanionCheckedConnectPreservesPreviousKey(t *testing.T) {
+	d := apitest.New(t)
+	owner := tc.New(d.URL, d.OwnerToken)
+	connect(t, d)
+	p := config.Paths{Home: d.Home}
+	before, err := os.ReadFile(p.CompanionAgentTokenFile())
+	if err != nil {
+		t.Fatal(err)
+	}
+	old, err := config.Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	busy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.Error(w, "busy", 503) }))
+	defer busy.Close()
+	body := map[string]any{"url": busy.URL, "token": "unchecked-test-key", "require_checked": true}
+	if code, _ := call(t, owner, "PUT", "/api/companion/connect", body, nil); code != http.StatusBadGateway {
+		t.Fatalf("unchecked connect: %d", code)
+	}
+	after, _ := os.ReadFile(p.CompanionAgentTokenFile())
+	current, err := config.Load(p)
+	if err != nil || string(after) != string(before) || current.Companion.URL != old.Companion.URL {
+		t.Fatal("failed handover replaced connection")
+	}
+	// Manual connection retains the existing explicit unchecked-storage behavior.
+	body["require_checked"] = false
+	if code, _ := call(t, owner, "PUT", "/api/companion/connect", body, nil); code != 0 {
+		t.Fatalf("manual connect: %d", code)
+	}
+	after, _ = os.ReadFile(p.CompanionAgentTokenFile())
+	if string(after) == string(before) {
+		t.Fatal("manual connect did not store unchecked key")
+	}
 }

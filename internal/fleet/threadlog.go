@@ -9,7 +9,6 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/blackcode-ch/tmx-go/internal/companion"
 	"github.com/blackcode-ch/tmx-go/internal/model"
 )
 
@@ -20,7 +19,10 @@ import (
 // project's log in their system prompt and read it again with thread_read.
 
 const (
-	maxEntryText = 400
+	// maxEntryText: a ceiling far out of reach of real work (256 KB), against a runaway only.
+	// Until 17 Nov a log line was 400 characters and three lines; the owner: no caps on what
+	// agents write, that is their judgment; long text is folded by the UI.
+	maxEntryText = 256 << 10
 	maxEntryLink = 500
 	// promptEntries is how much of its project's log an agent starts with.
 	promptEntries = 12
@@ -108,15 +110,14 @@ func (f *Fleet) AddEntry(c Caller, req AddEntryRequest) (model.ThreadEntry, bool
 	switch {
 	case text == "":
 		return model.ThreadEntry{}, false, errf(KindInvalid, "the entry is empty")
-	case utf8.RuneCountInString(text) > maxEntryText:
-		return model.ThreadEntry{}, false, errf(KindInvalid, "keep it to %d characters (one to three lines); put the details in a document and link it", maxEntryText)
-	case strings.Count(text, "\n") > 2:
-		return model.ThreadEntry{}, false, errf(KindInvalid, "keep it to three lines")
+	case len(text) > maxEntryText:
+		return model.ThreadEntry{}, false, errf(KindInvalid, "the entry is longer than %d KB; put the details in a document and link it", maxEntryText>>10)
 	case utf8.RuneCountInString(link) > maxEntryLink:
 		return model.ThreadEntry{}, false, errf(KindInvalid, "the link is too long")
-	case companion.Scrub(text) != text || companion.Scrub(link) != link:
-		return model.ThreadEntry{}, false, errf(KindInvalid, "this looks like it contains a secret (a key, token or password); logs never hold secrets")
 	}
+	// Nothing is checked or rewritten in what is written here (17 Nov, 22:46: no filters and no
+	// silent rewrites on tmx's own records; the check on credentials is where text leaves the
+	// machine).
 
 	f.mu.Lock()
 	defer f.mu.Unlock()

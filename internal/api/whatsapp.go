@@ -30,11 +30,12 @@ func (s *Server) whatsappRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/whatsapp/link/cancel", o(on(s.waCancelLink)))
 	mux.HandleFunc("POST /api/whatsapp/unlink", o(on(s.waUnlink)))
 	mux.HandleFunc("PUT /api/whatsapp/settings", o(on(s.waSettings)))
-	mux.HandleFunc("GET /api/whatsapp/chats", on(s.waChats))                        // owner, allowed agents
-	mux.HandleFunc("GET /api/whatsapp/chats/{jid}/messages", on(s.waMessages))      // owner, allowed agents
-	mux.HandleFunc("POST /api/whatsapp/chats/{jid}/messages", on(s.waSend))         // owner; allowed agents: text, approval rules
-	mux.HandleFunc("POST /api/whatsapp/chats/{jid}/read", o(on(s.waRead)))          //
-	mux.HandleFunc("GET /api/whatsapp/media/{jid}/{id}", on(s.waMedia))             // the owner, or a ticket
+	mux.HandleFunc("GET /api/whatsapp/chats", on(s.waChats))                   // owner, allowed agents
+	mux.HandleFunc("GET /api/whatsapp/chats/{jid}/messages", on(s.waMessages)) // owner, allowed agents
+	mux.HandleFunc("POST /api/whatsapp/chats/{jid}/messages", on(s.waSend))    // owner; allowed agents: text, approval rules
+	mux.HandleFunc("POST /api/whatsapp/chats/{jid}/read", o(on(s.waRead)))     //
+	mux.HandleFunc("GET /api/whatsapp/media/{jid}/{id}", on(s.waMedia))        // the owner, or a ticket
+	mux.HandleFunc("POST /api/whatsapp/media/{jid}/{id}/download", o(on(s.waDownload)))
 	mux.HandleFunc("POST /api/whatsapp/media/{jid}/{id}/ticket", o(on(s.waTicket))) //
 }
 
@@ -162,7 +163,13 @@ func (s *Server) waChats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	list, err := s.wa.Chats(r.URL.Query().Get("q"), limit)
+	var list []model.WaChat
+	var err error
+	if c.Owner {
+		list, err = s.wa.Chats(r.URL.Query().Get("q"), limit)
+	} else {
+		list, err = s.wa.AgentChats(c.AgentID, r.URL.Query().Get("q"), limit) // only the chats opened to it
+	}
 	if err != nil {
 		writeWaErr(w, err)
 		return
@@ -170,6 +177,11 @@ func (s *Server) waChats(w http.ResponseWriter, r *http.Request) {
 	if !c.Owner {
 		for i := range list {
 			list[i].Avatar = nil // pictures stay with the owner
+			if list[i].Last != nil {
+				last := *list[i].Last
+				hideJoinLinksIn(&last)
+				list[i].Last = &last
+			}
 		}
 	}
 	writeJSON(w, http.StatusOK, list)
@@ -183,8 +195,8 @@ func (s *Server) waMessages(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	limit, _ := strconv.Atoi(q.Get("limit"))
 	jid := r.PathValue("jid")
-	if !c.Owner { // agents may name the chat
-		ch, err := s.wa.FindChat(jid)
+	if !c.Owner { // agents may name the chat, among those the owner opened to them
+		ch, err := s.wa.AgentFindChat(c.AgentID, jid, false)
 		if err != nil {
 			writeWaErr(w, err)
 			return
@@ -195,6 +207,11 @@ func (s *Server) waMessages(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeWaErr(w, err)
 		return
+	}
+	if !c.Owner { // an invite the daemon sent stays the owner's: agents read it without the link
+		for i := range list {
+			hideJoinLinksIn(&list[i])
+		}
 	}
 	writeJSON(w, http.StatusOK, list)
 }
@@ -342,6 +359,17 @@ func (s *Server) waTicket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ticket": t, "expires_at": exp.UnixMilli()})
+}
+
+// waDownload retains the attachment in this daemon's whatsapp/media directory.
+// Only the owner may request bytes or learn a local storage path.
+func (s *Server) waDownload(w http.ResponseWriter, r *http.Request) {
+	f, err := s.wa.Media(r.Context(), r.PathValue("jid"), r.PathValue("id"))
+	if err != nil {
+		writeWaErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"path": f.Path, "name": f.Name, "type": f.Mime, "size": f.Size})
 }
 
 // ---- the privacy filter for agents

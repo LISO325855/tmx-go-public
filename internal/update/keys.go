@@ -7,8 +7,12 @@ import (
 )
 
 // FleetKeyID is the id of the first fleet key (and of the legacy update.fleet_public_key). Fleet
-// private key material is provisioned separately; this repository deliberately ships no trusted key.
+// private key material is provisioned separately and never ships with the binary.
 const FleetKeyID = config.LegacyFleetKeyID
+
+// FleetReleasePublicKey bootstraps installs that have no local pins. Explicit pins and
+// rotation policy replace this trust anchor; malformed configuration never falls back.
+const FleetReleasePublicKey = "6ec2frMWg6H02qJcMJWdxyJP6mSjQsojBsyW3/3/42c="
 
 // FleetSignatureContext separates fleet signatures from signatures of raw sums.
 // The purpose, repository, and tag each precede SHA256SUMS as an LF-terminated line.
@@ -24,21 +28,33 @@ const (
 	FleetExtraWebAuthnContext = "tmx-fleet-extra-v2"
 )
 
-// trustedKeys reads the pinned key set from local configuration. Options.Keys (base64 Ed25519
+// trustedKeys reads local pins, or the compiled bootstrap key for an unconfigured install. Options.Keys (base64 Ed25519
 // keys under FleetKeyID, require ["ed25519"]) is an explicit dependency injection seam for
 // tests, never an upstream fallback.
-func (u *Updater) trustedKeys() (keySet, error) {
+func (u *Updater) effectiveKeys(s config.UpdateConfig) ([]config.FleetKey, []string, string, error) {
 	if u.o.Keys != nil {
-		var ks []config.FleetKey
+		keys := []config.FleetKey{}
 		for _, k := range u.o.Keys {
-			ks = append(ks, config.FleetKey{ID: FleetKeyID, Type: config.KeyEd25519, Key: k})
+			keys = append(keys, config.FleetKey{ID: FleetKeyID, Type: config.KeyEd25519, Key: k})
 		}
-		return newKeySet(ks, []string{config.KeyEd25519})
+		return keys, []string{config.KeyEd25519}, "test", nil
 	}
-	s := u.settings()
 	keys, require, err := s.PinnedKeys()
 	if err != nil {
-		return keySet{}, fmt.Errorf("update keys invalid: %w", err) // fail closed: every release is refused
+		return keys, require, "configured", err
+	}
+	origin := "configured"
+	if len(keys) == 0 && s.FleetKeys == nil && s.FleetPublicKey == "" && s.Require == nil && s.KeysSerial == 0 {
+		keys = []config.FleetKey{{ID: FleetKeyID, Type: config.KeyEd25519, Key: FleetReleasePublicKey}}
+		origin = "built-in"
+	}
+	return keys, require, origin, nil
+}
+
+func (u *Updater) trustedKeys() (keySet, error) {
+	keys, require, _, err := u.effectiveKeys(u.settings())
+	if err != nil {
+		return keySet{}, fmt.Errorf("update keys invalid: %w", err)
 	}
 	ks, err := newKeySet(keys, require)
 	if err != nil {

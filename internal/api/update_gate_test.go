@@ -12,6 +12,7 @@ import (
 	"github.com/blackcode-ch/tmx-go/internal/api/apitest"
 	tc "github.com/blackcode-ch/tmx-go/internal/client"
 	"github.com/blackcode-ch/tmx-go/internal/config"
+	"github.com/blackcode-ch/tmx-go/internal/fleet"
 	"github.com/blackcode-ch/tmx-go/internal/gate"
 	"github.com/blackcode-ch/tmx-go/internal/update"
 )
@@ -222,10 +223,19 @@ func TestConfigAndUpdatesNoPromptForNothing(t *testing.T) {
 	}
 }
 
-// Inside the grace window the owner's requests pass without a prompt; an agent's token (and
+// Inside the grace window the owner's requests pass without a prompt; a worker's token (and
 // Companion's) never reaches these routes, window or not.
 func TestConfigAndUpdatesGraceWindow(t *testing.T) {
 	d, owner, agent, _ := configAndUpdateDaemon(t)
+	p, err := d.Fleet.CreateProject(fleet.OwnerCaller, fleet.ProjectRequest{Name: "Grace updates"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Fleet.LaunchAgent(fleet.OwnerCaller, fleet.LaunchRequest{Name: "grace-worker", ProjectID: p.ID}); err != nil {
+		t.Fatal(err)
+	}
+	agent = tc.New(owner.BaseURL, d.AgentToken(t, "grace-worker"))
+
 	owner.Header = http.Header{api.UISessionHeader: {strings.Repeat("ab", 32)}}
 	hour := map[string]int{"grace_minutes": 60}
 	s, conf := call(t, owner, "PUT", "/api/gate/grace", hour, nil)

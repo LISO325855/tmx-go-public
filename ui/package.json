@@ -10,7 +10,8 @@
     "preview": "vite preview",
     "lint": "eslint .",
     "typecheck": "tsc -b",
-    "shots": "node scripts/shots.mjs"
+    "shots": "node scripts/shots.mjs",
+    "render-check": "node scripts/render-check.mjs"
   },
   "dependencies": {
     "@fontsource-variable/geist": "5.3.0",

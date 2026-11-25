@@ -14,6 +14,11 @@ func (s *Server) processRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/processes/{id}/stop", s.stopOwnedProcess)
 	mux.HandleFunc("POST /api/processes/{id}/promote", s.ownerOnly(s.promoteProcess))
 	mux.HandleFunc("GET /api/system/tools", s.ownerOnly(s.systemTools))
+	// The machine registry (fleet/registry.go): every shell, tool and long-running process
+	// agents started. ?project=<id> filters; IDs go in the body (they contain colons).
+	mux.HandleFunc("GET /api/registry", s.registry)
+	mux.HandleFunc("POST /api/registry/stop", s.registryStop)
+	mux.HandleFunc("POST /api/registry/restart", s.registryRestart)
 	mux.HandleFunc("GET /api/system/warnings", s.ownerOnly(func(w http.ResponseWriter, r *http.Request) { writeJSON(w, http.StatusOK, s.systemWarnings) }))
 }
 
@@ -85,6 +90,53 @@ func (s *Server) promoteProcess(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
+func (s *Server) registry(w http.ResponseWriter, r *http.Request) {
+	c, _ := caller(r)
+	list, err := s.f.Registry(c, r.URL.Query().Get("project"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	orphans := 0
+	for _, e := range list {
+		if e.Orphan {
+			orphans++
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"entries": list, "orphans": orphans})
+}
+
+type registryRef struct {
+	ID string `json:"id"`
+}
+
+func (s *Server) registryStop(w http.ResponseWriter, r *http.Request) {
+	var req registryRef
+	if !decode(w, r, &req) {
+		return
+	}
+	c, _ := caller(r)
+	if err := s.f.RegistryStop(c, req.ID); err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) registryRestart(w http.ResponseWriter, r *http.Request) {
+	var req registryRef
+	if !decode(w, r, &req) {
+		return
+	}
+	c, _ := caller(r)
+	e, err := s.f.RegistryRestart(c, req.ID)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, e)
+}
+
 func (s *Server) systemTools(w http.ResponseWriter, r *http.Request) {
 	p := s.f.SystemTools()
 	if s.wa != nil {

@@ -203,10 +203,24 @@ func TestQuestionWithdrawalElicitationInterruptAndFailure(t *testing.T) {
 	if res := r.result(); res.Text != "elicitation decline" {
 		t.Fatal(res.Text)
 	}
+	// Codex asking to approve a call of tmx's own MCP tools is answered yes (17 Nov: declined,
+	// every tmxg tool of a Codex agent failed with "user rejected MCP tool call"); the same
+	// question for another server, or one not marked as a tool-call approval, is declined.
+	for say, want := range map[string]string{
+		"toolcall tmxg top":    "toolcall accept",
+		"toolcall tmxg inner":  "toolcall accept",
+		"toolcall tmxg plain":  "toolcall decline",
+		"toolcall other top":   "toolcall decline",
+		"toolcall other inner": "toolcall decline",
+	} {
+		_ = p.Send(say)
+		if res := r.result(); res.Text != want {
+			t.Fatalf("%s: %q, want %q", say, res.Text, want)
+		}
+	}
 
 	_ = p.Send("wait")
 	r.until("turn started", func(ev runner.Event) bool { return ev.Kind == runner.EvState && ev.State == model.StateWorking })
-	time.Sleep(100 * time.Millisecond) // the turn id arrives with turn/started
 	if err := p.Interrupt(); err != nil {
 		t.Fatal(err)
 	}
@@ -270,5 +284,32 @@ func TestStopEndsOnEOF(t *testing.T) {
 func TestWrongHarness(t *testing.T) {
 	if _, err := New().Start(context.Background(), runner.Spec{Harness: model.HarnessClaude}); err == nil {
 		t.Fatal("want error")
+	}
+}
+
+func TestSelectedProfileToolCallsAreApproved(t *testing.T) {
+	p, r := start(t, runner.Spec{ProfileMCP: map[string]runner.MCPServer{"arc-desktop": {Command: "fixture"}}})
+	r.state(model.StateIdle)
+	for say, want := range map[string]string{
+		"toolcall arc-desktop top":   "toolcall accept",
+		"toolcall arc-desktop inner": "toolcall accept",
+		"toolcall arc-desktop plain": "toolcall decline",
+		"toolcall unselected top":    "toolcall decline",
+	} {
+		if err := p.Send(say); err != nil {
+			t.Fatal(err)
+		}
+		if res := r.result(); res.Text != want {
+			t.Fatalf("%s: %s, want %s", say, res.Text, want)
+		}
+	}
+}
+
+func TestUnselectedElicitationDeclineIsVisible(t *testing.T) {
+	p := &parser{}
+	o := &out{}
+	p.serverRequest(o, wireMsg{ID: json.RawMessage(`1`), Method: mElicitation, Params: json.RawMessage(`{"serverName":"unknown","_meta":{"codex_approval_kind":"mcp_tool_call"}}`)})
+	if len(o.events) != 1 || o.events[0].Entry == nil || !o.events[0].Entry.IsError {
+		t.Fatal("silent elicitation decline")
 	}
 }

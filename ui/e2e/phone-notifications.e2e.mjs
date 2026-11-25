@@ -90,8 +90,8 @@ test("phone banner visibility, Later, denied permission, and Living cell screens
   }
   assert.equal(await page.evaluate(() => [document.documentElement, document.body, document.querySelector("main"), document.querySelector(".settings-page .scroll-thin")].some(el => el.scrollWidth > el.clientWidth + 1)), false, "no horizontal page or Settings scroll");
   await page.goto(`${d.proxy.origin}/#/`);
-  const logo = page.locator('main img[alt="Tiamatrix"]');
-  assert.equal(await logo.getAttribute("src"), "/living-cell.svg");
+  const logo = page.locator("main [data-brand-mark]");
+  assert.equal(await logo.locator("svg#living-cell").count(), 1);
   await logo.screenshot({ path: "screenshots/living-cell-header.png", scale: "css" });
   await banner.getByRole("button", { name: "Later" }).click();
   await banner.waitFor({ state: "detached" });

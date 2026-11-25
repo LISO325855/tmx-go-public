@@ -9,6 +9,10 @@ export type UpdateState = "off" | "idle" | "checking" | "available" | "downloadi
 
 export interface UpdateStatus {
   current: string;
+  running_flavour?: "headless" | "desktop";
+  flavour?: "headless" | "desktop";
+  migration?: string;
+  migration_error?: string;
   state: UpdateState;
   /** state off: why this build does not update itself */
   reason?: string;

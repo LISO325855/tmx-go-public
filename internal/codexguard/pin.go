@@ -10,8 +10,8 @@ import (
 	"path/filepath"
 )
 
-// Pin holds a read handle for the lifetime of a launch. On Windows the handle
-// denies writes and replacement without changing permissions or ACLs.
+// Pin holds a read handle for a launch. On Windows the handle denies writes;
+// only the daemon executable pin shares rename access for updates.
 type Pin struct {
 	Path   string
 	SHA256 string
@@ -19,6 +19,10 @@ type Pin struct {
 }
 
 func OpenPin(path string) (*Pin, error) {
+	return openPin(path, false)
+}
+
+func openPin(path string, shareDelete bool) (*Pin, error) {
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return nil, err
@@ -27,7 +31,7 @@ func OpenPin(path string) (*Pin, error) {
 	if err != nil {
 		return nil, err
 	}
-	f, err := openPinned(real)
+	f, err := openPinned(real, shareDelete)
 	if err != nil {
 		return nil, fmt.Errorf("pin file: %w", err)
 	}

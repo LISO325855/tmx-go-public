@@ -2,6 +2,7 @@ package api_test
 
 import (
 	"context"
+	"encoding/json"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -227,5 +228,95 @@ func TestFleetHostsPeerUnreachable(t *testing.T) {
 	}
 	if len(resp.Hosts) == 0 {
 		t.Fatal("configured peers must still be listed before the first poll")
+	}
+}
+
+// TestFleetHostsPeerMachineReading: a peer that sends its own machine reading with its agents
+// (GET /api/sessions "system", the Python daemons' shape) gets its CPU, memory and version on
+// its row; and this machine's own row comes apart from the list, as "self", under the fleet
+// name its peers know it by.
+func TestFleetHostsPeerMachineReading(t *testing.T) {
+	ps := newPeerSetup(t)
+	ps.py.sys = map[string]any{"cpu_percent": 0, "cpus": 16, "memory": map[string]any{"total_mb": 32768, "available_mb": 8192},
+		"disk_free_mb": 512000, "disk_total_mb": 1024000, "io_overloaded": true}
+	ps.pc.PollAll(context.Background())
+
+	owner := client{t: t, base: ps.url, token: ps.d.OwnerToken}
+	var resp struct {
+		Hosts []api.HostSummary `json:"hosts"`
+		Self  api.HostSummary   `json:"self"`
+	}
+	if s := owner.do("GET", "/api/fleet/hosts", nil, &resp); s != 200 {
+		t.Fatalf("status %d", s)
+	}
+	var hosta, hostc api.HostSummary
+	for _, h := range resp.Hosts {
+		switch h.Name {
+		case "hosta":
+			hosta = h
+		case "hostc":
+			hostc = h
+		case "hostb":
+			t.Fatalf("this machine is listed among the others: %+v", h)
+		}
+	}
+	// A CPU of 0 % is a reading: Measured tells it from "no numbers".
+	if !hosta.Measured || hosta.CPU != 0 || hosta.MemFreeMB != 8192 || hosta.MemTotalMB != 32768 ||
+		hosta.DiskFreeGB != 500 || hosta.DiskTotalGB != 1000 || !hosta.DiskBusy || hosta.Version != "2.41.0" || hosta.Seen == 0 {
+		t.Fatalf("hosta row: %+v", hosta)
+	}
+	if hostc.Reachable || hostc.Measured || hostc.MemTotalMB != 0 || hostc.Seen != 0 {
+		t.Fatalf("a machine that never answered has no reading: %+v", hostc)
+	}
+	if hosta.Daemon != "" || resp.Self.Daemon != "go" {
+		t.Fatalf("daemon kinds: the Python peer %q, this machine %q", hosta.Daemon, resp.Self.Daemon)
+	}
+	if resp.Self.Kind != "self" || resp.Self.Name != "hostb" || !resp.Self.Reachable || resp.Self.Agents == 0 {
+		t.Fatalf("self row: %+v", resp.Self)
+	}
+
+	// The agents' own fleet tool reads the roster (GET /api/fleet): an agent sees the other
+	// machines' agents there, names and states only - not the machine readings above.
+	var roster struct {
+		Hosts    []map[string]any `json:"hosts"`
+		Sessions []struct {
+			Name string `json:"name"`
+			Host string `json:"host"`
+		} `json:"sessions"`
+	}
+	agent := client{t: t, base: ps.url, token: ps.d.AgentToken(t, "head")}
+	if s := agent.do("GET", "/api/fleet", nil, &roster); s != 200 || len(roster.Hosts) != 3 {
+		t.Fatalf("agent roster: %d %+v", s, roster)
+	}
+	found := false
+	for _, row := range roster.Sessions {
+		found = found || (row.Name == "tmx-lead" && row.Host == "hosta")
+	}
+	if !found {
+		t.Fatalf("the roster lacks hosta's agent: %+v", roster.Sessions)
+	}
+}
+
+// TestPeerSessionsCarryThisMachinesReading: what this daemon tells its peers about its own
+// machine is an object in the Python daemons' field names - empty before the first sample,
+// never a made-up zero.
+func TestPeerSessionsCarryThisMachinesReading(t *testing.T) {
+	s := newPeerSetup(t)
+	var out struct {
+		Daemon string                     `json:"daemon"`
+		System map[string]json.RawMessage `json:"system"`
+	}
+	if code := peerDo(t, s.url, "GET", "/api/sessions", "hosta", s.pair, nil, nil, &out); code != 200 || out.System == nil || out.Daemon != "go" {
+		t.Fatalf("%d %+v", code, out)
+	}
+	for k := range out.System {
+		switch k {
+		case "cpu_percent", "cpus", "memory", "disk_write_mb_s", "disk_free_mb", "disk_total_mb", "io_overloaded":
+		default:
+			t.Fatalf("unexpected key %q in system: %s", k, out.System[k])
+		}
+	}
+	if _, ok := out.System["cpu_percent"]; ok != (out.System["memory"] != nil) {
+		t.Fatalf("cpu_percent and memory come together or not at all: %v", out.System)
 	}
 }

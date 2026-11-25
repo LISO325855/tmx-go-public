@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
+	"debug/pe"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -15,7 +18,7 @@ import (
 )
 
 func TestVerifyRelease(t *testing.T) {
-	for _, failure := range []string{"", "signature", "checksum", "missing binary", "missing signature", "missing sums", "untrusted", "repo", "tag", "empty pins"} {
+	for _, failure := range []string{"", "signature", "checksum", "missing binary", "missing desktop", "missing signature", "missing sums", "untrusted", "repo", "tag", "empty pins"} {
 		t.Run(failure, func(t *testing.T) {
 			dir := t.TempDir()
 			tag := "fleet-v2.0.0-rc1"
@@ -30,7 +33,7 @@ func TestVerifyRelease(t *testing.T) {
 				}
 			}
 			for _, name := range names(tag) {
-				write(name, []byte(name))
+				write(name, releaseFixture(name, tag))
 			}
 			sums, err := checksums(dir, tag)
 			if err != nil {
@@ -61,6 +64,8 @@ func TestVerifyRelease(t *testing.T) {
 				write(names(tag)[0], []byte("changed"))
 			case "missing binary":
 				os.Remove(filepath.Join(dir, names(tag)[0]))
+			case "missing desktop":
+				os.Remove(filepath.Join(dir, windowsDesktopName(tag)))
 			case "missing signature":
 				os.Remove(filepath.Join(dir, "SHA256SUMS.sig"))
 			case "missing sums":
@@ -95,7 +100,7 @@ func TestPublishOnlyVerifiedSnapshot(t *testing.T) {
 				}
 			}
 			for _, name := range names(tag) {
-				write(name, []byte(name))
+				write(name, releaseFixture(name, tag))
 			}
 			sums, err := checksums(dir, tag)
 			if err != nil {
@@ -120,7 +125,10 @@ func TestPublishOnlyVerifiedSnapshot(t *testing.T) {
 					if !strings.Contains(strings.Join(args, " "), "--verify-tag --draft") {
 						t.Fatal("must create a draft for an existing tag")
 					}
-					uploaded = args[len(args)-6:]
+					uploaded = args[len(args)-len(names(tag))-2:]
+					if filepath.Base(uploaded[len(names(tag))-1]) != windowsDesktopName(tag) {
+						t.Fatal("Windows desktop asset missing from upload")
+					}
 					for _, p := range uploaded {
 						if filepath.Dir(p) == dir {
 							t.Fatal("did not snapshot assets")
@@ -166,6 +174,67 @@ func TestPublishOnlyVerifiedSnapshot(t *testing.T) {
 			write("offline.sig", []byte("invalid"))
 			if err := publish(dir, tag, filepath.Join(dir, "offline.sig"), filepath.Join(dir, "pins.json")); err == nil || calls != 0 {
 				t.Fatal("invalid input reached GitHub")
+			}
+		})
+	}
+}
+
+func releaseFixture(name, tag string) []byte {
+	switch name {
+	case windowsHeadlessName(tag):
+		return peFixture(pe.IMAGE_SUBSYSTEM_WINDOWS_CUI)
+	case windowsDesktopName(tag):
+		return peFixture(pe.IMAGE_SUBSYSTEM_WINDOWS_GUI)
+	default:
+		return []byte(name)
+	}
+}
+
+func peFixture(subsystem uint16) []byte {
+	var b bytes.Buffer
+	// Keep the header readable by debug/pe without bundling executable code.
+	dos := make([]byte, 64)
+	copy(dos, "MZ")
+	binary.LittleEndian.PutUint32(dos[0x3c:], 64)
+	b.Write(dos)
+	b.WriteString("PE\x00\x00")
+	header := pe.OptionalHeader64{Magic: 0x20b, Subsystem: subsystem, NumberOfRvaAndSizes: 16}
+	binary.Write(&b, binary.LittleEndian, pe.FileHeader{
+		Machine: pe.IMAGE_FILE_MACHINE_AMD64, SizeOfOptionalHeader: uint16(binary.Size(header)),
+	})
+	binary.Write(&b, binary.LittleEndian, header)
+	return b.Bytes()
+}
+
+func TestWindowsReleaseAssets(t *testing.T) {
+	const tag = "fleet-v2.0.0"
+	headless, desktop := windowsHeadlessName(tag), windowsDesktopName(tag)
+	for _, test := range []struct {
+		name, asset string
+		contents    []byte
+		want        string
+	}{
+		{"missing headless", headless, nil, "required release asset " + headless},
+		{"missing desktop", desktop, nil, "required release asset " + desktop},
+		{"identical", desktop, peFixture(3), "identical SHA-256"},
+		{"wrong headless", headless, peFixture(1), headless + ": PE subsystem 1, expected 3"},
+		{"wrong desktop", desktop, peFixture(1), desktop + ": PE subsystem 1, expected 2"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			for _, name := range names(tag) {
+				data := releaseFixture(name, tag)
+				if name == test.asset {
+					data = test.contents
+				}
+				if data != nil {
+					if err := os.WriteFile(filepath.Join(dir, name), data, 0o600); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			if _, err := checksums(dir, tag); err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("checksums: got %v, want %q", err, test.want)
 			}
 		})
 	}

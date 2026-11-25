@@ -13,7 +13,6 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"github.com/blackcode-ch/tmx-go/internal/companion"
 	"github.com/blackcode-ch/tmx-go/internal/fleet"
 	"github.com/blackcode-ch/tmx-go/internal/model"
 	"github.com/blackcode-ch/tmx-go/internal/p2p"
@@ -35,16 +34,19 @@ import (
 // ignore the topic field of messages: their board is not updated, their chats work as before.
 
 const (
-	// MaxTopics bounds a chat's topics (archived ones included).
-	MaxTopics = 200
-	// MaxTopicEntries bounds a chat's log lines (every topic).
-	MaxTopicEntries = 5000
+	// MaxTopics bounds a chat's topics (archived ones included). A ceiling against a runaway
+	// filling the disk, a hundred times what real work reached (200 until 17 Nov).
+	MaxTopics = 20000
+	// MaxTopicEntries bounds a chat's log lines (every topic); 5000 until 17 Nov.
+	MaxTopicEntries = 500000
 	// MaxMove bounds the messages moved at once.
 	MaxMove = 100
 
-	maxTopicTitle     = 80
-	maxTopicEntryText = 400
-	maxTopicEntryLink = 500
+	// Storage ceilings, not rules on how to write (80, 400 and three lines, 500 until 17 Nov). An
+	// install older than that still refuses a longer title or line when it arrives there.
+	maxTopicTitle     = 400
+	maxTopicEntryText = 4000
+	maxTopicEntryLink = 2000
 	// maxTopicItems bounds the topics, moves and entries of one chat.topic envelope (each).
 	maxTopicItems = 200
 	// topicBodyBudget: a chat.topic body is cut into several below this (p2p.MaxBody is 48 KB).
@@ -216,13 +218,9 @@ func checkEntry(kind, text, link string) error {
 	case text == "":
 		return invalid("the entry is empty")
 	case utf8.RuneCountInString(text) > maxTopicEntryText:
-		return invalid("keep it to %d characters (one to three lines); put the details in a message or a document and link it", maxTopicEntryText)
-	case strings.Count(text, "\n") > 2:
-		return invalid("keep it to three lines")
+		return invalid("the entry is longer than %d characters", maxTopicEntryText)
 	case utf8.RuneCountInString(link) > maxTopicEntryLink:
 		return invalid("the link is too long")
-	case companion.Scrub(text) != text || companion.Scrub(link) != link:
-		return invalid("this looks like it contains a secret (a key, token or password); logs never hold secrets")
 	}
 	return nil
 }
@@ -473,10 +471,6 @@ func (s *Service) agentBoardChangeLocked(c fleet.Caller) error {
 		if at > since {
 			kept = append(kept, at)
 		}
-	}
-	if len(kept) >= AgentBoardChanges {
-		s.boardChanges[c.AgentID] = kept
-		return errf(fleet.KindTooMany, "you changed chat boards %d times in the last 10 minutes; wait a little", len(kept))
 	}
 	s.boardChanges[c.AgentID] = append(kept, now)
 	return nil

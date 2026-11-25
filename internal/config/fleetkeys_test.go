@@ -201,3 +201,23 @@ func jsonEqual(a, b []byte) bool {
 }
 
 func mustJSON(v any) []byte { b, _ := json.Marshal(v); return b }
+
+func TestExplicitEmptyTrustRoundTrip(t *testing.T) {
+	for _, raw := range []string{`{}`, `{"fleet_keys":[]}`, `{"require":[]}`, `{"fleet_keys":[],"require":[]}`} {
+		var original UpdateConfig
+		if err := json.Unmarshal([]byte(raw), &original); err != nil {
+			t.Fatal(err)
+		}
+		data, err := json.Marshal(original)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var reloaded UpdateConfig
+		if err := json.Unmarshal(data, &reloaded); err != nil {
+			t.Fatal(err)
+		}
+		if (original.FleetKeys == nil) != (reloaded.FleetKeys == nil) || (original.Require == nil) != (reloaded.Require == nil) {
+			t.Fatalf("lost nil/empty distinction: %s -> %s", raw, data)
+		}
+	}
+}

@@ -94,7 +94,7 @@ func (s *Server) putVoice(w http.ResponseWriter, r *http.Request) {
 // POST /api/voice/setup: downloads the engine, the chosen model and the voice activity model
 // (what is missing) in the background; progress in GET /api/voice and "voice.status".
 func (s *Server) voiceSetup(w http.ResponseWriter, r *http.Request) {
-	st, err := s.voice.Setup()
+	st, err := s.voice.SetupOwner() // the owner asked: this one may also install the faster-whisper worker
 	if err != nil {
 		writeVoiceErr(w, err)
 		return
@@ -123,9 +123,9 @@ func (s *Server) voiceRemoveModel(w http.ResponseWriter, r *http.Request) {
 // maxDictationBody: two minutes of 16 kHz mono PCM16 (3.84 MB) in base64, with room to spare.
 const maxDictationBody = 8 << 20
 
-// POST /api/transcribe: transcribes now and answers {text, language, segments}; nothing is
-// stored. JSON {data: base64 WAV (at most 2 minutes), language?} is dictation; a raw audio body
-// (Content-Type audio/* or application/octet-stream; WAV, MP3, FLAC or Ogg, at most 512 MB;
+// POST /api/transcribe: answers {text, language, segments, held?, held_reason?}. Held/empty
+// dictation audio is not retained. JSON {data: base64 WAV (at most 2 minutes), language?} is dictation; a raw audio body
+// (Content-Type audio/* or application/octet-stream; WAV, MP3, FLAC, Ogg, M4A or AAC, at most 512 MB;
 // ?language=) is a file (tmx transcribe FILE). The answer waits for the job's turn.
 func (s *Server) transcribeNow(w http.ResponseWriter, r *http.Request) {
 	if r.Header.Get(transcriptionLocalOnly) != "" {

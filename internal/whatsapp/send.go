@@ -18,7 +18,7 @@ import (
 
 // Sending. A request becomes one WhatsApp message per file (the text is the first file's
 // caption) or one text message. Every message is stored at once as "pending" and announced;
-// a queue per chat sends them in order, at least ChatGap apart, and the message's state follows
+// a queue per chat sends them in order, and the message's state follows
 // by event (sent, delivered, read, or failed with the reason).
 
 // Upload is a file to send (the API's {name, type, data}).
@@ -43,7 +43,6 @@ type sendJob struct {
 
 type chatQueue struct {
 	jobs []sendJob
-	last time.Time // when the previous message to this chat went out
 	busy bool
 }
 
@@ -109,11 +108,6 @@ func (s *Service) Send(origin, chat string, req SendRequest) ([]model.WaMessage,
 	if text != "" {
 		items = append(items, item{text: text})
 	}
-	if ok, wait := s.win.take(s.o.Now(), len(items)); !ok {
-		return nil, errorf(http.StatusTooManyRequests, "tmx has sent %d WhatsApp messages in the last %d minutes, the most it sends "+
-			"(WhatsApp bans numbers that send like a bot); try again in %s", WindowMax, int(Window.Minutes()), wait.Round(time.Second))
-	}
-
 	now := s.o.Now()
 	self := s.selfJID()
 	var out []model.WaMessage
@@ -136,8 +130,12 @@ func (s *Service) Send(origin, chat string, req SendRequest) ([]model.WaMessage,
 			row.MediaFile = s.keepFile(c.JID, id, it.file.Mime, it.file.Data)
 		}
 		if err := s.o.Store.WaPutMessage(row); err != nil {
+			s.markMedia(row.MediaFile, false)
+			s.removeFile(row.MediaFile)
 			return out, err
 		}
+		s.markMedia(row.MediaFile, false)
+		signal(s.maintenanceWake)
 		jobs = append(jobs, sendJob{row: row, out: o, file: it.file})
 		out = append(out, s.messageView(row))
 	}
@@ -172,7 +170,7 @@ func (s *Service) enqueue(chat string, jobs []sendJob) {
 	}
 }
 
-// drain sends a chat's queue in order, ChatGap apart.
+// drain sends a chat's queue in order.
 func (s *Service) drain(chat string, q *chatQueue) {
 	defer s.wg.Done()
 	for {
@@ -184,19 +182,11 @@ func (s *Service) drain(chat string, q *chatQueue) {
 		}
 		j := q.jobs[0]
 		q.jobs = q.jobs[1:]
-		wait := time.Until(q.last.Add(s.o.ChatGap))
 		s.mu.Unlock()
-		if wait > 0 {
-			select {
-			case <-time.After(wait):
-			case <-s.ctx.Done():
-				return // marked failed at the next start
-			}
+		if s.ctx.Err() != nil {
+			return // marked failed at the next start
 		}
 		s.sendOne(j)
-		s.mu.Lock()
-		q.last = time.Now()
-		s.mu.Unlock()
 	}
 }
 
@@ -213,15 +203,33 @@ func (s *Service) sendOne(j sendJob) {
 		}
 	}
 	var at time.Time
+	var deferred bool
 	if err == nil {
-		at, err = s.o.Client.Send(ctx, j.out)
+		cancel()
+		if deferred, err = s.waitSendSlot(); err == nil {
+			sendCtx, sendCancel := context.WithTimeout(s.ctx, 2*time.Minute)
+			at, err = s.o.Client.Send(sendCtx, j.out)
+			sendCancel()
+		}
 	}
 	if errors.Is(err, context.Canceled) && s.ctx.Err() != nil {
 		return // the daemon is stopping: marked failed at the next start
 	}
+	s.evMu.Lock()
 	cur, gerr := s.o.Store.WaGetMessage(row.ChatJID, row.ID)
+	if gerr != nil || cur.Deleted {
+		s.evMu.Unlock()
+		return
+	}
 	if gerr == nil { // keep a receipt that came in meanwhile
 		row.Status = cur.Status
+		if row.Media != nil && cur.Media != nil {
+			md := *row.Media
+			md.Transcript = cur.Media.Transcript
+			md.Expired = cur.Media.Expired
+			md.DownloadRetry, md.TranscribeRetry = cur.Media.DownloadRetry, cur.Media.TranscribeRetry
+			row.Media = &md
+		}
 	}
 	if err != nil {
 		s.log.Warn("whatsapp send", "err", err)
@@ -239,6 +247,62 @@ func (s *Service) sendOne(j sendJob) {
 		s.log.Warn("whatsapp send", "err", err)
 	}
 	s.publishMessage(row.ChatJID, row.ID)
+	s.evMu.Unlock()
+	s.wakeMedia()
+	if deferred && s.o.Fleet != nil && row.Origin != "" && row.Origin != model.Owner {
+		outcome := "was sent"
+		if err != nil {
+			outcome = "could not be sent"
+		}
+		body := fmt.Sprintf("[WhatsApp] Deferred message %s %s. Use whatsapp_read for its status.", row.ID, outcome)
+		if _, err := s.o.Fleet.DeliverWhatsApp(row.Origin, body); err != nil {
+			s.log.Warn("whatsapp send outcome", "err", err)
+		}
+	}
+}
+
+func (s *Service) waitSendSlot() (deferred bool, err error) {
+	for {
+		if err := s.ctx.Err(); err != nil {
+			return deferred, err
+		}
+		s.mu.Lock()
+		account := s.acct.Phone
+		if account == "" {
+			account = s.acct.JID
+		}
+		if s.sendWindows == nil {
+			s.sendWindows = make(map[string][]time.Time)
+		}
+		now := time.Now()
+		window, retryAt := reserveSend(s.sendWindows[account], now)
+		s.sendWindows[account] = window
+		s.mu.Unlock()
+		if retryAt.IsZero() {
+			return deferred, nil
+		}
+		deferred = true
+		timer := time.NewTimer(time.Until(retryAt))
+		select {
+		case <-timer.C:
+		case <-s.ctx.Done():
+			timer.Stop()
+			return deferred, s.ctx.Err()
+		}
+	}
+}
+
+func reserveSend(window []time.Time, now time.Time) ([]time.Time, time.Time) {
+	cutoff := now.Add(-time.Minute)
+	for len(window) != 0 && !window[0].After(cutoff) {
+		window = window[1:]
+	}
+	// Fleet-wide across agents and chats for this linked account. The owner
+	// approved this limit on 24 Nov 2026 to avoid bulk-sending account bans.
+	if len(window) >= 15 {
+		return window, window[0].Add(time.Minute)
+	}
+	return append(window, now), time.Time{}
 }
 
 // ---- agents
@@ -261,7 +325,7 @@ func (s *Service) AgentSend(agentID, chat, text, replyTo string) (AgentResult, e
 	if err := s.ready(true); err != nil {
 		return AgentResult{}, err
 	}
-	c, err := s.FindChat(chat)
+	c, err := s.AgentFindChat(agentID, chat, true) // access.go: only chats the owner opened to it
 	if err != nil {
 		return AgentResult{}, err
 	}
@@ -284,9 +348,6 @@ func (s *Service) AgentSend(agentID, chat, text, replyTo string) (AgentResult, e
 			return AgentResult{}, err
 		}
 		return AgentResult{Message: &msgs[0], Chat: c}, nil
-	}
-	if n := s.pendingOf(agentID); n >= MaxAgentPending {
-		return AgentResult{}, errorf(http.StatusTooManyRequests, "you already have %d WhatsApp messages waiting for the owner's OK", n)
 	}
 	ap, err := s.o.Fleet.WhatsAppApproval(agentID, model.WaSendInput{ChatJID: c.JID, ChatName: c.Name, Text: text, ReplyTo: replyTo})
 	if err != nil {

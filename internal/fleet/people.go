@@ -16,9 +16,9 @@ import (
 // may set reminders for itself only. Nothing here logs a name, number or address.
 
 const (
-	maxPromiseTitle = 200
-	maxPromiseText  = 4000
-	maxReminderText = 2000
+	maxPromiseTitle = 2000 // a longer title or text is cut here (200 and 4000 until 17 Nov)
+	maxPromiseText  = 64000
+	maxReminderText = 32000 // a storage ceiling (2000 until 17 Nov)
 )
 
 // PersonInput is an add/edit. Channels: a value "" removes that channel.
@@ -93,8 +93,11 @@ func (f *Fleet) Person(c Caller, key string) (any, error) {
 
 // PutPerson adds or edits a person (owner only).
 func (f *Fleet) PutPerson(c Caller, in PersonInput) (model.Person, error) {
-	if !c.Owner {
-		return model.Person{}, errf(KindForbidden, "only the owner can edit people")
+	f.mu.Lock()
+	err := f.manageNodeLocked(c, "edit people")
+	f.mu.Unlock()
+	if err != nil {
+		return model.Person{}, err
 	}
 	key := strings.ToLower(strings.TrimSpace(in.Key))
 	if err := people.ValidKey(key); err != nil {
@@ -161,7 +164,7 @@ func (f *Fleet) PutPerson(c Caller, in PersonInput) (model.Person, error) {
 		}
 		switch ch {
 		case "whatsapp":
-			v, err = people.Phone(v)
+			v, err = people.WhatsApp(v)
 		case "email":
 			v, err = people.Email(v)
 		case "github":
@@ -207,9 +210,46 @@ func contains(xs []string, x string) bool {
 	return false
 }
 
+// InviteTarget is who a join invite may be sent to by WhatsApp: a person the owner keeps in
+// People with a WhatsApp number (digits only). The number stays inside the daemon.
+type InviteTarget struct {
+	Key, Name, Lang, Number string
+}
+
+// PersonInviteTarget resolves a People key or alias for the daemon's invite-by-WhatsApp action.
+// It is not an agent route: the caller (api/p2p_invite_wa.go) never returns the number.
+func (f *Fleet) PersonInviteTarget(ref string) (InviteTarget, error) {
+	ref = strings.ToLower(strings.TrimSpace(ref))
+	if ref == "" {
+		return InviteTarget{}, errf(KindInvalid, "name the person by their People key")
+	}
+	all, err := f.st.ListPeople()
+	if err != nil {
+		return InviteTarget{}, err
+	}
+	for _, p := range all {
+		if p.Key != ref && !contains(p.Aliases, ref) {
+			continue
+		}
+		n := p.Channels["whatsapp"]
+		if n == "" {
+			return InviteTarget{}, errf(KindConflict, "%s has no WhatsApp number in People; attach one with person_set channels.whatsapp", p.Key)
+		}
+		name := p.Name
+		if name == "" {
+			name = p.Key
+		}
+		return InviteTarget{Key: p.Key, Name: name, Lang: p.Lang, Number: n}, nil
+	}
+	return InviteTarget{}, errf(KindNotFound, "no person %q in People", ref)
+}
+
 func (f *Fleet) DeletePerson(c Caller, key string) error {
-	if !c.Owner {
-		return errf(KindForbidden, "only the owner can remove people")
+	f.mu.Lock()
+	err := f.manageNodeLocked(c, "remove people")
+	f.mu.Unlock()
+	if err != nil {
+		return err
 	}
 	return storeErr(f.st.DeletePerson(strings.ToLower(key)), "such person")
 }
@@ -296,8 +336,8 @@ func (f *Fleet) PutPromise(c Caller, id string, in PromiseInput) (model.Promise,
 	// (assigned) agent may move it; a new promise from an agent is always its own.
 	if in.Owner != nil && !c.Owner {
 		to := strings.TrimSpace(*in.Owner)
-		if !f.isAgent(c.AgentID, to) && (id == "" || !f.promiseIsAssigned(c.AgentID, p)) {
-			return model.Promise{}, errf(KindForbidden, "only the owner or the promise's own agent can reassign it")
+		if !f.isAgent(c.AgentID, to) && (id == "" || !f.promiseIsAssigned(c.AgentID, p)) && !f.isHeadCaller(c) {
+			return model.Promise{}, errf(KindForbidden, "only the owner, the head or the promise's own agent can reassign it")
 		}
 	}
 	if in.Title != nil {

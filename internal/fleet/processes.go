@@ -44,8 +44,8 @@ func (f *Fleet) startProcessLocked(agent string, req ProcessRequest) (model.Proc
 	if err := harness.ValidateLaunchCwd(r.a.Cwd); err != nil {
 		return model.ProcessInfo{}, errf(KindForbidden, "%s", err)
 	}
-	if strings.TrimSpace(req.Purpose) == "" || len(req.Purpose) > 240 || len(req.Args) > 256 {
-		return model.ProcessInfo{}, errf(KindInvalid, "purpose required (up to 240 characters); at most 256 arguments")
+	if strings.TrimSpace(req.Purpose) == "" || len(req.Purpose) > 4000 || len(req.Args) > 25600 { // ceilings (240 and 256 until 17 Nov)
+		return model.ProcessInfo{}, errf(KindInvalid, "purpose required (up to 4000 characters); at most 25600 arguments")
 	}
 	p, err := f.processes.Start(processes.Spec{OwnerID: r.a.ID, ProjectID: r.a.ProjectID, Purpose: req.Purpose, Command: req.Command, Args: req.Args, Cwd: r.a.Cwd})
 	if err != nil {
@@ -85,8 +85,8 @@ func (f *Fleet) RequestProcess(c Caller, req ProcessRequest) (ProcessResult, err
 	if f.profileForLocked(r.a).ReadOnly {
 		return ProcessResult{}, errf(KindForbidden, "read-only profiles cannot launch commands")
 	}
-	if strings.TrimSpace(req.Purpose) == "" || len(req.Purpose) > 240 || strings.TrimSpace(req.Command) == "" || len(req.Args) > 256 {
-		return ProcessResult{}, errf(KindInvalid, "command and purpose required; purpose up to 240 characters and at most 256 arguments")
+	if strings.TrimSpace(req.Purpose) == "" || len(req.Purpose) > 4000 || strings.TrimSpace(req.Command) == "" || len(req.Args) > 25600 {
+		return ProcessResult{}, errf(KindInvalid, "command and purpose required; purpose up to 4000 characters and at most 25600 arguments")
 	}
 	raw, err := json.Marshal(req)
 	if err != nil || len(raw) > MaxBodyBytes {
@@ -113,15 +113,6 @@ func (f *Fleet) RequestProcess(c Caller, req ProcessRequest) (ProcessResult, err
 			return ProcessResult{}, err
 		}
 		return ProcessResult{Process: &p}, nil
-	}
-	count := 0
-	for _, p := range f.processRequests {
-		if p.agentID == r.a.ID {
-			count++
-		}
-	}
-	if count >= 8 {
-		return ProcessResult{}, errf(KindConflict, "too many pending tool requests")
 	}
 	ap := model.Approval{ID: model.NewID(), AgentID: r.a.ID, Kind: model.ApprovalPermission, Tool: ToolProcessStart, Input: raw, Description: "Start owned tool: " + req.Purpose + " — " + v.Message(), State: model.ApprovalPending, CreatedAt: model.Now(), Options: []string{}}
 	if err := f.st.PutApproval(ap); err != nil {
@@ -182,8 +173,10 @@ func (f *Fleet) AgentProcesses(c Caller, agent string) ([]model.ProcessInfo, err
 	a := r.a
 	proc := r.proc
 	if !c.Owner && c.AgentID != a.ID {
-		f.mu.Unlock()
-		return nil, errf(KindForbidden, "only the owner or this agent may inspect its processes")
+		if err := f.manageAgentLocked(c, r, "inspect an agent's processes"); err != nil {
+			f.mu.Unlock()
+			return nil, err
+		}
 	}
 	f.mu.Unlock()
 	out := []model.ProcessInfo{}

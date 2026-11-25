@@ -30,7 +30,7 @@ func TestProfilesSeededAndPolicyDerived(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := slugs(snap.Profiles); !slices.Equal(got, []string{"head", "lead", "worker", "reviewer"}) {
+	if got := slugs(snap.Profiles); !slices.Equal(got, []string{"head", "lead", "worker", model.FreeWorkerProfile, "reviewer"}) {
 		t.Fatalf("profiles %v", got)
 	}
 	for _, p := range snap.Profiles {
@@ -261,7 +261,7 @@ func TestProfileCRUD(t *testing.T) {
 
 	// Everything survives a daemon restart.
 	f2 := e.started()
-	if lead2, _ := f2.GetProfile("lead"); !reflect.DeepEqual(lead2.CanLaunch, []string{"worker", "reviewer"}) {
+	if lead2, _ := f2.GetProfile("lead"); !reflect.DeepEqual(lead2.CanLaunch, []string{"worker", "reviewer", model.FreeWorkerProfile}) {
 		t.Fatalf("after restart: %+v", lead2.CanLaunch)
 	}
 }
@@ -283,7 +283,7 @@ func TestSetPolicyKeepsCustomLaunchRights(t *testing.T) {
 		t.Fatal(err)
 	}
 	lead, _ := f.GetProfile("lead")
-	if lead.Model != haiku || !slices.Equal(lead.CanLaunch, []string{"worker", "reviewer"}) {
+	if lead.Model != haiku || !slices.Equal(lead.CanLaunch, []string{"worker", "reviewer", model.FreeWorkerProfile}) {
 		t.Fatalf("lead %+v", lead)
 	}
 	lp.CanLaunch = nil
@@ -302,6 +302,10 @@ func TestUpdateAgent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Launch diagnostics are slices: edits and no-op detection must preserve them.
+	f.mu.Lock()
+	f.agents[w.ID].a.MCPWarnings = []string{"arc-desktop unavailable"}
+	f.mu.Unlock()
 	str := func(s string) *string { return &s }
 	if _, err := f.UpdateAgent(AgentCaller(w.ID), "w1", AgentPatch{Role: str("x")}); KindOf(err) != KindForbidden {
 		t.Fatal("agent edited an agent")
@@ -309,6 +313,9 @@ func TestUpdateAgent(t *testing.T) {
 	up, err := f.UpdateAgent(OwnerCaller, "w1", AgentPatch{Role: str("tests"), Brief: str("cover the API")})
 	if err != nil || !up.Changed || !up.RestartNeeded || up.Agent.Role != "tests" || up.Note != "Saved; applies on restart." {
 		t.Fatalf("update: %+v %v", up, err)
+	}
+	if len(up.Agent.MCPWarnings) != 1 || up.Agent.MCPWarnings[0] != "arc-desktop unavailable" {
+		t.Fatalf("edit lost MCP diagnostics: %+v", up.Agent.MCPWarnings)
 	}
 	if up, _ := f.UpdateAgent(OwnerCaller, "w1", AgentPatch{Role: str("tests")}); up.Changed || up.RestartNeeded {
 		t.Fatalf("no-op: %+v", up)
@@ -351,6 +358,56 @@ func TestUpdateAgent(t *testing.T) {
 }
 
 // Agents stored before profiles get the built-in profile of their level.
+// Profiles and the policy are the owner's and the head's (17 Nov 22:18: "The head can do
+// everything"); a lead, a worker, a paired machine and Companion change none of it.
+func TestHeadManagesProfiles(t *testing.T) {
+	e := newEnv(t)
+	f := e.started()
+	f.CreateProject(OwnerCaller, ProjectRequest{Name: "alpha"})
+	head, lead := AgentCaller(mustAgent(t, f, "head").ID), AgentCaller(mustAgent(t, f, "alpha-lead").ID)
+	w, err := f.LaunchAgent(lead, LaunchRequest{Name: "w1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	custom := model.Profile{Slug: "docs", Name: "Docs", Level: model.LevelWorker, Model: haiku, Instructions: "Write docs."}
+	for name, c := range map[string]Caller{"lead": lead, "worker": AgentCaller(w.ID), "peer": PeerCaller("hostb"), "companion": CompanionCaller} {
+		if _, err := f.CreateProfile(c, custom); KindOf(err) != KindForbidden {
+			t.Errorf("%s created a profile: %v", name, err)
+		}
+		cur, _ := f.GetProfile("worker")
+		cur.Instructions = "changed"
+		if _, err := f.UpdateProfile(c, "worker", cur); KindOf(err) != KindForbidden {
+			t.Errorf("%s changed a profile: %v", name, err)
+		}
+		if _, err := f.ResetProfile(c, "worker"); KindOf(err) != KindForbidden {
+			t.Errorf("%s reset a profile: %v", name, err)
+		}
+		if err := f.DeleteProfile(c, "reviewer"); KindOf(err) != KindForbidden {
+			t.Errorf("%s deleted a profile: %v", name, err)
+		}
+		if _, err := f.SetPolicy(c, f.Policy()); KindOf(err) != KindForbidden {
+			t.Errorf("%s changed the policy: %v", name, err)
+		}
+	}
+	if got, err := f.CreateProfile(head, custom); err != nil || got.Slug != "docs" {
+		t.Fatalf("the head creates a profile: %+v %v", got, err)
+	}
+	cur, _ := f.GetProfile("worker")
+	cur.Instructions, cur.ReadOnly = "You are {{name}}. Say what you did, then stop.", true
+	if got, err := f.UpdateProfile(head, "worker", cur); err != nil || got.Instructions != cur.Instructions || !got.ReadOnly {
+		t.Fatalf("the head changes a profile: %+v %v", got, err)
+	}
+	if got, err := f.ResetProfile(head, "worker"); err != nil || got.ReadOnly {
+		t.Fatalf("the head resets a profile: %+v %v", got, err)
+	}
+	if err := f.DeleteProfile(head, "docs"); err != nil {
+		t.Fatalf("the head deletes a profile: %v", err)
+	}
+	if _, err := f.SetPolicy(head, f.Policy()); err != nil {
+		t.Fatalf("the head sets the policy: %v", err)
+	}
+}
+
 func TestAgentsWithoutProfileGetTheirLevel(t *testing.T) {
 	e := newEnv(t)
 	now := model.Now()

@@ -5,8 +5,11 @@ import "testing"
 // Hostb's log (3 Nov): `tmx slot -- <command>` (the heavy-command slot) was blocked as an owner
 // command. The guard now checks the wrapped command instead; other tmx commands are unchanged.
 func TestTmxSlotChecksTheWrappedCommand(t *testing.T) {
+	// Both rules are Allowed by default since defaults version 2; the owner holds them here.
+	states := DefaultStates()
+	states[RuleElevation], states[RuleTmxCLI] = Hold, Hold
 	ctx := Context{OS: "linux", Home: "/home/dev", Own: "/home/dev/work/app", Workspace: "/home/dev/work",
-		StateDir: "/home/dev/.local/state/tmx-go", Temp: []string{"/tmp"}, States: DefaultStates()}
+		StateDir: "/home/dev/.local/state/tmx-go", Temp: []string{"/tmp"}, States: states}
 	for _, tc := range []struct {
 		cmd  string
 		want Outcome

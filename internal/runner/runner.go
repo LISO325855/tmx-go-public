@@ -56,6 +56,9 @@ type Spec struct {
 	Harness         model.Harness
 	Mode            model.Mode
 	Command         string // executable path; "" = look up the harness on PATH
+	Provider        string
+	OpenCodeDataDir string
+	OpenCodeBaseURL string // optional OpenCode provider URL; Fae defaults to model.FaeBaseURL
 	Model           string // "" = harness default
 	Cwd             string
 	Env             []string // extra KEY=VALUE pairs (TMXG_URL, TMXG_AGENT_ID, TMXG_AGENT_TOKEN, ...)
@@ -63,22 +66,31 @@ type Spec struct {
 	PermissionMode  string   // claude --permission-mode
 	CodexFullAccess bool
 	AgyFullAccess   bool
+
+	FaeRuntimeContextCap int // tokens; zero uses the default
+
 	// CodexWindowsSandbox: Codex's own sandbox on Windows. Nothing sets it today (there is no
 	// config key or API field for it): Windows Codex runs unsandboxed, see harness.CodexPolicy.
 	CodexWindowsSandbox bool
 	// CodexGuardHome/Executable are set only by the daemon's Windows parity
 	// adapter. Runners must prepare and pin the configuration before spawning.
 	CodexGuardHome       string
+	AgentMachine         bool
 	CodexGuardExecutable string
 	// GuardStates returns the owner's current state per guard rule (block | hold | allow); the
 	// Codex parser calls it on every check, so a flip applies to running agents at once.
-	GuardStates     func() map[string]string
-	MCPConfigPath   string   // claude --mcp-config (written by fleet)
-	SettingsPath    string   // claude --settings: the guard's PreToolUse hook (written by fleet)
-	AllowedTools    []string // claude --allowedTools
-	DisallowedTools []string // claude --disallowedTools
-	SystemPrompt    string   // claude --append-system-prompt
-	InitialPrompt   string   // agy: first turn passed with -i, not typed a second time
+	GuardStates      func() map[string]string
+	MCPConfigPath    string   // claude --mcp-config (written by fleet)
+	SettingsPath     string   // claude --settings: the guard's PreToolUse hook (written by fleet)
+	AllowedTools     []string // claude --allowedTools
+	DisallowedTools  []string // claude --disallowedTools
+	SystemPrompt     string   // claude --append-system-prompt
+	SystemPromptFile string   // full oversized instructions; native file input where supported
+	InitialPrompt    string   // agy: first turn passed with -i, not typed a second time
+	// ProjectSource would start claude with the "project" setting source. The fleet never sets
+	// it (fleet/project_memory.go says why); it stays only so that the argument builder and its
+	// test keep stating that no other source can ever be named.
+	ProjectSource bool
 	// AddDirs are extra folders the agent may read and edit (claude --add-dir), e.g. its uploads.
 	AddDirs    []string
 	ExtraArgs  []string
@@ -87,7 +99,8 @@ type Spec struct {
 	// MCP is the tmx MCP server for harnesses configured on the command line or by env
 	// (codex, opencode); its env values are in Env, only the names are passed (EnvKeys).
 	// SystemPrompt goes to codex as developer instructions.
-	MCP *MCPServer
+	MCP        *MCPServer
+	ProfileMCP map[string]MCPServer // profile-selected stdio servers; never includes tmxg
 
 	LowPriority bool // start the process tree at lower CPU and disk I/O priority (every harness)
 
@@ -113,6 +126,21 @@ var ErrNoHost = errors.New("no session host")
 // on the same conversation: check again later.
 var ErrHostUnknown = errors.New("the session host could not be checked")
 
+// ErrHostRepaint identifies a verified legacy terminal that did not produce a usable
+// screen after resize. Fleet may end that host and resume once per handover.
+var ErrHostRepaint = errors.New("terminal did not repaint after resize")
+
+// ErrHostSilent accompanies ErrHostRepaint only after a complete observation
+// window with no PTY output. It is not inferred from an unrecognized screen.
+var ErrHostSilent = errors.New("no PTY output during repaint wait")
+
+// ErrHostMode: the session host is there, but it runs the agent in its OTHER mode: a chat
+// runner found the harness's own screen (a terminal) in the host, or the terminal runner found
+// a chat process (pipes). A live switch (chat <-> the harness's screen) is not stored, so the
+// daemon that comes after one finds the host in a mode it did not expect. The host was left as
+// it is; the caller reattaches in the other mode.
+var ErrHostMode = errors.New("the session host runs the agent in its other mode")
+
 // Reattacher is implemented by runners whose processes can outlive the daemon: Reattach
 // connects to the one an earlier daemon left running for spec, and returns the credential it
 // was started with. An error (ErrNoHost: there is none) means: start it instead.
@@ -134,10 +162,11 @@ const (
 	EvApproval EventKind = "approval" // the harness asks permission; answer with Process.Answer
 	// EvApprovalCancelled: the harness withdrew a request (Approval.ID set); the fleet expires it.
 	EvApprovalCancelled EventKind = "approval_cancelled"
-	EvSession           EventKind = "session" // SessionID known (new or confirmed)
-	EvUsage             EventKind = "usage"   // CostUSD / Turns totals for the conversation so far
-	EvOutput            EventKind = "output"  // terminal bytes
-	EvExit              EventKind = "exit"    // process ended; the channel is closed right after
+	EvSession           EventKind = "session"  // SessionID known (new or confirmed)
+	EvUsage             EventKind = "usage"    // CostUSD / Turns totals for the conversation so far
+	EvOutput            EventKind = "output"   // terminal bytes
+	EvProgress          EventKind = "progress" // meaningful terminal text changed, excluding redraws/spinners
+	EvExit              EventKind = "exit"     // process ended; the channel is closed right after
 )
 
 // EvRateLimit: the harness says a limit of the owner's plan stopped it (RateLimit set; Claude's
@@ -168,6 +197,20 @@ type MailSender interface {
 	SendMail(text string, ids []string) error
 }
 
+// LaunchPromptSender delivers a new launch's first turn once the harness can
+// submit it. Other turns continue to use the ordinary process paths.
+type LaunchPromptSender interface {
+	SendLaunchPrompt(text string) error
+}
+
+// Interjector is a process that can take the owner's words in the middle of a turn: typed into
+// a harness's own screen while it works, where the harness queues them for its next step (as
+// typing into Claude Code while it works). Like SendMail, the write is reported asynchronously;
+// where typing is not safe at that moment the text waits for the input box as mail does.
+type Interjector interface {
+	Interject(text string, ids []string) error
+}
+
 // RateLimit is a harness's report that a limit of the owner's plan was hit.
 type RateLimit struct {
 	Status   string // the harness's word: rejected, …
@@ -179,6 +222,7 @@ type RateLimit struct {
 type MCPServer struct {
 	Command string
 	Args    []string
+	Env     map[string]string
 	EnvKeys []string // variables (set in Spec.Env) the server needs
 }
 
@@ -272,4 +316,18 @@ func (b ByHarness) Start(ctx context.Context, spec Spec) (Process, error) {
 		return nil, fmt.Errorf("no %s runner for harness %q", spec.Mode, h)
 	}
 	return r.Start(ctx, spec)
+}
+
+// MailDiagnoser exposes only the stage of an outstanding terminal handoff, never
+// its text. Implementations must not wait for the input or process write lock.
+type MailDiagnoser interface {
+	MailStage(messageID string) string
+	ForgetMailStage(messageID string)
+}
+
+// MailProgressDiagnoser returns an atomic stage and its start time (Unix milliseconds).
+// A queue's age must never be used as the duration of a later write stage.
+// Like MailDiagnoser, this must remain readable while a write lock is blocked.
+type MailProgressDiagnoser interface {
+	MailProgress(messageID string) (stage string, since int64)
 }

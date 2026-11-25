@@ -1,8 +1,9 @@
-// public-release builds and publishes headless fleet releases. It never reads a private key.
+// public-release builds and publishes fleet releases. It never reads a private key.
 package main
 
 import (
 	"crypto/sha256"
+	"debug/pe"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -21,6 +22,10 @@ import (
 
 var platforms = []string{"darwin/amd64", "darwin/arm64", "linux/amd64", "windows/amd64"}
 
+func windowsDesktopName(tag string) string { return "tmxg-desktop_" + tag + "_windows_amd64.exe" }
+
+func windowsHeadlessName(tag string) string { return "tmxg_" + tag + "_windows_amd64.exe" }
+
 func names(tag string) []string {
 	var out []string
 	for _, p := range platforms {
@@ -30,7 +35,7 @@ func names(tag string) []string {
 		}
 		out = append(out, n)
 	}
-	return out
+	return append(out, windowsDesktopName(tag))
 }
 
 func validTag(tag string) bool {
@@ -40,11 +45,12 @@ func validTag(tag string) bool {
 
 func checksums(dir, tag string) ([]byte, error) {
 	var sums strings.Builder
+	windowsHashes := make(map[string]string, 2)
 	for _, name := range names(tag) {
 		p := filepath.Join(dir, name)
 		info, err := os.Lstat(p)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("required release asset %s: %w", name, err)
 		}
 		if !info.Mode().IsRegular() || info.Size() == 0 {
 			return nil, fmt.Errorf("%s must be a nonempty regular file", name)
@@ -59,9 +65,39 @@ func checksums(dir, tag string) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		fmt.Fprintf(&sums, "%s  %s\n", hex.EncodeToString(h.Sum(nil)), name)
+		digest := hex.EncodeToString(h.Sum(nil))
+		if name == windowsHeadlessName(tag) || name == windowsDesktopName(tag) {
+			windowsHashes[name] = digest
+		}
+		fmt.Fprintf(&sums, "%s  %s\n", digest, name)
+	}
+	headless, desktop := windowsHeadlessName(tag), windowsDesktopName(tag)
+	if windowsHashes[headless] == windowsHashes[desktop] {
+		return nil, fmt.Errorf("%s and %s have identical SHA-256 hashes", headless, desktop)
+	}
+	if err := checkSubsystem(dir, headless, pe.IMAGE_SUBSYSTEM_WINDOWS_CUI); err != nil {
+		return nil, err
+	}
+	if err := checkSubsystem(dir, desktop, pe.IMAGE_SUBSYSTEM_WINDOWS_GUI); err != nil {
+		return nil, err
 	}
 	return []byte(sums.String()), nil
+}
+
+func checkSubsystem(dir, name string, want uint16) error {
+	f, err := pe.Open(filepath.Join(dir, name))
+	if err != nil {
+		return fmt.Errorf("%s: cannot read PE headers: %w", name, err)
+	}
+	defer f.Close()
+	header, ok := f.OptionalHeader.(*pe.OptionalHeader64)
+	if !ok {
+		return fmt.Errorf("%s: missing PE32+ optional header", name)
+	}
+	if header.Subsystem != want {
+		return fmt.Errorf("%s: PE subsystem %d, expected %d", name, header.Subsystem, want)
+	}
+	return nil
 }
 
 func verify(dir, tag, sigPath, pinsPath string) error {
@@ -99,7 +135,7 @@ func verify(dir, tag, sigPath, pinsPath string) error {
 		return err
 	}
 	if string(want) != string(sums) {
-		return errors.New("SHA256SUMS differs from the four release binaries (or is not canonical)")
+		return errors.New("SHA256SUMS differs from the required headless and Windows desktop binaries (or is not canonical)")
 	}
 	return nil
 }
@@ -130,6 +166,12 @@ func build(dir, tag string) error {
 		if err := c.Run(); err != nil {
 			return err
 		}
+	}
+	if err := run("make", "app-windows", "VERSION="+tag); err != nil {
+		return fmt.Errorf("build Windows desktop asset: %w", err)
+	}
+	if err := copyFile(filepath.Join("build", "bin", "tmxg.exe"), filepath.Join(dir, windowsDesktopName(tag))); err != nil {
+		return fmt.Errorf("stage Windows desktop asset: %w", err)
 	}
 	sums, err := checksums(dir, tag)
 	if err != nil {
@@ -163,7 +205,7 @@ func publish(dir, tag, sigPath, pinsPath string) error {
 		return err
 	}
 	// --verify-tag requires a pre-existing public tag, established by the release operator.
-	args := []string{"release", "create", tag, "--repo", config.PublicUpdateRepo, "--verify-tag", "--draft", "--title", tag, "--notes", "Signed fleet headless binaries. Verify SHA256SUMS.sig against your pinned fleet release key before installing."}
+	args := []string{"release", "create", tag, "--repo", config.PublicUpdateRepo, "--verify-tag", "--draft", "--title", tag, "--notes", "Signed fleet binaries, including the Windows desktop app. Verify SHA256SUMS.sig against your pinned fleet release key before installing."}
 	if strings.Contains(tag, "-rc") {
 		args = append(args, "--prerelease")
 	}
@@ -213,9 +255,9 @@ func copyFile(src, dst string) error {
 }
 
 func main() {
-	mode := flag.String("mode", "verify", "build, verify, or publish")
+	mode := flag.String("mode", "verify", "build, checksums, verify, or publish")
 	tag := flag.String("tag", "", "fleet release tag")
-	dir := flag.String("dir", "release-dist", "directory containing the four binaries and SHA256SUMS")
+	dir := flag.String("dir", "release-dist", "directory containing the headless and Windows desktop binaries and SHA256SUMS")
 	sig := flag.String("sig", "", "already-made detached SHA256SUMS.sig")
 	pins := flag.String("pins", "", "trusted public pin JSON: {fleet_keys, require}; never private key material")
 	flag.Parse()
@@ -223,12 +265,18 @@ func main() {
 	switch *mode {
 	case "build":
 		err = build(*dir, *tag)
+	case "checksums":
+		var sums []byte
+		sums, err = checksums(*dir, *tag)
+		if err == nil {
+			_, err = os.Stdout.Write(sums)
+		}
 	case "verify":
 		err = verify(*dir, *tag, *sig, *pins)
 	case "publish":
 		err = publish(*dir, *tag, *sig, *pins)
 	default:
-		err = errors.New("mode must be build, verify, or publish")
+		err = errors.New("mode must be build, checksums, verify, or publish")
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)

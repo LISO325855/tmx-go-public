@@ -39,6 +39,8 @@ func TestOnlyRememberableRulesAreRemembered(t *testing.T) {
 				return f.HoldP2P(me, ToolP2PInvite, "Create an invite")
 			case guard.RuleP2PJoin:
 				return f.HoldP2P(me, ToolP2PJoin, "Join another tmx")
+			case guard.RuleP2PInviteWA:
+				return f.HoldP2P(me, ToolP2PInviteWA, "Send a join invite by WhatsApp")
 			default:
 				return f.Hold(me, req)
 			}
@@ -65,12 +67,54 @@ func TestOnlyRememberableRulesAreRemembered(t *testing.T) {
 	}
 	// The 9 Sep class and the lockout rows are among them, by name.
 	for _, id := range []string{guard.RuleDisk, guard.RuleDeleteRoot, guard.RulePermsRoot, guard.RuleBoot, guard.RulePermsOutside,
-		guard.RuleElevation, guard.RuleHelloKey, guard.RuleNetwork, guard.RuleTmxCLI, guard.RuleBrowserScript} {
+		guard.RuleElevation, guard.RuleHelloKey, guard.RuleNetwork, guard.RuleTmxCLI, guard.RuleBrowserUnsafe,
+		guard.RuleP2PInvite, guard.RuleP2PJoin, guard.RuleP2PInviteWA} {
 		if guard.Rememberable[id] {
 			t.Errorf("%s is rememberable", id)
 		}
 	}
-	if checked < 10 {
+	if checked < 9 {
 		t.Fatalf("only %d rules checked", checked)
+	}
+}
+
+// A scripted browser run asks once (17 Nov): the script the owner allowed runs again without a
+// card; another script, another folder or another kind of agent still asks.
+func TestScriptedBrowserHoldIsRememberedAfterOneAllow(t *testing.T) {
+	e := newEnv(t)
+	f := e.started()
+	head := mustAgent(t, f, "head")
+	me := callerFor(t, f, e.chat, head.ID)
+	heldRule(t, f, guard.RuleBrowserScript) // no rule is held by default (build5's guard): the owner set this one to Held
+	run := HoldRequest{Tool: "Bash", Command: "npx playwright test e2e/login.spec.ts", Rule: guard.RuleBrowserScript, Cwd: "/w"}
+	first, err := f.Hold(me, run)
+	if err != nil || first.State != model.ApprovalPending {
+		t.Fatalf("the first run brings a card: %+v %v", first, err)
+	}
+	if _, err := f.Decide(OwnerCaller, first.ID, DecideRequest{Decision: "allow"}); err != nil {
+		t.Fatal(err)
+	}
+	second, err := f.Hold(me, run)
+	if err != nil || second.State != model.ApprovalAllowed || second.Answer != AnswerSame {
+		t.Fatalf("the same script again: %+v %v", second, err)
+	}
+	other := run
+	other.Command = "npx playwright test e2e/checkout.spec.ts"
+	if h, _ := f.Hold(me, other); h.State != model.ApprovalPending {
+		t.Fatal("another script ran without a card")
+	}
+	elsewhere := run
+	elsewhere.Cwd = "/other"
+	if h, _ := f.Hold(me, elsewhere); h.State != model.ApprovalPending {
+		t.Fatal("the same script in another folder ran without a card")
+	}
+	// A denied script is not remembered.
+	denied := HoldRequest{Tool: "Bash", Command: "node scrape.js --remote-debugging-port=9222", Rule: guard.RuleBrowserScript, Cwd: "/w"}
+	d1, _ := f.Hold(me, denied)
+	if _, err := f.Decide(OwnerCaller, d1.ID, DecideRequest{Decision: "deny"}); err != nil {
+		t.Fatal(err)
+	}
+	if h, _ := f.Hold(me, denied); h.State != model.ApprovalPending {
+		t.Fatal("a denied script ran without a card")
 	}
 }

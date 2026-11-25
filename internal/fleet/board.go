@@ -30,7 +30,7 @@ const boardRules = `The owner follows your conversation on a board of topics. A 
 	`and read a topic's log with mcp__tmxg__thread_read before you work on it.`
 
 const (
-	maxThreadTitle = 80
+	maxThreadTitle = 400 // 80 until 17 Nov
 	cardText       = 600
 	cardNote       = 300
 )
@@ -683,17 +683,38 @@ func (f *Fleet) FileTurn(c Caller, title string) (model.Thread, []string, error)
 func splitTurns(entries []model.TimelineEntry) [][]model.TimelineEntry {
 	var turns [][]model.TimelineEntry
 	prevStart := false
+	cur := -1         // the turn that is running
+	var waiting []int // the owner's messages that came in the middle of it, each a turn of its own
 	for _, e := range entries {
 		start := e.Kind == model.EntryUser || e.Kind == model.EntryMessageIn
+		if start && interjected(e) && cur >= 0 {
+			// The owner wrote while the head was in a turn (mail.go deliverOwner): his message is a
+			// card of its own, and what the head goes on to say still belongs to the turn that
+			// was running, until that turn's result.
+			turns = append(turns, []model.TimelineEntry{e})
+			waiting = append(waiting, len(turns)-1)
+			continue
+		}
 		if start && !prevStart {
 			turns = append(turns, nil)
+			cur = len(turns) - 1
 		}
 		prevStart = start
-		if len(turns) > 0 {
-			turns[len(turns)-1] = append(turns[len(turns)-1], e)
+		if cur >= 0 {
+			turns[cur] = append(turns[cur], e)
+		}
+		if e.Kind == model.EntryResult && len(waiting) > 0 {
+			cur, waiting = waiting[0], waiting[1:] // what follows answers the message that waited
+			prevStart = false                      // and a new message after it opens a turn of its own
 		}
 	}
 	return turns
+}
+
+// interjected: an owner's message that reached the head while it was in the middle of a turn.
+func interjected(e model.TimelineEntry) bool {
+	v, _ := e.Meta["interjected"].(bool)
+	return v
 }
 
 // summarize makes a turn's card.

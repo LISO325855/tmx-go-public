@@ -8,7 +8,10 @@ import { ApprovalActions, type ApprovalActionsHandle, ApprovalBody, approvalHead
 import { guardOf } from "@/components/guard";
 import { HandToCompanion } from "@/components/companion/approval";
 import { EmptyState, PageBody, PageHeader, PageTitle } from "@/components/page";
+import { TurnDeck } from "@/components/phone/turn-deck";
 import { StateDot } from "@/components/state";
+import { useClassic } from "@/hooks/use-classic";
+import { usePhoneClassic } from "@/hooks/use-phone-classic";
 import { isTyping } from "@/hooks/use-hotkeys";
 import { useNow } from "@/hooks/use-now";
 import { absoluteTime, relativeTime } from "@/lib/format";
@@ -17,6 +20,7 @@ import { harnessLabel, terminalMenuOf } from "@/lib/harness";
 import { href, paths } from "@/lib/router";
 import { pendingApprovals, useStore } from "@/lib/store";
 import { cardAnswerKey, useCardSends, cardsWithSavedAnswers, useCardAnswers, useCardDrafts } from "@/lib/card-answers";
+import { filterCardGroups, groupCardsByProject, projectChips } from "@/lib/card-choices";
 import type { Agent, Approval } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -32,12 +36,18 @@ function ApprovalCard({
   selected,
   onSelect,
   actionsRef,
+  showAgent,
+  roomy,
 }: {
   a: Approval;
   agent?: Agent;
   selected: boolean;
   onSelect: () => void;
   actionsRef?: React.Ref<ApprovalActionsHandle>;
+  /** classic: the cards sit under their project, so each one names its agent */
+  showAgent?: boolean;
+  /** the card has the screen to itself (a phone's Your turn): nothing is folded to a few lines */
+  roomy?: boolean;
 }) {
   const menu = terminalMenuOf(a);
   const Icon = menu
@@ -84,13 +94,21 @@ function ApprovalCard({
                 ? "the agent asks you to send this"
                 : "about a task tmx handed it"
               : approvalHeadline(a)}</span>
-        <span className="tabular ml-auto shrink-0 text-2xs text-subtle-foreground" title={absoluteTime(a.created_at)}>
-          {relativeTime(a.created_at)}
+        <span className="tabular ml-auto flex shrink-0 items-center gap-2 text-2xs text-subtle-foreground">
+          {showAgent && (
+            <a href={href(paths.agent(a.agent_id))} className="max-w-[12rem] truncate text-muted-foreground hover:text-foreground hover:underline" data-card-agent>
+              {agent?.name ?? a.agent_id}
+            </a>
+          )}
+          <span title={absoluteTime(a.created_at)}>{relativeTime(a.created_at)}</span>
         </span>
       </header>
       <div className="space-y-3 px-4 pt-2.5 pb-3.5">
-        <ApprovalBody a={a} agent={agent} compact />
-        <ApprovalActions ref={actionsRef} a={a} showKeys={selected} />
+        <ApprovalBody a={a} agent={agent} compact={!roomy} />
+        {/* data-card-actions: a phone sizes these buttons as thumb targets (index.css, "Your turn on that phone") */}
+        <div data-card-actions>
+          <ApprovalActions ref={actionsRef} a={a} showKeys={selected} />
+        </div>
         {a.kind === "guard" && <GuardFootnote />}
         <HandToCompanion a={a} />
       </div>
@@ -106,6 +124,9 @@ export function InboxPage() {
   const drafts = useCardDrafts((s) => s.items);
   const agents = useStore((s) => s.agents);
   const projects = useStore((s) => s.projects);
+  const classic = useClassic();
+  // Classic on a phone: Python's Your turn, one card per screen (components/phone/turn-deck.tsx).
+  const phone = usePhoneClassic();
   useNow(20_000);
   const list = useMemo(() => {
     const merged = cardsWithSavedAnswers(approvals, scope, pendingAnswers, drafts);
@@ -123,10 +144,23 @@ export function InboxPage() {
     }
     return [...m.values()];
   }, [list, agents]);
-  const flat = useMemo(() => groups.flatMap((g) => g.items), [groups]);
+  // Classic (Python's "Your turn"): the cards by project, with chips to show one project.
+  const byProject = useMemo(() => groupCardsByProject(list, agents, projects), [list, agents, projects]);
+  const chips = useMemo(() => projectChips(byProject), [byProject]);
+  const [chip, setChip] = useState<string | null>(null);
+  const shownProjects = useMemo(() => filterCardGroups(byProject, chip), [byProject, chip]);
+  // the chip in force: a chip whose project has no cards left falls back to all projects
+  const activeChip = chip !== null && byProject.some((g) => g.key === chip) ? chip : null;
+  const flat = useMemo(() => (classic ? shownProjects.flatMap((g) => g.items) : groups.flatMap((g) => g.items)), [classic, shownProjects, groups]);
 
   const initial = new URLSearchParams(window.location.hash.split("?")[1] ?? "").get("id");
   const [sel, setSel] = useState<string | null>(initial);
+  // A link to a card that arrives while this page is open: no project chip may hide that card.
+  const [linked, setLinked] = useState(initial);
+  if (initial !== linked) {
+    setLinked(initial);
+    if (initial) setChip(null);
+  }
   const selected = flat.find((a) => a.id === sel) ?? flat[0];
   const actions = useRef<ApprovalActionsHandle>(null);
 
@@ -165,15 +199,37 @@ export function InboxPage() {
     <div className="flex min-h-0 flex-1 flex-col">
       <PageHeader>
         <OwnerCardRecovery />
-        <PageTitle>Needs you</PageTitle>
+        <PageTitle>{classic ? "Your turn" : "Needs you"}</PageTitle>
         {list.length > 0 && <span className="tabular text-xs text-muted-foreground">{list.length} pending</span>}
-        {list.length > 1 && (
+        {!classic && list.length > 1 && (
           <span className="ml-auto hidden items-center gap-1.5 text-2xs text-subtle-foreground md:flex">
             <Kbd>J</Kbd>
             <Kbd>K</Kbd> to move · <Kbd>A</Kbd> allow · <Kbd>D</Kbd> deny
           </span>
         )}
       </PageHeader>
+      {phone ? (
+        <TurnDeck
+          cards={flat}
+          total={list.length}
+          chips={chips}
+          chip={activeChip}
+          onChip={setChip}
+          later={deferred}
+          agents={agents}
+          projects={projects}
+          initialId={initial}
+          renderCard={(a, agent) => <ApprovalCard key={a.id} a={a} agent={agent} selected={false} onSelect={() => {}} roomy />}
+          empty={
+            <EmptyState icon={CheckCircle2} title="Nothing needs you" className="border-none bg-transparent">
+              When an agent asks for permission or has a question for you, it shows up here.
+            </EmptyState>
+          }
+        >
+          <JobQuarantineCards />
+          {sendingCount > 0 && <p role="status" className="mb-3 text-sm text-muted-foreground">Sending {sendingCount === 1 ? "your saved answer" : `${sendingCount} saved answers`}? Your words stay saved until delivery is confirmed.</p>}
+        </TurnDeck>
+      ) : (
       <PageBody width="max-w-[51.25rem]">
         <JobQuarantineCards />
         {sendingCount > 0 && <p role="status" className="mb-4 text-sm text-muted-foreground">Sending {sendingCount === 1 ? "your saved answer" : `${sendingCount} saved answers`}? Your words stay saved until delivery is confirmed.</p>}
@@ -181,6 +237,59 @@ export function InboxPage() {
           <EmptyState icon={CheckCircle2} title="Nothing needs you" className="mt-6">
             When an agent asks for permission or has a question for you, it shows up here.
           </EmptyState>
+        ) : classic ? (
+          <>
+            {chips.length > 0 && (
+              <div className="mb-5 flex flex-wrap gap-1.5" role="group" aria-label="Projects" data-project-chips>
+                {chips.map((c) => {
+                  const on = c.key === activeChip;
+                  return (
+                    <button
+                      key={c.key ?? "*"}
+                      type="button"
+                      aria-pressed={on}
+                      onClick={() => setChip(c.key)}
+                      className={cn(
+                        "h-7 rounded-full border px-3 text-xs outline-none transition-colors duration-150 focus-visible:ring-2 focus-visible:ring-ring",
+                        on ? "border-brand/50 bg-brand-soft font-medium text-foreground" : "text-muted-foreground hover:bg-muted/50 hover:text-foreground",
+                      )}
+                    >
+                      {c.label}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+            <div className="space-y-8">
+              {shownProjects.map((g) => (
+                <section key={g.key || "no-project"} aria-label={g.name} data-card-project={g.key}>
+                  <div className="mb-2.5 flex items-center gap-2.5">
+                    {g.key ? (
+                      <a href={href(paths.project(g.key))} className="text-[0.8125rem] font-medium hover:underline">
+                        {g.name}
+                      </a>
+                    ) : (
+                      <span className="text-[0.8125rem] font-medium">{g.name}</span>
+                    )}
+                    {g.items.length > 1 && <span className="tabular ml-auto text-2xs text-subtle-foreground">{g.items.length} open</span>}
+                  </div>
+                  <div className="space-y-2.5">
+                    {g.items.map((a) => (
+                      <ApprovalCard
+                        key={a.id}
+                        a={a}
+                        agent={agents[a.agent_id]}
+                        selected={a.id === selected?.id}
+                        onSelect={() => setSel(a.id)}
+                        actionsRef={a.id === selected?.id ? actions : undefined}
+                        showAgent
+                      />
+                    ))}
+                  </div>
+                </section>
+              ))}
+            </div>
+          </>
         ) : (
           <div className="space-y-8">
             {groups.map((g) => {
@@ -222,6 +331,7 @@ export function InboxPage() {
           {deferred.map((a) => <ApprovalCard key={a.id} a={a} agent={agents[a.agent_id]} selected={false} onSelect={() => {}} />)}
         </section>}
       </PageBody>
+      )}
     </div>
   );
 }

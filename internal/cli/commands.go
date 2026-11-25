@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"net/http"
 	"os"
@@ -65,7 +66,7 @@ func cmdLs(e *env, args []string) error {
 
 func cmdProject(e *env, args []string) error {
 	if len(args) == 0 {
-		return usageErr("usage: tmx project new|ls|rm|import ...")
+		return usageErr("usage: tmx project new|ls|set|rm|import ...")
 	}
 	switch args[0] {
 	case "import":
@@ -90,6 +91,30 @@ func cmdProject(e *env, args []string) error {
 				return err
 			}
 			fmt.Fprintf(e.out, "project %s (%s) created in %s; lead %s-lead started\n", p.Name, p.Slug, p.Folder, p.Slug)
+			return nil
+		})
+	case "set":
+		fs := newFlags("project set")
+		lead := fs.String("lead", "", "the project's lead: an existing lead or head, name@host for a remote one, none for no lead")
+		pos, err := parse(fs, args[1:])
+		if err != nil {
+			return err
+		}
+		given := false
+		fs.Visit(func(fl *flag.Flag) { given = given || fl.Name == "lead" })
+		if len(pos) != 1 || !given {
+			return usageErr("usage: tmx project set PROJECT --lead NAME|NAME@HOST|none")
+		}
+		return withOwner(e, func(c *client.Client, cx context.Context) error {
+			var p model.Project
+			if err := ownerDo(e, c, cx, http.MethodPatch, "/api/projects/"+client.Seg(pos[0]), map[string]string{"lead": *lead}, &p); err != nil {
+				return err
+			}
+			if p.LeadID == "" {
+				fmt.Fprintf(e.out, "project %s has no lead now\n", p.Slug)
+			} else {
+				fmt.Fprintf(e.out, "project %s: lead is %s\n", p.Slug, *lead)
+			}
 			return nil
 		})
 	case "ls":
@@ -130,7 +155,7 @@ func cmdProject(e *env, args []string) error {
 			return nil
 		})
 	}
-	return usageErr("unknown project command %q (new, ls, rm, import)", args[0])
+	return usageErr("unknown project command %q (new, ls, set, rm, import)", args[0])
 }
 
 func cmdRun(e *env, args []string) error {
@@ -146,6 +171,7 @@ func cmdRun(e *env, args []string) error {
 	role := fs.String("role", "", "short role")
 	brief := fs.String("brief", "", "standing brief")
 	cwd := fs.String("cwd", "", "working folder")
+	conversation := fs.String("conversation", "", "resume this existing claude or codex conversation of the folder instead of starting a new one")
 	noWait := fs.Bool("no-wait", false, "over the machine's limits: refuse instead of queueing")
 	force := fs.Bool("force", false, "start even over the machine's limits")
 	pos, err := parse(fs, args)
@@ -153,10 +179,11 @@ func cmdRun(e *env, args []string) error {
 		return err
 	}
 	if len(pos) != 1 {
-		return usageErr("usage: tmx run NAME --project P [--profile P | --level worker] [--model M] [--mode M] [--harness H] [--account A] [--prompt TEXT]")
+		return usageErr("usage: tmx run NAME --project P [--profile P | --level worker] [--model M] [--mode M] [--harness H] [--account A] [--prompt TEXT] [--conversation ID]")
 	}
 	req := map[string]string{"name": pos[0], "project_id": *project, "level": *level, "profile": *profile, "model": *mdl,
-		"mode": *mode, "harness": *harness, "account": *account, "prompt": *prompt, "role": *role, "brief": *brief, "cwd": *cwd}
+		"mode": *mode, "harness": *harness, "account": *account, "prompt": *prompt, "role": *role, "brief": *brief, "cwd": *cwd,
+		"conversation_id": *conversation}
 	body := map[string]any{"no_wait": *noWait, "force": *force}
 	for k, v := range req {
 		if v != "" {
@@ -177,17 +204,19 @@ func cmdRun(e *env, args []string) error {
 }
 
 func cmdSend(e *env, args []string) error {
-	const usage = "usage: tmx send NAME [-f FILE]... TEXT..."
+	const usage = "usage: tmx send NAME [--as-agent] [-f FILE]... TEXT..."
 	if len(args) < 2 {
 		return usageErr(usage)
 	}
-	// Only -f/--file is an option; any other word (even one starting with "-") is text.
 	var files, words []string
+	var asAgent bool
 	for i := 1; i < len(args); i++ {
 		switch a := args[i]; {
 		case a == "--":
 			words = append(words, args[i+1:]...)
 			i = len(args)
+		case a == "--as-agent":
+			asAgent = true
 		case a == "-f" || a == "--file":
 			if i+1 >= len(args) {
 				return usageErr(usage)
@@ -203,8 +232,28 @@ func cmdSend(e *env, args []string) error {
 	if len(words) == 0 && len(files) == 0 {
 		return usageErr(usage)
 	}
-	return withOwner(e, func(c *client.Client, cx context.Context) error {
+	agent, err := managedAgentClient(asAgent)
+	if err != nil {
+		return err
+	}
+	if asAgent && agent == nil {
+		return fmt.Errorf("--as-agent requires the agent's TMXG_URL and TMXG_AGENT_TOKEN")
+	}
+	send := func(c *client.Client, cx context.Context) error {
+		if agent != nil && len(files) == 0 {
+			var m model.Message
+			if err := c.Post(cx, "/api/messages", map[string]string{"to": args[0], "body": strings.Join(words, " ")}, &m); err != nil {
+				return err
+			}
+			fmt.Fprintf(e.out, "message %s to %s: %s\n", m.ID, args[0], m.State)
+			return nil
+		}
 		ids := make([]string, 0, len(files))
+		uploadPath, sendPath := "/uploads", "/send"
+		if agent != nil {
+			uploadPath, sendPath = "/mail-uploads", "/mail"
+		}
+		base := "/api/agents/" + client.Seg(args[0])
 		for _, path := range files {
 			b, err := os.ReadFile(path)
 			if err != nil {
@@ -214,19 +263,25 @@ func cmdSend(e *env, args []string) error {
 				ID string `json:"id"`
 			}
 			body := map[string]string{"name": filepath.Base(path), "data": base64.StdEncoding.EncodeToString(b)}
-			if err := c.Post(cx, "/api/agents/"+client.Seg(args[0])+"/uploads", body, &up); err != nil {
+			if err := c.Post(cx, base+uploadPath, body, &up); err != nil {
 				return fmt.Errorf("%s: %w", path, err)
 			}
 			ids = append(ids, up.ID)
 		}
 		var m model.Message
 		req := map[string]any{"text": strings.Join(words, " "), "uploads": ids}
-		if err := c.Post(cx, "/api/agents/"+client.Seg(args[0])+"/send", req, &m); err != nil {
+		if err := c.Post(cx, base+sendPath, req, &m); err != nil {
 			return err
 		}
 		fmt.Fprintf(e.out, "message %s to %s: %s\n", m.ID, args[0], m.State)
 		return nil
-	})
+	}
+	if agent == nil {
+		return withOwner(e, send)
+	}
+	cx, cancel := ctx()
+	defer cancel()
+	return send(agent, cx)
 }
 
 func cmdAction(action string) cmdFunc {
@@ -294,7 +349,7 @@ func cmdApprovals(e *env, args []string) error {
 				if len(ap.Options) > 0 {
 					fmt.Fprintf(e.out, "  [%s]", strings.Join(ap.Options, " | "))
 				}
-				fmt.Fprintln(e.out)
+				fmt.Fprintf(e.out, "  (version %d)\n", ap.Version)
 				continue
 			}
 			if ap.Kind == model.ApprovalGuard {

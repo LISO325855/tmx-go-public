@@ -1,10 +1,12 @@
 package guard
 
 // The fixed parts of the owner's rule switches (3 Nov 22:14): what stays blocked whatever the
-// switch says. Pure string matching on the command; nothing is run or looked up.
+// switch says, and the browser rules. Pure string matching on the command; nothing is run or
+// looked up.
 
 import (
 	"encoding/json"
+	"path"
 	"regexp"
 	"strings"
 
@@ -108,11 +110,65 @@ func safeBrowserLaunch(command string) bool {
 	return bundledBrowser.MatchString(command) && !strings.Contains(strings.ToLower(command), "remote-debugging")
 }
 
-// checkBrowser applies the browser rule's state. Blocked: a launch is a Block, a mere mention a
-// Hold (its own switch). Held: a launch waits for the owner. Allowed: a direct launch passes
-// only when safe (else the fixed browser-unsafe-launch), scripted automation waits for the owner
-// (the fixed browser-unverified: a virtual authenticator can't be seen in a command line), a
-// mention passes.
+var (
+	psHereString = regexp.MustCompile(`(?s)@(['"])[ \t]*\r?\n.*?\r?\n[ \t]*(['"])@`)
+	psRunsText   = regexp.MustCompile(`(?i)\b(iex|invoke-expression|powershell(\.exe)?|pwsh(\.exe)?|cmd(\.exe)?)\b`)
+)
+
+// commandText is command as the shell runs it, for the browser rules: without the text a
+// command only carries along. That is the body of a heredoc (POSIX) or of a here-string
+// (PowerShell), which is a file's content or a script's source, not a command line: `python -
+// <<EOF`, `cat > notes.md <<EOF` and `Set-Content x @'...'@` writing the word "browser" launch
+// no browser (the owner, 17 Nov: his own held card). A heredoc fed to a shell stays: its lines are
+// commands. The other rules read heredocs their own way (analyzer.simple); this is only what
+// checkBrowser matches words in.
+func commandText(command string, sh Shell) string {
+	switch sh {
+	case ShellPowerShell:
+		if !strings.Contains(command, "@'") && !strings.Contains(command, `@"`) {
+			return command
+		}
+		if psRunsText.MatchString(command) {
+			return command // the text may be run (iex, a nested shell): keep every word
+		}
+		return psHereString.ReplaceAllString(command, "@$1$2@")
+	case ShellPOSIX:
+		if !strings.Contains(command, "<<") {
+			return command
+		}
+		var b strings.Builder
+		docs := false
+		for _, c := range lex(command, ShellPOSIX) {
+			b.WriteString(c.raw)
+			b.WriteByte('\n')
+			if c.heredoc == "" {
+				continue
+			}
+			docs = true
+			for _, w := range c.words {
+				if s, ok := w.literal(); ok && isShell(strings.TrimSuffix(strings.ToLower(path.Base(strings.ReplaceAll(s, `\`, "/"))), ".exe")) {
+					b.WriteString(c.heredoc)
+					break
+				}
+			}
+		}
+		if !docs {
+			return command // "<<" was something else (a here-string, arithmetic): match it whole
+		}
+		return b.String()
+	}
+	return command
+}
+
+// checkBrowser applies the browser rules' states to an actual launch: a browser executable, or
+// an automation library or tool that is the thing being run. browser-automation Blocked: a
+// launch is a Block. Held: it waits for the owner. Allowed: a direct launch passes only when
+// safe (else the fixed browser-unsafe-launch), scripted automation follows its own switch
+// (browser-unverified: a virtual authenticator can't be seen in a command line).
+//
+// A word is not a launch (the owner, 17 Nov: `go test -run TestBrowser...` was denied for its test
+// name). A browser word in an argument, a test name, a path, a commit message or file content
+// matches no rule, whatever the states are; the former rule browser-mention is gone.
 func checkBrowser(ctx Context, command string) Verdict {
 	state := ctx.StateOf(RuleBrowser)
 	if ctx.States == nil && ctx.AllowBrowserAutomation {
@@ -123,7 +179,11 @@ func checkBrowser(ctx Context, command string) Verdict {
 		switch state {
 		case Allow:
 			if scriptedBrowser.MatchString(command) || !directBrowser.MatchString(command) {
-				return ruleVerdict(RuleBrowserScript, "scripted browser automation")
+				v := ruleVerdict(RuleBrowserScript, "scripted browser automation")
+				if v.Outcome = ctx.StateOf(RuleBrowserScript); v.Outcome == Allow {
+					return Verdict{Outcome: Allow}
+				}
+				return v
 			}
 			if !safeBrowserLaunch(command) {
 				return ruleVerdict(RuleBrowserUnsafe, "a browser launch without the bundled Chromium and the WebAuthn flag")
@@ -135,15 +195,8 @@ func checkBrowser(ctx Context, command string) Verdict {
 			return v
 		}
 		return ruleVerdict(RuleBrowser, "")
-	case agentpolicy.BrowserMention:
-		if state == Allow {
-			return Verdict{Outcome: Allow}
-		}
-		v := ruleVerdict(RuleBrowserMention, "")
-		v.Outcome = ctx.StateOf(RuleBrowserMention)
-		return v
 	}
-	return Verdict{Outcome: Allow}
+	return Verdict{Outcome: Allow} // agentpolicy.BrowserMention included: a word, not a launch
 }
 
 func ruleVerdict(id, detail string) Verdict {

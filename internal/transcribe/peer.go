@@ -67,7 +67,28 @@ func (s *Service) diskCheck(dir string, bytes int64) error {
 	return nil
 }
 
-// spoolPeer keeps direct requests outside tmp (which Start removes). The source
+// Dictation uses a request-scoped endpoint, never the recording upload/spool protocol.
+// Optional for older peer implementations: refuse rather than retaining microphone audio.
+type dictationPeer interface {
+	DictatePeer(context.Context, string, []byte, string) (Result, error)
+}
+
+func (s *Service) dictatePeer(ctx context.Context, wav []byte, language string) (Result, error) {
+	if ctx.Value(localOnlyKey{}) == true {
+		return Result{}, fmt.Errorf("%w: fleet routing is disabled for a local-only request", ErrNotSetUp)
+	}
+	peer, ok := s.o.Peer.(dictationPeer)
+	if !ok {
+		return Result{}, fmt.Errorf("%w: peer does not support non-retained dictation", ErrNotSetUp)
+	}
+	result, err := peer.DictatePeer(ctx, s.ViaPeer(), wav, language)
+	if err == nil && strings.TrimSpace(result.Text) == "" {
+		err = ErrNoSpeech
+	}
+	return result, err
+}
+
+// spoolPeer keeps file uploads outside tmp (which Start removes). Dictation never uses it. The source
 // row and file survive request cancellation, network loss, and daemon restart.
 func (s *Service) spoolPeer(ctx context.Context, r io.Reader, kind, language string) (Result, error) {
 	if ctx.Value(localOnlyKey{}) == true {

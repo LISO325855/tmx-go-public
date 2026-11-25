@@ -37,6 +37,9 @@ func TestLoadDefaultsAndSave(t *testing.T) {
 	if c.Port != DefaultPort || c.Machine == "" || c.Workspace == "" {
 		t.Fatalf("defaults not filled: %+v", c)
 	}
+	if c.AgentMachine {
+		t.Fatal("agent_machine must default to false")
+	}
 	if _, err := os.Stat(p.ConfigFile()); err != nil {
 		t.Fatalf("config.json not written: %v", err)
 	}

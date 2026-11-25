@@ -76,7 +76,7 @@ func TestP2PAgentFilesAPI(t *testing.T) {
 		t.Fatal(err)
 	}
 	put(filepath.Join(aa.Cwd, ".ssh", "id_ed25519"), "private-key fixture")
-	for _, path := range []string{"../outside.txt", "..\\outside.txt", filepath.Join(t.TempDir(), "outside.txt"), "report.txt:secret", ".env", ".ssh/id_ed25519", "AppData/Local/gh/hosts.yml", "client-credentials.json", "my-secret.txt", "hosts.yml", "signature.pdf", "run.ps1", "secrets/key.txt", ".git/config", filepath.Join(a.Home, "config.json")} {
+	for _, path := range []string{"../outside.txt", "..\\outside.txt", filepath.Join(t.TempDir(), "outside.txt"), "report.txt:secret", ".env", ".ssh/id_ed25519", "AppData/Local/gh/hosts.yml", "client-credentials.json", "my-secret.txt", "hosts.yml", "secrets/key.txt", ".git/config", filepath.Join(a.Home, "config.json")} {
 		if code := ac.do("POST", "/api/p2p/files/send", api.P2PSendFileRequest{Chat: id, Path: path}, nil); code != 403 {
 			t.Errorf("source %q: %d", path, code)
 		}
@@ -87,7 +87,7 @@ func TestP2PAgentFilesAPI(t *testing.T) {
 	}
 	put(filepath.Join(aa.Cwd, "run.ps1"), "Write-Output should-not-run")
 	put(filepath.Join(aa.Cwd, "fake.pdf"), "MZ executable")
-	for _, path := range []string{"fake.pdf"} {
+	for _, path := range []string{"fake.pdf", "run.ps1"} { // a program by its content, a script by its extension
 		if code := ac.do("POST", "/api/p2p/files/send", api.P2PSendFileRequest{Chat: id, Path: path}, nil); code != 400 {
 			t.Errorf("blocked %q: %d", path, code)
 		}
@@ -186,7 +186,7 @@ func p2pWorkspace(t *testing.T) string {
 	return abs
 }
 
-func TestP2PSendScansContentAndAllowsDocuments(t *testing.T) {
+func TestP2PSendAllowsCredentialTextInDocuments(t *testing.T) {
 	n := p2ptest.NewNetwork()
 	workspace := p2pWorkspace(t)
 	d := apitest.NewWithNode(t, n.NewNode("a"), func(o *fleet.Options) { o.Workspace = workspace })
@@ -199,9 +199,9 @@ func TestP2PSendScansContentAndAllowsDocuments(t *testing.T) {
 		name, data string
 		code       int
 	}{
-		{"report.txt", "gh" + "p_" + strings.Repeat("a", 36), 403},
-		{"report.pdf", "%PDF-1.4\n" + "gh" + "p_" + strings.Repeat("a", 36), 403},
-		{"late.txt", strings.Repeat("a", (1<<20)+8) + " sk-" + "test-value", 403},
+		{"report.txt", "gh" + "p_" + strings.Repeat("a", 36), 201},
+		{"report.pdf", "%PDF-1.4\n" + "gh" + "p_" + strings.Repeat("a", 36), 201},
+		{"late.txt", strings.Repeat("a", (1<<20)+8) + " sk-" + strings.Repeat("k", 24), 201},
 		{"normal.pdf", "%PDF-1.4\nA normal report\n%%EOF", 201},
 		{"normal.png", "\x89PNG\r\n\x1a\nordinary image fixture", 201},
 	} {

@@ -31,22 +31,41 @@ import (
 
 // fakeCatalog replaces the model catalog with small files (the real ones are 60 MB and up) and
 // returns their contents by name.
+// The catalog is built once and only swapped in when it is not in place already: a test with two
+// environments must not write the globals while the first environment's worker reads them.
 func fakeCatalog(t *testing.T) map[string][]byte {
 	t.Helper()
+	fakeCatalogOnce.Do(func() {
+		fakeFiles = map[string][]byte{}
+		mk := func(name, file string, heavy, vad bool) Model {
+			b := []byte(strings.Repeat(name, 300))
+			h := sha256.Sum256(b)
+			fakeFiles[name] = b
+			return Model{Name: name, File: file, Label: strings.ToUpper(name[:1]) + name[1:], Size: int64(len(b)), SHA256: hex.EncodeToString(h[:]),
+				Repo: "org/repo", Revision: "rev1", RAMMB: 100, Heavy: heavy, VAD: vad}
+		}
+		fakeModels = []Model{mk("base-q5_1", "ggml-base-q5_1.bin", false, false), mk("small-q5_1", "ggml-small-q5_1.bin", true, false)}
+		fakeVAD = mk("silero-v6.2.0", "ggml-silero-v6.2.0.bin", false, true)
+	})
+	files := make(map[string][]byte, len(fakeFiles))
+	for name, b := range fakeFiles {
+		files[name] = b
+	}
+	if len(Models) > 0 && &Models[0] == &fakeModels[0] {
+		return files
+	}
 	oldModels, oldVAD := Models, VADModel
 	t.Cleanup(func() { Models, VADModel = oldModels, oldVAD })
-	files := map[string][]byte{}
-	mk := func(name, file string, heavy, vad bool) Model {
-		b := []byte(strings.Repeat(name, 300))
-		h := sha256.Sum256(b)
-		files[name] = b
-		return Model{Name: name, File: file, Label: strings.ToUpper(name[:1]) + name[1:], Size: int64(len(b)), SHA256: hex.EncodeToString(h[:]),
-			Repo: "org/repo", Revision: "rev1", RAMMB: 100, Heavy: heavy, VAD: vad}
-	}
-	Models = []Model{mk("base-q5_1", "ggml-base-q5_1.bin", false, false), mk("small-q5_1", "ggml-small-q5_1.bin", true, false)}
-	VADModel = mk("silero-v6.2.0", "ggml-silero-v6.2.0.bin", false, true)
+	Models, VADModel = fakeModels, fakeVAD
 	return files
 }
+
+var (
+	fakeCatalogOnce sync.Once
+	fakeFiles       map[string][]byte
+	fakeModels      []Model
+	fakeVAD         Model
+)
 
 type testEnv struct {
 	t      *testing.T
@@ -347,7 +366,7 @@ func TestDictationGoesFirstAndIsNotStored(t *testing.T) {
 	e.until("dictation queued", func() bool { return e.s.Status().Queued == 2 })
 	e.slots.Release(held.ID, builder)
 	r := <-done
-	if !strings.HasPrefix(r.Text, "fake words of dictation-") || r.Language != "en" || len(r.Segments) != 1 {
+	if !strings.HasPrefix(r.Text, "Fake words of dictation-") || r.Language != "en" || len(r.Segments) != 1 {
 		t.Fatalf("%+v", r)
 	}
 	e.wait("recording:r/2")
@@ -395,6 +414,17 @@ func TestDictationLimits(t *testing.T) {
 		t.Fatalf("cancel: %v", err)
 	}
 	e.until("the worker is free", func() bool { return e.s.Status().Job == nil })
+}
+
+func TestTranscribeLocalFileIgnoresPeer(t *testing.T) {
+	e := newEnv(t)
+	e.mu.Lock()
+	e.cfg.ViaPeer = "must-not-receive-whatsapp"
+	e.mu.Unlock()
+	r, err := e.s.TranscribeLocalFile(context.Background(), bytes.NewReader(append([]byte("OggS"), make([]byte, 100)...)), "")
+	if err != nil || r.Text == "" {
+		t.Fatalf("local file: %+v %v", r, err)
+	}
 }
 
 func TestTranscribeFile(t *testing.T) {
@@ -517,10 +547,13 @@ func TestRestartPicksUpUnfinished(t *testing.T) {
 func TestSettingsAndWarnings(t *testing.T) {
 	e := newEnv(t, func(e *testEnv, o *Options) { o.MemTotal = 8 << 30 })
 	for name, p := range map[string]SettingsPatch{
-		"model":    {Model: ptr("huge")},
-		"vad":      {Model: ptr(VADModel.Name)},
-		"language": {Language: ptr("klingon")},
-		"threads":  {Threads: ptr(100)},
+		"model":          {Model: ptr("huge")},
+		"vad":            {Model: ptr(VADModel.Name)},
+		"language":       {Language: ptr("klingon")},
+		"threads":        {Threads: ptr(100)},
+		"engine":         {Engine: ptr("unknown")},
+		"relative tools": {ToolsDir: ptr("relative")},
+		"missing python": {Python: ptr(filepath.Join(t.TempDir(), "missing.exe"))},
 	} {
 		if _, err := e.s.Configure(p); !errors.Is(err, ErrInvalid) {
 			t.Errorf("%s: %v", name, err)

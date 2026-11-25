@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/blackcode-ch/tmx-go/internal/model"
@@ -84,8 +85,10 @@ var registry = []Info{
 			Idle:     screen.Rx(`^\s*[>❯](\s|$)|\? for shortcuts`),
 			// With a background shell or a mode on, the hint is replaced by e.g. "⏵⏵ bypass
 			// permissions on · 1 shell", so the mode line counts too.
-			AtPrompt:   screen.Rx(`shift\+tab to cycle|\? for shortcuts|⏵⏵|⏸|(bypass permissions|accept edits|plan mode|auto mode|manual mode) on`),
-			MenuCursor: "❯",
+			AtPrompt:        screen.Rx(`shift\+tab to cycle|\? for shortcuts|⏵⏵|⏸|(bypass permissions|accept edits|plan mode|auto mode|manual mode) on`),
+			MenuCursor:      "❯",
+			NumberedDialogs: true,
+			UnnumberedMenu:  screen.Rx(`^\s*(Quick safety check:|Is this a project you created|Make auto mode your default permission mode\?|Syntax theme:|Choose the text style|.*running in Bypass Permissions mode)`),
 		},
 		Synonyms: menuNav,
 		Gates: []Gate{
@@ -216,7 +219,17 @@ func LookPath(h model.Harness, override string) (string, error) {
 	}
 	for _, c := range info.commands {
 		if p, err := exec.LookPath(c); err == nil {
-			return p, nil
+			ext := strings.ToLower(filepath.Ext(p))
+			if runtime.GOOS != "windows" || h != model.HarnessOpenCode || ext == ".exe" || ext == ".cmd" || ext == ".bat" {
+				return p, nil
+			}
+			// PowerShell lists npm's .ps1 shim, and PATHEXT can make Go pick it too.
+			// ConPTY can run the sibling .cmd shim through its existing batch launcher.
+			for _, name := range exeNames(c) {
+				if native, err := exec.LookPath(name); err == nil {
+					return native, nil
+				}
+			}
 		}
 	}
 	for _, d := range installDirs(h) {
@@ -237,6 +250,11 @@ func installDirs(h model.Harness) []string {
 	home, _ := os.UserHomeDir()
 	if runtime.GOOS == "windows" {
 		dirs := []string{filepath.Join(os.Getenv("APPDATA"), "npm"), filepath.Join(home, ".local", "bin")}
+		if h == model.HarnessOpenCode {
+			if localAppData := os.Getenv("LOCALAPPDATA"); localAppData != "" {
+				dirs = append(dirs, filepath.Join(localAppData, "Programs", "node"))
+			}
+		}
 		if h == "agy" || h == "antigravity" {
 			dirs = append(dirs, filepath.Join(os.Getenv("LOCALAPPDATA"), "agy", "bin"))
 		}

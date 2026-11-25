@@ -16,12 +16,8 @@ import (
 // DefaultPort isolates the trial from existing daemon installations.
 const DefaultPort = 8797
 
-// Profiles. "trial" is the side-by-side trial: local-only, every external service off.
-// "production" is a machine whose primary tmx is this daemon (DESIGN.md "Production profile"):
-// it may reach the Python fleet's daemons (Peers) and honours the owner's Companion and WhatsApp
-// switches, but peer-to-peer (libp2p, DHT, mDNS, NAT port mapping) and automatic updates stay
-// off in v1 whatever config.json says: the fleet's transport is the pair-token API, and there is
-// no signed release path yet (P1.22).
+// Profiles. Trial keeps peer services local-only. Both profiles honour explicit
+// automatic update settings; existing homes default to automatic updates off.
 const (
 	ProfileTrial      = "trial"
 	ProfileProduction = "production"
@@ -35,26 +31,39 @@ const EnvPort = "TMXG_PORT"
 
 // Config is config.json. Zero fields take their defaults on Load.
 type Config struct {
+	// AllowUserAccounts explicitly allows this node to use the OS user's AI logins.
+	AllowUserAccounts  bool            `json:"allow_user_accounts,omitempty"`
 	Owner              *OwnerConfig    `json:"owner,omitempty"`
 	SecretFolders      []string        `json:"secret_folders,omitempty"`
 	TrustedBackupRoots []string        `json:"trusted_backup_roots,omitempty"`
 	Transfers          *TransferConfig `json:"transfers,omitempty"`
 	Tasks              *TaskConfig     `json:"tasks,omitempty"`
+	Watch              *WatchConfig    `json:"watch,omitempty"`       // nil = the watch's defaults (watch.go)
 	Supervisor         *string         `json:"supervisor,omitempty"`  // nil = architect; explicit empty = unique-head fallback
 	AutoShelve         *bool           `json:"auto_shelve,omitempty"` // nil = on; workers idle two hours or explicitly done
 	Warnings           []string        `json:"-"`                     // runtime notices; never persisted or used to enable services
 	API                APIConfig       `json:"api,omitempty"`
 	Profile            string          `json:"profile,omitempty"`
+	UI                 *UIConfig       `json:"ui,omitempty"` // nil = the default dashboard (ui.go)
 	Machine            string          `json:"machine"`
 	Workspace          string          `json:"workspace"`
 	Port               int             `json:"port"`
 	ClaudeCommand      string          `json:"claude_command,omitempty"` // "" = claude on PATH
+
+	FaeRuntimeContextCap int `json:"fae_runtime_context_cap,omitempty"` // tokens; default 32768
+
+	// PhoneLock locks tmx on paired phones while they are in the background
+	// (internal/api/phonelock.go); nil = on, after five minutes.
+	PhoneLock *PhoneLockConfig `json:"phone_lock,omitempty"`
 	// SignInCommands are the executables the AI accounts' sign-in, sign-out and checks run for
 	// codex and agy ("codex", "antigravity"), when the one on PATH must not be used (Hostb's
 	// production start puts exit-78 stubs first so no Codex/agy agent starts); agents still
 	// start whatever is on PATH. "" or missing = PATH.
 	SignInCommands map[string]string `json:"sign_in_commands,omitempty"`
 	HeadHarness    string            `json:"head_harness,omitempty"` // "" = claude, and an existing head keeps its harness; else claude or codex
+	// OnboardedAt is when the owner finished or closed the first-run setup (the UI's onboarding:
+	// WhatsApp, a phone, Companion), Unix ms; 0 = never, so the computer's window offers it.
+	OnboardedAt int64 `json:"onboarded_at,omitempty"`
 	// Policy seeds the built-in agent profiles when tmx.db has none yet (first start, or the
 	// upgrade to profiles); nil = model.DefaultPolicy(). Afterwards edit the profiles instead.
 	Policy    *model.Policy    `json:"policy,omitempty"`
@@ -63,12 +72,14 @@ type Config struct {
 	P2P       *P2PConfig       `json:"p2p,omitempty"`       // nil = peer-to-peer off
 	Companion *CompanionConfig `json:"companion,omitempty"` // nil = Companion off
 	Update    *UpdateConfig    `json:"update,omitempty"`    // nil = automatic updates off
+	Rules     *RulesConfig     `json:"rules,omitempty"`     // nil = the defaults (rules.go)
 	Voice     *VoiceConfig     `json:"voice,omitempty"`     // nil = the defaults (voice.go)
 	Recorder  *RecorderConfig  `json:"recorder,omitempty"`  // nil = the recorder's defaults
 	Summaries *SummaryConfig   `json:"summaries,omitempty"` // nil = the defaults (summary.go)
 	WhatsApp  *WhatsAppConfig  `json:"whatsapp,omitempty"`  // nil = off (whatsapp.go)
 	Hosts     []Host           `json:"hosts,omitempty"`     // other local daemons merged into Overview (hosts.go); nil = none
 	Peers     []Peer           `json:"peers,omitempty"`
+	FleetLead string           `json:"fleet_lead,omitempty"` // explicitly selected, attested agent@paired-node
 	// FleetAuthorities: "name@host" senders whose peer mail counts as the owner's standing order
 	// (internal/fleet/authority.go); nil = the default (architect@hosta, tmx-lead@hosta).
 	FleetAuthorities []string `json:"fleet_authorities,omitempty"`
@@ -79,7 +90,8 @@ type Config struct {
 	Teammates []model.Teammate `json:"teammates,omitempty"`
 	// AgentBypass: Claude agents guarded by tmx's hook run in bypass mode, so the guard alone
 	// decides what asks the owner (internal/fleet/guard.go); nil = on, false = Claude's prompts.
-	AgentBypass *bool `json:"agent_bypass,omitempty"` // the Python fleet's other machines (peers.go); production only
+	AgentBypass  *bool `json:"agent_bypass,omitempty"` // the Python fleet's other machines (peers.go); production only
+	AgentMachine bool  `json:"agent_machine,omitempty"`
 }
 
 // OwnerConfig supplies names used by the manipulation detector. Empty names retain generic role matching.
@@ -134,9 +146,11 @@ func (r *RecorderConfig) Resolved() RecorderConfig {
 
 // UpdateConfig is config.json "update" (DESIGN.md "Updates").
 type UpdateConfig struct {
+	// Flavour selects the Windows update asset. Unset follows the running build.
+	Flavour string `json:"flavour,omitempty"`
 	// Auto installs new releases by itself (once no agent is working); nil = false.
 	Auto *bool `json:"auto,omitempty"`
-	// Channel: "stable" (fleet releases) or "latest" (also fleet prereleases).
+	// Channel: "stable" (including public numbered fleet builds) or "latest" (also release candidates).
 	Channel string `json:"channel,omitempty"`
 	// CheckHours between checks; 0 = 6.
 	CheckHours int `json:"check_hours,omitempty"`
@@ -144,7 +158,7 @@ type UpdateConfig struct {
 	// PublicUpdateRepo serves fleet releases without requiring a GitHub token.
 	Repo string `json:"repo,omitempty"`
 	// FleetPublicKey is the base64 Ed25519 fleet key (the pre-fleet_keys form, read as one
-	// ed25519 entry with id "fleet-release-v1"). Empty and no FleetKeys disables updates.
+	// ed25519 entry with id "fleet-release-v1"). Unconfigured installs use the compiled release key.
 	FleetPublicKey string `json:"fleet_public_key,omitempty"`
 	// FleetKeys is the pinned release key set (1-4 entries; DESIGN.md "Updates"). See fleetkeys.go.
 	FleetKeys []FleetKey `json:"fleet_keys,omitempty"`
@@ -160,6 +174,12 @@ type UpdateConfig struct {
 	rawKeys, rawRequire json.RawMessage
 	shapeErr            error
 }
+
+// Install flavours in update.flavour.
+const (
+	FlavourHeadless = "headless"
+	FlavourDesktop  = "desktop"
+)
 
 // Update channels.
 const (
@@ -187,6 +207,9 @@ func (u *UpdateConfig) Resolved() UpdateConfig {
 	}
 	if out.Repo == "" {
 		out.Repo = DefaultUpdateRepo
+		if strings.HasPrefix(Version, "fleet-v") {
+			out.Repo = PublicUpdateRepo
+		}
 	}
 	return out
 }
@@ -198,6 +221,11 @@ type CompanionConfig struct {
 	// URL of Companion's local agent server, e.g. http://127.0.0.1:8010 (loopback only);
 	// "" = discovered (Companion's engine.json, then its engine state, then port 8010).
 	URL string `json:"url,omitempty"`
+	// TrustedPrograms: programs, besides the installed app, that the owner accepts as
+	// Companion's engine when tmx checks who listens before it sends its key: the full path of
+	// a program or of a folder (a development Companion's python.exe). Set through the API
+	// behind the owner gate (PUT /api/companion/trusted-programs).
+	TrustedPrograms []string `json:"trusted_programs,omitempty"`
 }
 
 // P2PConfig is config.json "p2p" (DESIGN.md "Peer-to-peer network"). Everything is optional:
@@ -298,6 +326,9 @@ func Load(p Paths) (Config, error) {
 		return c, fmt.Errorf("unsupported config profile %q (want %q or %q)", c.Profile, ProfileTrial, ProfileProduction)
 	}
 	c.Warnings = c.ProfileWarnings()
+	if w := c.UIProfileWarning(); w != "" {
+		c.Warnings = append(c.Warnings, w)
+	}
 	if !c.Production() && len(c.Warnings) == 0 {
 		if _, err := os.Stat(p.WhatsAppDB()); err == nil {
 			c.Warnings = []string{TrialServicesWarning}
@@ -306,6 +337,11 @@ func Load(p Paths) (Config, error) {
 	c.fillDefaults()
 	if err := c.API.Validate(); err != nil {
 		return c, err
+	}
+	if lead, err := FleetLeadAddress(c.FleetLead); err != nil {
+		return c, err
+	} else {
+		c.FleetLead = lead
 	}
 	if err := c.validatePeers(); err != nil {
 		return c, err
@@ -343,11 +379,7 @@ func (c *Config) fillDefaults() {
 	if c.Profile == "" {
 		c.Profile = ProfileTrial
 	}
-	// Automatic updates stay off everywhere (no signed release path yet); the trial also stays
-	// local-only (no WhatsApp, no Companion, no Peers, no peer-to-peer), including when loading
-	// an older config. In production, config.json decides peer-to-peer (the owner, 3 Nov 15:47:
-	// the pair-token transport doesn't cover person-to-person contacts/chats, which is what
-	// peer-to-peer is for; the "no signed release" reasoning was about auto-update, not this).
+	// Trial keeps peer services local-only, including when loading older config.
 	off := func() *bool { v := false; return &v }
 	if c.P2P == nil {
 		c.P2P = &P2PConfig{}
@@ -366,7 +398,9 @@ func (c *Config) fillDefaults() {
 	if c.Update == nil {
 		c.Update = &UpdateConfig{}
 	}
-	c.Update.Auto = off()
+	if c.Update.Auto == nil {
+		c.Update.Auto = off()
+	}
 
 	if c.Machine == "" {
 		c.Machine = shortHostname()

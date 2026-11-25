@@ -9,15 +9,14 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/blackcode-ch/tmx-go/internal/companion"
 	"github.com/blackcode-ch/tmx-go/internal/model"
 )
 
 const (
-	maxLinkRef   = 1000
-	maxLinkLabel = 200
-	maxLinkWhy   = 300
-	maxLinkRole  = 40
+	// Storage ceilings (1000, 200 and 40 until 17 Nov; a why takes maxWhy).
+	maxLinkRef   = 8000
+	maxLinkLabel = 2000
+	maxLinkRole  = 200
 )
 
 // LinkRequest attaches one thing to a thread (by the thread's ID or title).
@@ -98,10 +97,8 @@ func (f *Fleet) AttachLink(c Caller, req LinkRequest) (model.ThreadLink, error) 
 	case ref == "":
 		return model.ThreadLink{}, errf(KindInvalid, "say what to attach (ref)")
 	case utf8.RuneCountInString(ref) > maxLinkRef, utf8.RuneCountInString(label) > maxLinkLabel,
-		utf8.RuneCountInString(why) > maxLinkWhy, utf8.RuneCountInString(role) > maxLinkRole:
+		len(why) > maxWhy, utf8.RuneCountInString(role) > maxLinkRole:
 		return model.ThreadLink{}, errf(KindInvalid, "too long: a link is a reference and a short line; put the details in a document and attach it")
-	case companion.Scrub(ref) != ref || companion.Scrub(label) != label || companion.Scrub(why) != why:
-		return model.ThreadLink{}, errf(KindInvalid, "this looks like it contains a secret (a key, token or password); attach the secret's name, never its value")
 	}
 
 	f.mu.Lock()

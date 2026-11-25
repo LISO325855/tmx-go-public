@@ -71,6 +71,9 @@ type fakePython struct {
 	incoming     []fleet.PeerOutbound
 	answer       func(m fleet.PeerOutbound) (int, any)
 	wrongPairAck bool // answer a fingerprint that doesn't match what was actually stored
+	system       any  // GET /api/sessions "system"; nil = the key is left out
+	version      string
+	daemon       string
 }
 
 func (p *fakePython) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -106,10 +109,20 @@ func (p *fakePython) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			write(401, map[string]string{"error": "bad token"})
 			return
 		}
-		write(200, map[string]any{"host": p.name, "commit": "abc1234\x07", "sessions": []map[string]any{
+		v := map[string]any{"host": p.name, "commit": "abc1234\x07", "sessions": []map[string]any{
 			{"name": "tmx-lead", "host": "spoofed", "state": "idle", "title": "lead‮"},
 			{"name": "../bad", "state": "busy"},
-		}})
+		}}
+		if p.system != nil {
+			v["system"] = p.system
+		}
+		if p.version != "" {
+			v["version"] = p.version
+		}
+		if p.daemon != "" {
+			v["daemon"] = p.daemon
+		}
+		write(200, v)
 	case "/api/messages/incoming":
 		if !paired {
 			write(401, map[string]string{"error": "bad token"})
@@ -307,5 +320,74 @@ func TestTrialHasNoPeers(t *testing.T) {
 		Peers: []config.Peer{{Name: "hosta", URL: "https://h.example.ts.net"}}}, config.Paths{Home: t.TempDir()}, nil)
 	if c.Known("hosta") || len(c.Statuses()) != 0 {
 		t.Fatal("the trial talks to peers")
+	}
+}
+
+// A Python machine's own reading (sysmon.snapshot's names, plus keys this daemon does not use)
+// arrives with its agents; a Go machine adds the disk's free and total space.
+func TestPollReadsTheMachineReading(t *testing.T) {
+	c, py := newPair(t, "hosta")
+	py.version = "2.41.0\x07"
+	py.system = map[string]any{"cpu_percent": 12.5, "cpus": 32, "boot_at": 1.7e9, "disk_write_mb_s": 3.25,
+		"memory": map[string]any{"total_mb": 65536, "available_mb": 20480, "commit_available_mb": 9000},
+		"disk":   map[string]any{"busy": 4, "queue": 0.1}, "io_overloaded": true, "io_frozen": []string{"a"},
+		"disk_free_mb": 204800, "disk_total_mb": 953674}
+	c.PollAll(context.Background())
+	st := c.Statuses()[0]
+	sys := st.System
+	if !st.OK || st.Version != "2.41.0" || sys == nil {
+		t.Fatalf("%+v", st)
+	}
+	if sys.CPUPercent == nil || *sys.CPUPercent != 12.5 || sys.CPUs != 32 || sys.Memory == nil || sys.Memory.TotalMB != 65536 ||
+		sys.Memory.AvailableMB != 20480 || sys.DiskWriteMBs == nil || *sys.DiskWriteMBs != 3.25 || !sys.IOOverloaded ||
+		sys.DiskFreeMB == nil || *sys.DiskFreeMB != 204800 || sys.DiskTotalMB == nil || *sys.DiskTotalMB != 953674 {
+		t.Fatalf("reading: %+v", sys)
+	}
+	// A Python daemon does not say what it is; only the exact word of a Go daemon is kept.
+	if st.Daemon != "" {
+		t.Fatalf("daemon kind of a Python peer: %q", st.Daemon)
+	}
+	for word, want := range map[string]string{"go": DaemonGo, "Go\x07": "", "<b>go</b>": ""} {
+		py.mu.Lock()
+		py.daemon = word
+		py.mu.Unlock()
+		c.PollAll(context.Background())
+		if got := c.Statuses()[0].Daemon; got != want {
+			t.Fatalf("daemon %q read as %q, want %q", word, got, want)
+		}
+	}
+	// What Statuses hands out is a copy: changing it never reaches the next reader.
+	*sys.CPUPercent, sys.Memory.TotalMB = 99, 1
+	if again := c.Statuses()[0].System; *again.CPUPercent != 12.5 || again.Memory.TotalMB != 65536 {
+		t.Fatalf("Statuses shares the poller's reading: %+v", again)
+	}
+}
+
+// A reading is display data from another machine: numbers no machine can report are dropped
+// one by one, nulls (not measured yet) stay absent, and a "system" of another shape - or none,
+// as older daemons answer - leaves the machine listed and reachable, just without numbers.
+func TestPollDropsAnUnusableMachineReading(t *testing.T) {
+	c, py := newPair(t, "hosta")
+	set := func(v any) {
+		py.mu.Lock()
+		py.system = v
+		py.mu.Unlock()
+		c.PollAll(context.Background())
+	}
+	set(map[string]any{"cpu_percent": 250, "cpus": -3, "disk_write_mb_s": nil,
+		"memory":       map[string]any{"total_mb": 1024, "available_mb": 4096},
+		"disk_free_mb": 10, "disk_total_mb": 5})
+	if st := c.Statuses()[0]; !st.OK || st.System != nil {
+		t.Fatalf("an impossible reading was kept: %+v %+v", st, st.System)
+	}
+	set(map[string]any{"cpu_percent": nil, "cpus": 8, "memory": nil})
+	if sys := c.Statuses()[0].System; sys == nil || sys.CPUPercent != nil || sys.Memory != nil || sys.CPUs != 8 {
+		t.Fatalf("nulls: %+v", sys)
+	}
+	for _, shape := range []any{"busy", []int{1}, map[string]any{"memory": "lots"}, map[string]any{}} {
+		set(shape)
+		if st := c.Statuses()[0]; !st.OK || st.System != nil || len(st.Sessions) != 1 {
+			t.Fatalf("system %v: %+v", shape, st)
+		}
 	}
 }

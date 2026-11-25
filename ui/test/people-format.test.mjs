@@ -14,6 +14,36 @@ test("People shows team and external, Clients only clients", () => {
   assert.deepEqual(forPage(people, "clients").map((p) => p.key), ["bo"]);
 });
 
+// Classic (the Python dashboard): one People entry, tabs Team | Clients & partners.
+test("classic tabs: Team is the team; clients and partners are the other tab", async () => {
+  const { forClassicTab, PEOPLE_TABS } = await import("../src/lib/people-format.ts");
+  assert.deepEqual(PEOPLE_TABS, [
+    { page: "people", label: "Team" },
+    { page: "clients", label: "Clients & partners" },
+  ]);
+  assert.deepEqual(forClassicTab(people, "people").map((p) => p.key), ["ana"]);
+  assert.deepEqual(forClassicTab(people, "clients").map((p) => p.key), ["bo", "cy"]);
+  // everyone is on exactly one tab, including a person with no or an unknown kind
+  const all = [...people, { key: "dee", updated_at: 0 }, { key: "eve", kind: "friend", updated_at: 0 }];
+  const team = forClassicTab(all, "people").map((p) => p.key);
+  const rest = forClassicTab(all, "clients").map((p) => p.key);
+  assert.deepEqual([...team, ...rest].sort(), all.map((p) => p.key).sort());
+  assert.deepEqual(team, ["ana", "dee", "eve"]);
+  // the default dashboard's split is untouched
+  assert.deepEqual(forPage(people, "people").map((p) => p.key), ["ana", "cy"]);
+});
+
+test("classic: the sidebar has one People entry and the page carries the tabs", async () => {
+  const { readFileSync } = await import("node:fs");
+  const read = (p) => readFileSync(new URL(`../src/${p}`, import.meta.url), "utf8");
+  const side = read("components/sidebar.tsx");
+  assert.match(side, /\{!classic && <NavItem to=\{paths\.clients\(\)\} icon=\{Briefcase\} label="Clients"/);
+  assert.match(side, /label="People" active=\{path === paths\.people\(\) \|\| \(classic && path === paths\.clients\(\)\)\}/);
+  const page = read("pages/people.tsx");
+  assert.match(page, /classic \? forClassicTab\(all \?\? \[\], page\) : forPage\(all \?\? \[\], page\)/);
+  assert.match(page, /\{classic && \(\s*<nav className="flex gap-1\.5" aria-label="People" data-people-tabs>/);
+});
+
 test("a key from a name", () => {
   assert.equal(keyFromName("Anna Müller"), "anna-muller");
   assert.equal(keyFromName("  -Zoë O'Brien "), "zoe-o-brien");

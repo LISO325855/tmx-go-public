@@ -32,8 +32,10 @@ func teammateEnv(t *testing.T) *Fleet {
 		{WhatsApp: strings.ToUpper(annaJID), Project: "Dev Tools"},       // JIDs compare case-insensitively
 		{Peer: oldPeer, Project: "old"},                                  // archived: inert
 		{Peer: ghostPeer, Project: "no-such-project"},                    // unknown project: inert
-		{Peer: nobodyPeer},                     // no project: dropped
-		{Name: "Nobody", Project: "dev-tools"}, // no identity: dropped
+		// no project: dropped
+		{Peer: nobodyPeer},
+		// no identity: dropped
+		{Name: "Nobody", Project: "dev-tools"},
 	}
 	f := e.started()
 	for _, name := range []string{"Dev Tools", "Beta", "Old"} {

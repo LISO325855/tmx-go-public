@@ -18,6 +18,21 @@ import (
 // slow, ctrl (raw control characters in the text), badversion. TMXG_FAKE_WHISPER_LOG gets a
 // line per run: "start|end <pid> <args>".
 func TestMain(m *testing.M) {
+	if len(os.Args) == 4 && os.Args[1] == "-I" && os.Args[2] == "-c" {
+		if os.Getenv("TMXG_FAKE_PYTHON") == "3" {
+			fmt.Println("(3, 12)")
+			os.Exit(0)
+		}
+		if os.Getenv("TMXG_FAKE_PYTHON") == "slow" {
+			time.Sleep(20 * time.Second)
+		}
+		fmt.Println("not Python")
+		os.Exit(0)
+	}
+	// ... and as a fake faster-whisper worker ("python -u voice_worker.py"): sidecar_test.go.
+	if mode := os.Getenv("TMXG_FAKE_FW"); mode != "" && len(os.Args) == 6 && os.Args[1] == "-I" && os.Args[4] == "-u" {
+		os.Exit(fakeFW(mode))
+	}
 	if mode := os.Getenv("TMXG_FAKE_WHISPER"); mode != "" {
 		os.Exit(fakeWhisper(mode, os.Args[1:]))
 	}

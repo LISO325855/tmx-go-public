@@ -4,10 +4,12 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta name="color-scheme" content="light dark" />
-    <meta name="theme-color" content="#202a25" />
+    <!-- The browser bar takes the page background of each mode (src/lib/install-colors.ts). -->
+    <meta name="theme-color" media="(prefers-color-scheme: light)" content="#f1f5ed" />
+    <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#151e19" />
     <meta name="mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
-    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
     <meta name="apple-mobile-web-app-title" content="Tiamatrix" />
     <title>tmx</title>
     <link rel="manifest" href="/manifest.webmanifest" />
@@ -22,7 +24,13 @@
         var el = document.documentElement;
         if (dark) el.classList.add("dark");
         el.style.colorScheme = dark ? "dark" : "light";
-        el.style.backgroundColor = dark ? "#171717" : "#ffffff";
+        var bg = dark ? "#151e19" : "#f1f5ed"; // the page background, so nothing flashes
+        el.style.backgroundColor = bg;
+        // a theme chosen in the app wins over the system's: the browser bar follows it
+        if (t === "light" || t === "dark") {
+          var metas = document.querySelectorAll('meta[name="theme-color"]');
+          for (var i = 0; i < metas.length; i++) metas[i].setAttribute("content", bg);
+        }
       })();
     </script>
   </head>

@@ -285,3 +285,47 @@ func TestVoiceRefusalsAndTransientRetry(t *testing.T) {
 		})
 	}
 }
+
+func TestPeerDictationUsesEphemeralEndpoint(t *testing.T) {
+	paths := config.Paths{Home: t.TempDir()}
+	c := New(config.Config{Profile: config.ProfileProduction, Machine: "hostb", Peers: []config.Peer{{Name: "hosta", URL: "https://hosta.example.ts.net"}}}, paths, nil)
+	token := NewPairToken()
+	if _, err := c.Tokens().Store("hosta", token, "test"); err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	c.SetTransport(voiceTransport(func(r *http.Request) (*http.Response, error) {
+		calls++
+		if r.Method != "POST" || r.URL.Path != "/api/peer/dictate" || r.Header.Get("X-Transcription-Local-Only") != "true" || r.GetBody != nil {
+			t.Fatal("wrong protocol", r.Method, r.URL.Path)
+		}
+		if r.Header.Get(HeaderToken) != token || r.Header.Get(HeaderOnBehalf) != "operator" {
+			t.Fatal("missing paired identity")
+		}
+		var body map[string]string
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		audio, err := base64.StdEncoding.DecodeString(body["data"])
+		if err != nil || string(audio) != "test wav" || body["language"] != "fr" {
+			t.Fatal(body, err)
+		}
+		return voiceResponse(transcribe.Result{Text: "bonjour", Language: "fr"}), nil
+	}))
+	result, err := c.DictatePeer(context.Background(), "hosta", []byte("test wav"), "fr")
+	if err != nil || result.Text != "bonjour" || calls != 1 {
+		t.Fatal(result, err, calls)
+	}
+	for _, status := range []int{404, 422, 503} {
+		c.SetTransport(voiceTransport(func(r *http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(`{"error":"failed"}`)), Header: make(http.Header)}, nil
+		}))
+		_, err = c.DictatePeer(context.Background(), "hosta", []byte("test wav"), "fr")
+		if err == nil || errors.Is(err, transcribe.ErrPending) || strings.Contains(err.Error(), "retained") {
+			t.Fatal("must fail without replay/retention", status, err)
+		}
+		if status == 422 && !errors.Is(err, transcribe.ErrNoSpeech) {
+			t.Fatal(err)
+		}
+	}
+}

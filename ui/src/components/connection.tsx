@@ -1,8 +1,52 @@
 import { useEffect, useState } from "react";
 import { Loader2 } from "lucide-react";
+import { Dialog } from "radix-ui";
+import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { useStore } from "@/lib/store";
+import { retryNow, useStore } from "@/lib/store";
+import { daemonRestartAction } from "@/lib/transport";
 import { cn } from "@/lib/utils";
+
+export function DaemonUnavailable() {
+  const restart = daemonRestartAction();
+  const [starting, setStarting] = useState(false);
+  const [failed, setFailed] = useState(false);
+
+  async function recover() {
+    if (!restart || failed) {
+      retryNow();
+      return;
+    }
+    setStarting(true);
+    try {
+      await restart();
+    } catch {
+      setFailed(true);
+    } finally {
+      setStarting(false);
+      retryNow();
+    }
+  }
+
+  return (
+    <Dialog.Root open>
+      <Dialog.Portal>
+        <Dialog.Overlay className="fixed inset-0 z-[200] bg-background" />
+        <Dialog.Content
+          aria-describedby={undefined}
+          className="drag-region fixed inset-0 z-[201] flex flex-col items-center justify-center gap-4 p-6 text-center"
+          onEscapeKeyDown={(event) => event.preventDefault()}
+          onInteractOutside={(event) => event.preventDefault()}
+        >
+          <Dialog.Title>Tiamatrix lost its connection to its program</Dialog.Title>
+          <Button onClick={() => void recover()} disabled={starting}>
+            {starting ? "Restarting…" : restart && !failed ? "Restart it" : "Reconnect after restarting Tiamatrix"}
+          </Button>
+        </Dialog.Content>
+      </Dialog.Portal>
+    </Dialog.Root>
+  );
+}
 
 /** True once the event stream has been down for more than `after` ms. */
 export function useDisconnected(after = 3000): boolean {

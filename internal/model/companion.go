@@ -17,7 +17,7 @@ type CompanionSpec struct {
 	Effects string `json:"effects,omitempty"`
 }
 
-// Effects of a task, weakest first. Anything but none passes the owner gate (when it is on).
+// Effects of a task, weakest first.
 const (
 	EffectsNone    = "none"
 	EffectsAccount = "account"
@@ -28,23 +28,25 @@ const (
 type CompanionTaskState string
 
 const (
-	CompanionAwaitingApproval CompanionTaskState = "awaiting_approval" // an agent asked; the owner decides
-	CompanionDenied           CompanionTaskState = "denied"            // the owner declined the hand-off
-	CompanionQueued           CompanionTaskState = "queued"            // approved; waits its turn (one at a time) or for Companion
-	CompanionSending          CompanionTaskState = "sending"           // the request is on its way
-	CompanionWorking          CompanionTaskState = "working"           // Companion took it
-	CompanionInputRequired    CompanionTaskState = "input_required"    // Companion asks a question (Needs you)
-	CompanionCompleted        CompanionTaskState = "completed"
-	CompanionFailed           CompanionTaskState = "failed"
-	CompanionCanceled         CompanionTaskState = "canceled"
-	CompanionRefused          CompanionTaskState = "refused"     // Companion refused it before running (nothing was sent)
-	CompanionUnconfirmed      CompanionTaskState = "unconfirmed" // maybe sent (timeout); never resent blindly
+	CompanionAwaitingApproval   CompanionTaskState = "awaiting_approval" // an agent asked; the owner decides
+	CompanionDenied             CompanionTaskState = "denied"            // the owner declined the hand-off
+	CompanionQueued             CompanionTaskState = "queued"            // approved; waits its turn (one at a time) or for Companion
+	CompanionSending            CompanionTaskState = "sending"           // the request is on its way
+	CompanionWorking            CompanionTaskState = "working"           // Companion took it
+	CompanionInputRequired      CompanionTaskState = "input_required"    // Companion asks a question (Needs you)
+	CompanionUnknown            CompanionTaskState = "unknown"
+	CompanionEndedWithoutReport CompanionTaskState = "ended_without_report"
+	CompanionCompleted          CompanionTaskState = "completed"
+	CompanionFailed             CompanionTaskState = "failed"
+	CompanionCanceled           CompanionTaskState = "canceled"
+	CompanionRefused            CompanionTaskState = "refused"     // Companion refused it before running (nothing was sent)
+	CompanionUnconfirmed        CompanionTaskState = "unconfirmed" // maybe sent (timeout); never resent blindly
 )
 
 // Done reports whether the task reached a final state.
 func (s CompanionTaskState) Done() bool {
 	switch s {
-	case CompanionDenied, CompanionCompleted, CompanionFailed, CompanionCanceled, CompanionRefused, CompanionUnconfirmed:
+	case CompanionDenied, CompanionCompleted, CompanionFailed, CompanionCanceled, CompanionRefused, CompanionUnconfirmed, CompanionEndedWithoutReport:
 		return true
 	}
 	return false
@@ -73,25 +75,43 @@ type CompanionTask struct {
 	// Companion's pending question (tasks only).
 	ApprovalID         string             `json:"approval_id,omitempty"`
 	SourceApprovalID   string             `json:"source_approval_id,omitempty"`
+	OwnerOrderID       string             `json:"owner_order_id,omitempty"`
 	QuestionApprovalID string             `json:"question_approval_id,omitempty"`
 	Spec               CompanionSpec      `json:"spec"`
 	Body               string             `json:"body,omitempty"` // a message: what its sender wrote (Text frames it)
 	Text               string             `json:"text"`
 	Effects            string             `json:"effects"`
 	State              CompanionTaskState `json:"state"`
+	MessageID          string             `json:"message_id,omitempty"` // outgoing A2A message identity
 	RemoteID           string             `json:"remote_id,omitempty"`  // Companion's task id
 	ContextID          string             `json:"context_id,omitempty"` // Companion's conversation id
 	Question           string             `json:"question,omitempty"`
 	// Exchanges: Companion's questions about it and their answers, oldest first.
-	Exchanges  []CompanionExchange `json:"exchanges,omitempty"`
-	Result     string              `json:"result,omitempty"`
-	Error      string              `json:"error,omitempty"`
-	Attempts   int                 `json:"attempts"`
-	NextAt     int64               `json:"next_at,omitempty"`
-	CreatedAt  int64               `json:"created_at"`
-	UpdatedAt  int64               `json:"updated_at"`
-	SentAt     int64               `json:"sent_at,omitempty"`
-	FinishedAt int64               `json:"finished_at,omitempty"`
+	Exchanges     []CompanionExchange `json:"exchanges,omitempty"`
+	Result        string              `json:"result,omitempty"`
+	Error         string              `json:"error,omitempty"`
+	Attempts      int                 `json:"attempts"`
+	NextAt        int64               `json:"next_at,omitempty"`
+	CreatedAt     int64               `json:"created_at"`
+	UpdatedAt     int64               `json:"updated_at"`
+	SentAt        int64               `json:"sent_at,omitempty"`
+	LastReadAt    int64               `json:"last_read_at,omitempty"`
+	ProgressAt    int64               `json:"progress_at,omitempty"`
+	ProgressKey   string              `json:"progress_key,omitempty"`
+	QueueReleased bool                `json:"queue_released,omitempty"`
+	LinkDownAt    int64               `json:"link_down_at,omitempty"`
+	PollStoppedAt int64               `json:"poll_stopped_at,omitempty"`
+	FinishedAt    int64               `json:"finished_at,omitempty"`
+}
+
+// Following reports whether tmx is still tracking the remote run.
+func (s CompanionTaskState) Following() bool {
+	return s == CompanionWorking || s == CompanionInputRequired || s == CompanionUnknown
+}
+
+// AwaitingAnswer preserves an open question while the link is unavailable.
+func (t CompanionTask) AwaitingAnswer() bool {
+	return t.RemoteID != "" && (t.State == CompanionInputRequired || t.State == CompanionUnknown && t.Question != "")
 }
 
 // IsMessage reports whether t is a conversation message (not a task).

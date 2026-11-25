@@ -61,7 +61,12 @@ type Options struct {
 // the daemon's own launch, not of the agent). A Codex shim must not use this:
 // see FromManifest.
 func FromEnv() Options {
-	return fromEnvAnd(os.Getenv(guard.EnvFolder), os.Getenv(guard.EnvWorkspace), os.Getenv(guard.EnvState))
+	o := fromEnvAnd(os.Getenv(guard.EnvFolder), os.Getenv(guard.EnvWorkspace), os.Getenv(guard.EnvState))
+	// The agent's own account home: the CLAUDE_CONFIG_DIR the daemon launched this Claude with
+	// (the hook is Claude's own child, so this is the daemon's value, as the folders above are).
+	// The guard counts it only when it is an account home inside tmx's state.
+	o.Context.AccountHome = os.Getenv("CLAUDE_CONFIG_DIR")
+	return o
 }
 
 // FromManifest builds Options the same way as FromEnv, except own/workspace/

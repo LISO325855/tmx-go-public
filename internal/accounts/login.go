@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"github.com/blackcode-ch/tmx-go/internal/sysinfo"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -77,7 +78,12 @@ func (ls *loginSession) ended() bool {
 	return ls.isEnd
 }
 
-func startLogin(h model.Harness, dir, path string, args, env []string) (*loginSession, error) {
+func startLogin(h model.Harness, dir, path string, args, env []string, dryRun ...bool) (*loginSession, error) {
+	for _, arg := range args {
+		if strings.Contains(strings.ToLower(arg), "/limit-reset") && (resetTestProcess() || (len(dryRun) > 0 && dryRun[0])) {
+			return nil, errors.New("reset helper process creation disabled for tests and dry runs")
+		}
+	}
 	pt, err := pty.New()
 	if err != nil {
 		return nil, fmt.Errorf("open a terminal: %w", err)
@@ -216,6 +222,9 @@ func (s *Service) Login(h, name string) (string, error) {
 	if e == nil || h == "" {
 		return "", ErrUnknown
 	}
+	if err := s.prepareHome(e); err != nil {
+		return "", err
+	}
 	e.loginMu.Lock()
 	defer e.loginMu.Unlock()
 	s.mu.Lock()
@@ -307,6 +316,9 @@ wait:
 	}
 	if ticket != nil {
 		ticket.Release() // before checkAndApply, which starts claude through the same queue
+	}
+	if e.def.h == Antigravity {
+		s.agyForget() // a signed-in agy answers differently: ask it again
 	}
 	if s.ctx.Err() != nil {
 		return
@@ -429,6 +441,9 @@ func (s *Service) Logout(ctx context.Context, h, name string) (Payload, error) {
 	if e == nil || h == "" {
 		return Payload{}, ErrUnknown
 	}
+	if !s.owns(e) {
+		return Payload{}, ErrNotOwned
+	}
 	_ = s.CancelLogin(h, name)
 	e.loginMu.Lock()
 	defer e.loginMu.Unlock()
@@ -446,6 +461,9 @@ func (s *Service) Logout(ctx context.Context, h, name string) (Payload, error) {
 		return Payload{}, fmt.Errorf("%s: %w: run it and type /signout", e.def.label, ErrNoSignOut)
 	}
 	r := run(ctx, s.o.CheckTimeout, path, args...)
+	if e.def.h == Antigravity {
+		s.agyForget() // signed out (or not): what was learned about agy is asked again
+	}
 	if r.err != nil {
 		return Payload{}, fmt.Errorf("%s's sign-out: %w", e.def.label, r.err)
 	}

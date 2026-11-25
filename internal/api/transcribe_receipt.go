@@ -68,6 +68,9 @@ func (s *Server) transcribeReceipt(next http.HandlerFunc) http.HandlerFunc {
 		defer r.Body.Close()
 		key := r.Header.Get("Idempotency-Key")
 		if key == "" {
+			key = r.URL.Query().Get("request_id")
+		} // UI/desktop bridge retry key
+		if key == "" {
 			key = model.NewID()
 		}
 		if !transcriptionKey.MatchString(key) {
@@ -162,6 +165,10 @@ func (s *Server) transcribeReceipt(next http.HandlerFunc) http.HandlerFunc {
 		receipt.code, receipt.body, receipt.contentType = rr.code, rr.body.Bytes(), rr.Header().Get("Content-Type")
 		receipt.finished = time.Now()
 		close(receipt.done)
+		// A transient failure must be retryable immediately, not replayed for ten minutes.
+		if r.URL.Query().Get("request_id") != "" && (receipt.code >= 500 || receipt.code == http.StatusTooManyRequests || receipt.code == http.StatusRequestTimeout) {
+			delete(receipts, key)
+		}
 		mu.Unlock()
 		w.Header().Set("Content-Type", receipt.contentType)
 		w.WriteHeader(receipt.code)

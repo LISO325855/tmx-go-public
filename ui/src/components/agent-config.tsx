@@ -52,11 +52,14 @@ export function AgentConfig({ agent }: { agent: Agent }) {
     if (agent.state === "starting") setPending("");
   }, [agent.state]);
 
-  const choices = useMemo(() => sortProfiles(Object.values(profiles)).filter((p) => p.level === agent.level), [profiles, agent.level]);
+  const choices = useMemo(
+    () => sortProfiles(Object.values(profiles)).filter((p) => p.level === agent.level && p.provider === current?.provider),
+    [profiles, agent.level, current?.provider],
+  );
   const chosen = profiles[draft.profile] ?? current;
   const models = Array.from(new Set([chosen?.model ?? "", ...(chosen?.allowed_models ?? [])].filter(Boolean)));
   const shell = agent.harness === "shell";
-  const freeModel = agent.harness !== "claude" && !shell; // codex, opencode, pi: their own model names
+  const freeModel = agent.harness !== "claude" && !chosen?.provider && !shell; // codex, opencode, pi: their own model names
   const dirty = JSON.stringify(draft) !== JSON.stringify(base);
   const modelOK = shell || freeModel || models.includes(draft.model);
 

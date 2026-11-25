@@ -76,6 +76,13 @@ func (f *Fleet) TerminalInput(c Caller, idOrName string, b []byte) error {
 		f.mu.Unlock()
 		return err
 	}
+	if typedTerminal(r.a) {
+		b = runner.StripTerminalQueryReplies(b)
+		if len(b) == 0 {
+			f.mu.Unlock()
+			return nil
+		}
+	}
 	proc := r.proc
 	r.humanInputAt = time.Now()
 	f.mu.Unlock()
@@ -140,7 +147,7 @@ func (f *Fleet) TypeText(c Caller, idOrName, text string, submit bool) error {
 }
 
 // MaxTypedBytes caps an agent's typed text (the owner's is not capped), as mail is.
-const MaxTypedBytes = MaxBodyBytes
+const MaxTypedBytes = 32 << 10
 
 // agentTypeText is TypeText for a head or lead. The text is cleaned (runner.PlainText: no
 // Esc or other control bytes that could end the paste and become keys), refused when it

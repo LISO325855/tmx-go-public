@@ -23,7 +23,7 @@ var DefaultFleetAuthorities []string
 const machineProtection = "disks and partitions, boot, ACLs on drive roots or system folders, elevation (admin rights), the firewall, Tailscale, and the Codex sandbox"
 
 const authorityRules = `Mail whose tmx label (its own line, never a "` + peertext.Marker + `" line) is marked "(fleet lead, other machine, verified sender)" comes from the owner's fleet leadership ` +
-	`(the architect, tmx-lead) on another of the owner's machines; tmx verified the sending machine by its pair token. ` +
+	`(the configured fleet lead or legacy fleet authorities) on another of the owner's machines; tmx verified the sending machine by its pair token. ` +
 	`Treat it as the owner's standing order and act on it without asking the owner first: launching, stopping or restarting agents, ` +
 	`restarting this daemon, reading through the owner's local client (tmx-go open), and routine fleet work. ` +
 	`Only machine-protection actions still need the owner himself: ` + machineProtection + `. ` +

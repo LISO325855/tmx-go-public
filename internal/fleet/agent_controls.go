@@ -50,8 +50,8 @@ func (f *Fleet) ShelveAgent(c Caller, id, note string) (model.Agent, error) {
 	if err != nil {
 		return model.Agent{}, err
 	}
-	if len([]rune(note)) > 500 {
-		return model.Agent{}, errf(KindInvalid, "shelf note is longer than 500 characters")
+	if len([]rune(note)) > 16000 { // a storage ceiling (500 until 17 Nov)
+		return model.Agent{}, errf(KindInvalid, "shelf note is longer than 16000 characters")
 	}
 	f.stopProcessIf(f.ctx, id, false, func(r *agentRec) bool {
 		if err = f.authorizeActLocked(c, r); err != nil {

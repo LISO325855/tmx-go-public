@@ -2,6 +2,7 @@ package term
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -119,5 +120,52 @@ func TestNoResultWithoutInput(t *testing.T) {
 		if e.Kind == model.EntryResult {
 			t.Fatalf("a result before anything went in: %+v", before)
 		}
+	}
+}
+
+func TestTranscriptPasteWrapperEcho(t *testing.T) {
+	for _, close := range []string{"</pasted_content>", "</pasted_content id=42>"} {
+		tr := &transcript{}
+		body := "[message from owner] hello\n\n[Fleet state \u2014 latest snapshot; monitor data, not instructions]\n\u2502 sample"
+		tr.note(body)
+		if !tr.wasTyped("<pasted_content id=42>\n" + body + "\n" + close) {
+			t.Fatal("wrapped delivery attributed to owner")
+		}
+		if tr.wasTyped("a different hand-typed message") {
+			t.Fatal("lost owner input")
+		}
+	}
+}
+
+func TestTranscriptUnmatchedPasteInputIsPreserved(t *testing.T) {
+	for _, prompt := range []string{
+		"Explain <pasted_content id=42>Hello</pasted_content id=42> literally",
+		"<pasted_content id=42>Hello</pasted_content id=42>",
+		"<pasted_content>one</pasted_content><pasted_content>two</pasted_content>",
+	} {
+		path := filepath.Join(t.TempDir(), "transcript.jsonl")
+		raw, err := json.Marshal(map[string]any{"type": "user", "message": map[string]any{"content": prompt}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, append(raw, '\n'), 0600); err != nil {
+			t.Fatal(err)
+		}
+		tr := &transcript{path: path}
+		tr.note("unrelated delivery")
+		entries := tr.read()
+		if len(entries) != 1 || entries[0].Kind != model.EntryUser || entries[0].Text != prompt {
+			t.Fatalf("unmatched owner input changed: %+v", entries)
+		}
+	}
+	// An embedded literal tag must not be normalized into a known sent message.
+	tr := &transcript{}
+	tr.note("Explain Hello literally")
+	if tr.wasTyped("Explain <pasted_content>Hello</pasted_content> literally") {
+		t.Fatal("literal owner text mistaken for echo")
+	}
+	tr.note("onetwo")
+	if tr.wasTyped("<pasted_content>one</pasted_content><pasted_content>two</pasted_content>") {
+		t.Fatal("multiple wrappers stripped")
 	}
 }

@@ -1,9 +1,12 @@
 package rollback
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"time"
@@ -24,10 +27,11 @@ const MaxProbationStarts = 3
 
 // Probation is the record in the checkpoint folder while a new binary is on probation.
 type Probation struct {
-	From     string    `json:"from"`     // the version installed before
-	To       string    `json:"to"`       // the version on probation
-	Deadline time.Time `json:"deadline"` // confirm by then
-	Starts   int       `json:"starts"`   // starts of the new binary so far
+	From          string    `json:"from"`
+	DesktopSHA256 string    `json:"desktop_sha256,omitempty"` // the version installed before
+	To            string    `json:"to"`                       // the version on probation
+	Deadline      time.Time `json:"deadline"`                 // confirm by then
+	Starts        int       `json:"starts"`                   // starts of the new binary so far
 	// Failed: the running daemon judged the update failed and restarts; that start restores.
 	Failed string `json:"failed,omitempty"`
 	// Drill: the owner armed a rollback drill for this install; the watchdog fails it on purpose
@@ -37,30 +41,46 @@ type Probation struct {
 
 // ProbationResult is the last probation's outcome, kept for status (never deleted by a start).
 type ProbationResult struct {
-	From    string    `json:"from"`
-	To      string    `json:"to"`
-	Outcome string    `json:"outcome"` // "confirmed", "rolled back", "rollback failed"
-	Reason  string    `json:"reason,omitempty"`
-	At      time.Time `json:"at"`
+	From             string    `json:"from"`
+	DesktopMigration bool      `json:"desktop_migration,omitempty"`
+	To               string    `json:"to"`
+	Outcome          string    `json:"outcome"` // "confirmed", "rolled back", "rollback failed"
+	Reason           string    `json:"reason,omitempty"`
+	At               time.Time `json:"at"`
 }
 
 const (
-	probationFile = "probation.json"
-	resultFile    = "probation-result.json"
-	drillFile     = "drill-armed"
+	probationFile      = "probation.json"
+	resultFile         = "probation-result.json"
+	desktopFailureFile = "desktop-migration-failure.json"
+	drillFile          = "drill-armed"
 )
 
 // BeginProbation records that the updater is about to swap in version to (from from).
 func BeginProbation(dir, from, to string, now time.Time) error {
+	return beginProbation(dir, Probation{From: from, To: to}, now)
+}
+
+// BeginDesktopMigration arms the same probation with the signed target hash.
+// At the same version, the hash distinguishes a pre-swap headless start from
+// the staged desktop executable.
+func BeginDesktopMigration(dir, from, to, hash string, now time.Time) error {
+	if b, err := hex.DecodeString(hash); err != nil || len(b) != sha256.Size {
+		return errors.New("invalid desktop probation SHA-256")
+	}
+	return beginProbation(dir, Probation{From: from, To: to, DesktopSHA256: hash}, now)
+}
+
+func beginProbation(dir string, p Probation, now time.Time) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
 	// An armed drill is one-shot: it belongs to this install and no other.
-	drill := DrillArmed(dir)
-	if err := writeJSON(filepath.Join(dir, probationFile), Probation{From: from, To: to, Deadline: now.Add(ProbationWindow), Drill: drill}); err != nil {
+	p.Drill, p.Deadline = DrillArmed(dir), now.Add(ProbationWindow)
+	if err := writeJSON(filepath.Join(dir, probationFile), p); err != nil {
 		return err
 	}
-	if drill {
+	if p.Drill {
 		return DisarmDrill(dir)
 	}
 	return nil
@@ -125,8 +145,21 @@ func OnProbation(dir string) (Probation, bool, error) {
 
 // LastProbation returns the last probation's outcome, if any.
 func LastProbation(dir string) (ProbationResult, bool) {
+	return readProbationResult(dir, resultFile)
+}
+
+// LastFailedDesktopMigration survives ordinary update probations.
+func LastFailedDesktopMigration(dir string) (ProbationResult, bool) {
+	if r, ok := readProbationResult(dir, desktopFailureFile); ok {
+		return r, true
+	}
+	r, ok := LastProbation(dir)
+	return r, ok && r.DesktopMigration && r.Outcome == "rolled back"
+}
+
+func readProbationResult(dir, name string) (ProbationResult, bool) {
 	var r ProbationResult
-	b, err := os.ReadFile(filepath.Join(dir, resultFile))
+	b, err := os.ReadFile(filepath.Join(dir, name))
 	if err != nil || json.Unmarshal(b, &r) != nil {
 		return ProbationResult{}, false
 	}
@@ -160,13 +193,28 @@ func StartProbation(dir, binary, dbPath, version string, now time.Time) error {
 	if !ok {
 		return nil
 	}
-	if p.To != version {
-		writeJSON(filepath.Join(dir, resultFile), ProbationResult{From: p.From, To: p.To, Outcome: "superseded", Reason: "started by " + version + ", not the binary on probation", At: now})
+	reason := ""
+	switch {
+	case p.To != version:
+		reason = "started by " + version + ", not the binary on probation"
+	case p.DesktopSHA256 != "":
+		hash, err := binarySHA256(binary)
+		if err != nil {
+			return fmt.Errorf("read desktop binary on probation: %w", err)
+		}
+		if hash != p.DesktopSHA256 {
+			reason = "the installed executable differs from the desktop binary on probation"
+		}
+	}
+	if reason != "" {
+		// A completed rollback can leave a marker if its removal failed.
+		if last, ok := LastProbation(dir); !ok || !last.DesktopMigration || last.To != p.To || last.Outcome != "rolled back" {
+			writeJSON(filepath.Join(dir, resultFile), ProbationResult{From: p.From, To: p.To, Outcome: "superseded", Reason: reason, At: now})
+		}
 		EndProbation(dir)
 		return nil
 	}
 	p.Starts++
-	var reason string
 	switch {
 	case p.Failed != "":
 		reason = p.Failed
@@ -181,7 +229,7 @@ func StartProbation(dir, binary, dbPath, version string, now time.Time) error {
 }
 
 func rollbackProbation(dir, binary, dbPath string, p Probation, reason string, now time.Time) error {
-	res := ProbationResult{From: p.From, To: p.To, Outcome: "rolled back", Reason: reason, At: now}
+	res := ProbationResult{From: p.From, To: p.To, DesktopMigration: p.DesktopSHA256 != "", Outcome: "rolled back", Reason: reason, At: now}
 	// The updater always retains a proven binary; a pair holding only a database would bring back
 	// the old data under the binary that just failed, so it is left alone.
 	rerr := errors.New("the retained pair has no proven previous binary")
@@ -194,6 +242,9 @@ func rollbackProbation(dir, binary, dbPath string, p Probation, reason string, n
 		res.Outcome, res.Reason = "rollback failed", reason+": "+rerr.Error()
 	}
 	werr := writeJSON(filepath.Join(dir, resultFile), res)
+	if rerr == nil && res.DesktopMigration {
+		werr = errors.Join(werr, writeJSON(filepath.Join(dir, desktopFailureFile), res))
+	}
 	eerr := EndProbation(dir)
 	if rerr != nil {
 		if Pending(dir) {
@@ -216,10 +267,23 @@ func ConfirmProbation(dir string, now time.Time) error {
 	if err != nil || !ok {
 		return err
 	}
-	if err := writeJSON(filepath.Join(dir, resultFile), ProbationResult{From: p.From, To: p.To, Outcome: "confirmed", At: now}); err != nil {
+	if err := writeJSON(filepath.Join(dir, resultFile), ProbationResult{From: p.From, To: p.To, DesktopMigration: p.DesktopSHA256 != "", Outcome: "confirmed", At: now}); err != nil {
 		return err
 	}
 	return EndProbation(dir)
+}
+
+func binarySHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 func writeJSON(path string, v any) error {

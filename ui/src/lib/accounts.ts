@@ -39,12 +39,15 @@ export async function loadAccounts(): Promise<void> {
     put(await transport().request<AccountsPayload>("GET", "/api/accounts"));
   } catch (e) {
     const err = e as { status?: number; message?: string };
-    useAccounts.setState({ loaded: true, error: { status: err.status ?? 0, message: err.message || "The accounts could not be read." } });
+    useAccounts.setState({ payload: null, loaded: true, error: { status: err.status ?? 0, message: err.message || "The accounts could not be read." } });
   }
 }
 
 onBusEvent((ev: BusEvent) => {
-  if (ev.type === "snapshot") void loadAccounts(); // on every (re)connection: the sidebar shows a full quota
+  if (ev.type === "snapshot") {
+    if (useStore.getState().conn !== "open") useAccounts.setState({ payload: null, loaded: false, error: null });
+    void loadAccounts();
+  }
   if (ev.type === "accounts.updated") put(ev.data as AccountsPayload);
 });
 
@@ -56,6 +59,9 @@ export function accountQuery(name?: string): string {
 }
 
 export const accountsApi = {
+  reset: (account: string, email: string, kind: "fable" | "weekly", dryRun = false) =>
+    ownerAction((c) => transport().request<AccountsPayload>("POST", withConfirmation("/api/accounts/claude/reset", c),
+      { account, email, kind, confirm: !dryRun, dry_run: dryRun })).then(put),
   /** Asks the harnesses again (all of them without a harness; every account of harness without
    * a name); the answer says refreshing. */
   refresh: (harness?: string, account?: string) =>

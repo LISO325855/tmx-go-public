@@ -54,7 +54,7 @@ func (f *Fleet) launchAccountLocked(h model.Harness, name string) (string, error
 
 // accountHomeLocked is a's account's private home, "" = its harness's usual one.
 func (f *Fleet) accountHomeLocked(a model.Agent) string {
-	if a.Account == "" || f.opts.Accounts == nil || !hasAccounts(a.Harness) {
+	if f.opts.Accounts == nil || !hasAccounts(a.Harness) {
 		return ""
 	}
 	return f.opts.Accounts.Home(AccountHarness(a.Harness), a.Account)
@@ -62,7 +62,7 @@ func (f *Fleet) accountHomeLocked(a model.Agent) string {
 
 // accountEnvLocked points a's harness at its account's home.
 func (f *Fleet) accountEnvLocked(a model.Agent) []string {
-	if a.Account == "" || f.opts.Accounts == nil || !hasAccounts(a.Harness) {
+	if f.opts.Accounts == nil || !hasAccounts(a.Harness) {
 		return nil
 	}
 	return f.opts.Accounts.Env(AccountHarness(a.Harness), a.Account)

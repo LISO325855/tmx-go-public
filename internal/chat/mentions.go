@@ -16,7 +16,7 @@ import (
 // resolves the labels and sends who is meant (peer ID, agent); receivers flag messages that
 // mention their owner and tell their chat agent when it is mentioned.
 const (
-	maxMentions     = 20
+	maxMentions     = 200 // mentions after this many are dropped (20 until 17 Nov)
 	maxMentionLabel = 80
 )
 

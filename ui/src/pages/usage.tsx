@@ -1,3 +1,4 @@
+import { useClassic } from "@/hooks/use-classic";
 // Usage (#/usage): the AI accounts this machine's harnesses are signed in to (Claude, Codex,
 // Antigravity) and how much of each plan's quota is used, as the harnesses report it. Connect
 // is one click: it runs the harness's own sign-in and shows its terminal in a dialog.
@@ -28,6 +29,8 @@ import {
   usedPct,
   type AccountStatus,
 } from "@/lib/accounts";
+import { DEFAULT_ACCOUNT } from "@/lib/accounts-format";
+import { useStore } from "@/lib/store";
 import { relativeTime } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
@@ -35,6 +38,8 @@ import { cn } from "@/lib/utils";
 const STALE_MS = 5 * 60_000;
 
 export function UsagePage() {
+  const classic = useClassic();
+  const freeWorker = useStore((s) => s.profiles["free-worker"]);
   const payload = useAccounts((s) => s.payload);
   const loaded = useAccounts((s) => s.loaded);
   const error = useAccounts((s) => s.error);
@@ -64,14 +69,15 @@ export function UsagePage() {
     }
   };
 
-  const connect = useCallback(async (a: AccountStatus) => {
+  const connect = useCallback(async (a: AccountStatus, restart = false) => {
     const key = accountKey(a);
-    if (a.login.state === "running") {
+    if (!restart && a.login.state === "running") {
       setConnecting({ harness: a.harness, account: a.name, session: `running-${key}` }); // one already runs: show it
       return;
     }
     setStarting(key);
     try {
+      if (restart) await accountsApi.cancelLogin(a.harness, a.name);
       const r = await accountsApi.login(a.harness, a.name);
       setConnecting({ harness: a.harness, account: a.name, session: r?.session || `${key}-${Date.now()}` });
     } catch (e) {
@@ -102,9 +108,18 @@ export function UsagePage() {
         }
       >
         <Gauge className="size-4 shrink-0 text-muted-foreground" />
-        <PageTitle>Usage</PageTitle>
+        <PageTitle>{classic ? "Usage and accounts" : "Usage"}</PageTitle>
       </PageHeader>
       <PageBody width="max-w-[70rem]" className="space-y-6">
+        {freeWorker?.provider === "fae" && (
+          <section aria-label="Free worker usage" className="flex items-center justify-between gap-4 rounded-lg border p-4">
+            <div>
+              <h2 className="text-sm font-semibold">{freeWorker.name}</h2>
+              <p className="text-xs text-muted-foreground">OpenCode on Fae ? No account required</p>
+            </div>
+            <span className="text-sm font-medium tabular">$0.00 API cost</span>
+          </section>
+        )}
         {!payload ? (
           loaded && error ? (
             <EmptyState
@@ -133,9 +148,12 @@ export function UsagePage() {
             </>
           )
         ) : accounts.length === 0 ? (
-          <EmptyState icon={Gauge} title="No AI tools to show">
-            This tmx knows no harness with an account to connect.
-          </EmptyState>
+          <>
+            <EmptyState icon={Gauge} title="No AI accounts to show">
+              {(payload.hidden ?? []).length > 0 ? "Every card is hidden. Show one again below." : "This tmx knows no harness with an account to connect."}
+            </EmptyState>
+            <HiddenAccounts hidden={payload.hidden ?? []} />
+          </>
         ) : (
           <>
             <Summary accounts={accounts} now={now} />
@@ -159,10 +177,11 @@ export function UsagePage() {
                 </div>
               </section>
             ))}
+            <HiddenAccounts hidden={payload.hidden ?? []} />
           </>
         )}
       </PageBody>
-      <ConnectDialog connecting={connecting} onClose={closeDialog} onRetry={(a) => void connect(a)} />
+      <ConnectDialog connecting={connecting} onClose={closeDialog} onRetry={(a) => void connect(a, a.harness === "claude")} restarting={!!starting} />
     </div>
   );
 }
@@ -176,6 +195,26 @@ function harnessGroups(accounts: AccountStatus[]): { harness: string; label: str
     else groups.push({ harness: a.harness, label: a.label, accounts: [a] });
   }
   return groups;
+}
+
+/** The default accounts taken off the page with "Remove": one line, each with "Show again". */
+function HiddenAccounts({ hidden }: { hidden: { harness: string; label: string }[] }) {
+  if (hidden.length === 0) return null;
+  const show = (h: { harness: string; label: string }) =>
+    accountsApi.add(h.harness, DEFAULT_ACCOUNT).catch((e) => toast.error(`Could not show ${h.label} again`, { description: (e as Error).message }));
+  return (
+    <p className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground" data-hidden-accounts>
+      <span>Hidden:</span>
+      {hidden.map((h) => (
+        <span key={h.harness} className="inline-flex items-center gap-1">
+          {h.label}
+          <Button variant="ghost" size="xs" className="text-muted-foreground" onClick={() => void show(h)}>
+            Show again
+          </Button>
+        </span>
+      ))}
+    </p>
+  );
 }
 
 /** "Add account": a name, then a signed-out card to connect. */

@@ -104,7 +104,7 @@ func startFakeHarness(t *testing.T, spec runner.Spec) (runner.Process, *tuiEvent
 func TestHarnessTUIStatesMessagesAndMenus(t *testing.T) {
 	p, ev := startFakeTUI(t, nil, "--session-id", "sess-1")
 	// A message sent before the input box is ready waits for it (the initial prompt).
-	if err := p.Send("first"); err != nil {
+	if err := p.(runner.LaunchPromptSender).SendLaunchPrompt("first"); err != nil {
 		t.Fatal(err)
 	}
 	ev.until("the queued message", func(e runner.Event) bool { return strings.Contains(ev.out.String(), "got: first") })
@@ -268,8 +268,14 @@ func TestHarnessCommands(t *testing.T) {
 	oc, _ := harness.TerminalCommand(runner.Spec{Harness: model.HarnessOpenCode, Command: "/x/oc", SessionID: "ses_abc",
 		Model: "opencode-go/gpt-6", PermissionMode: "bypassPermissions",
 		Env: []string{"TMXG_URL=u"}, MCP: &runner.MCPServer{Command: "/x/tmx", Args: []string{"mcp"}, EnvKeys: []string{"TMXG_URL"}}})
-	if strings.Join(oc.Args, " ") != "--standalone -s ses_abc" {
+	if strings.Join(oc.Args, " ") != "-s ses_abc -m opencode-go/gpt-6" {
 		t.Fatalf("opencode args: %q", oc.Args)
+	}
+	// opencode 1.19.3's TUI rejects unknown flags (exit 1, prints help): never pass --standalone.
+	for _, a := range oc.Args {
+		if a == "--standalone" {
+			t.Fatalf("opencode args must not contain --standalone: %q", oc.Args)
+		}
 	}
 	env := strings.Join(oc.Env, "\n")
 	if !strings.Contains(env, `"permission":"allow"`) || !strings.Contains(env, `"model":"opencode-go/gpt-6"`) ||

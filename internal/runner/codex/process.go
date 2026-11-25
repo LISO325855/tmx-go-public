@@ -27,6 +27,7 @@ import (
 	"github.com/blackcode-ch/tmx-go/internal/runner"
 	"github.com/blackcode-ch/tmx-go/internal/runner/claude"
 	"github.com/blackcode-ch/tmx-go/internal/sysinfo"
+	"github.com/blackcode-ch/tmx-go/internal/winshim"
 )
 
 // EventBuffer is the capacity of Process.Events; the consumer must drain it.
@@ -78,6 +79,9 @@ func (r chatRunner) Start(ctx context.Context, spec runner.Spec) (runner.Process
 	if spec.LowPriority {
 		argv0, args = sysinfo.LowPriorityCommand(argv0, args) // macOS: low disk I/O policy
 	}
+	// A .cmd shim would go through cmd.exe, which cuts the arguments at the first line break
+	// (the agent's instructions): start what the shim starts (winshim).
+	argv0, args = winshim.Apply(argv0, args)
 	cmd := hiddenexec.Command(argv0, args...)
 	cmd.Dir = spec.Cwd
 	cmd.Env = claude.MergeEnv(claude.BaseEnv(), spec.Env...)
@@ -104,6 +108,7 @@ func (r chatRunner) Start(ctx context.Context, spec runner.Spec) (runner.Process
 		log: p.log, nextID: p.nextID, resumeID: spec.SessionID, threadParams: threadParams(spec),
 		pending: map[string]pendingReq{}, items: map[string]wireItem{},
 	}
+	p.parser.managedMCP = harness.CodexManagedServers(spec)
 	p.parser.initID = p.nextID()
 	if lease != nil {
 		p.parser.guardExecutable = spec.CodexGuardExecutable
@@ -173,10 +178,11 @@ type process struct {
 	events chan runner.Event
 	closed bool
 
-	stderr   *tailBuffer
-	done     chan struct{}
-	stopOnce sync.Once
-	log      *slog.Logger
+	stderr           *tailBuffer
+	done             chan struct{}
+	stopOnce         sync.Once
+	interruptPending bool
+	log              *slog.Logger
 }
 
 func (p *process) Events() <-chan runner.Event { return p.events }
@@ -221,6 +227,14 @@ func (p *process) apply(o out) error {
 			err = e
 		}
 	}
+	if p.interruptPending && p.parser.turnID != "" {
+		p.interruptPending = false
+		if e := p.interruptTurn(); e != nil && err == nil {
+			err = e
+		}
+	} else if !p.parser.busy {
+		p.interruptPending = false
+	}
 	if o.close {
 		go p.closeInput()
 	}
@@ -253,9 +267,17 @@ func (p *process) Answer(requestID string, d runner.Decision) error {
 func (p *process) Interrupt() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if !p.parser.busy || p.parser.turnID == "" {
+	if !p.parser.busy {
 		return nil
 	}
+	if p.parser.turnID == "" {
+		p.interruptPending = true
+		return nil
+	}
+	return p.interruptTurn()
+}
+
+func (p *process) interruptTurn() error {
 	return p.write(request(p.nextID(), "turn/interrupt", map[string]any{"threadId": p.parser.threadID, "turnId": p.parser.turnID}))
 }
 
@@ -291,9 +313,6 @@ func (p *process) Stop(ctx context.Context) error {
 }
 
 func (p *process) run(stdout io.Reader) {
-	if p.guardLease != nil {
-		defer p.guardLease.Close()
-	}
 	br := bufio.NewReaderSize(stdout, 64<<10)
 	for {
 		line, err := br.ReadBytes('\n')
@@ -310,6 +329,9 @@ func (p *process) run(stdout io.Reader) {
 	}
 	waitErr := p.cmd.Wait()
 	reapGroup(p.cmd)
+	if p.guardLease != nil {
+		p.guardLease.Close()
+	}
 	ev := runner.Event{Kind: runner.EvExit, ExitCode: -1}
 	if st := p.cmd.ProcessState; st != nil {
 		ev.ExitCode = st.ExitCode()

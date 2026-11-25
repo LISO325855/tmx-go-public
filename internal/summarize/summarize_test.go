@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -96,10 +97,11 @@ func (f *fakeVoice) Enqueue(source, wav, lang string) error {
 		return err
 	}
 	t, err := f.st.TranscriptBySource(source)
+	now := model.Now()
 	if errors.Is(err, store.ErrNotFound) {
-		t = model.Transcript{ID: model.NewID(), Source: source, CreatedAt: model.Now()}
+		t = model.Transcript{ID: model.NewID(), Source: source, CreatedAt: now}
 	}
-	t.State, t.Text, t.Segments, t.UpdatedAt = model.TranscriptQueued, "", nil, model.Now()
+	t.State, t.Text, t.Segments, t.UpdatedAt = model.TranscriptQueued, "", nil, now
 	if err := f.st.PutTranscript(t, wav); err != nil {
 		return err
 	}
@@ -838,5 +840,193 @@ func TestGetWithoutSummary(t *testing.T) {
 	b, _ := json.Marshal(x)
 	if !strings.Contains(string(b), `"key_points":[]`) || !strings.Contains(string(b), `"chapters":[]`) {
 		t.Fatalf("json: %s", b)
+	}
+}
+
+func TestReportSkipsMissingLastPartAfterOneResend(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		alreadyLate bool
+	}{
+		{"first request is after cutoff", true},
+		{"report can finish before cutoff", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var clockOffset atomic.Int64
+			e := newEnv(t, "ok", func(o *Options) {
+				o.Now = func() time.Time { return time.Now().Add(time.Duration(clockOffset.Load())) }
+			})
+			e.rec.SetFinished(nil)
+			r := e.record(model.RecordingAudio, true, 2, 5)
+			r = e.stop(r.ID)
+			first := recorder.Source(r.ID, 1)
+			last := recorder.Source(r.ID, 2)
+			if err := e.st.PutTranscript(model.Transcript{
+				ID: model.NewID(), Source: first, State: model.TranscriptDone, Language: "en",
+				Text: "First part", Segments: []model.TranscriptSegment{{FromMS: 0, ToMS: 1200, Text: "First part"}},
+				CreatedAt: model.Now(), UpdatedAt: model.Now(),
+			}, r.Segments[0].WAV); err != nil {
+				t.Fatal(err)
+			}
+			e.voice.set(func(f *fakeVoice) { f.hold = true })
+			wav := r.Segments[1].WAV
+			if tc.alreadyLate {
+				clockOffset.Store(int64(11 * time.Minute))
+			} else if err := os.Rename(wav, wav+".unavailable"); err != nil {
+				t.Fatal(err)
+			}
+			e.s.FinishedHere(r, "worker never started")
+			report := e.wait(r.ID, model.SummaryDone)
+			if report.Transcripts != 1 || !strings.Contains(strings.ToLower(report.Note), "segment 2") ||
+				!strings.Contains(report.Note, "worker never started") {
+				t.Fatalf("partial report: %+v", report)
+			}
+			wantAttempts := 1
+			if !tc.alreadyLate {
+				if _, err := e.st.TranscriptBySource(last); !errors.Is(err, store.ErrNotFound) || len(e.jobs()) != 1 {
+					t.Fatalf("before cutoff, no row and one attempt expected: %v, jobs %v", err, e.jobs())
+				}
+				if err := os.Rename(wav+".unavailable", wav); err != nil {
+					t.Fatal(err)
+				}
+				wantAttempts++
+				clockOffset.Store(int64(11 * time.Minute))
+				e.s.kickWatch()
+			}
+			until := time.Now().Add(3 * time.Second)
+			for {
+				got, err := e.st.TranscriptBySource(last)
+				if err == nil && got.State == model.TranscriptQueued {
+					break
+				}
+				if !time.Now().Before(until) {
+					t.Fatalf("final resend: %+v %v", got, err)
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			e.voice.release()
+			jobs := e.jobs()
+			if len(jobs) != wantAttempts || jobs[len(jobs)-1] != last {
+				t.Fatalf("transcription jobs: %v", jobs)
+			}
+			after, err := e.st.GetSummary(r.ID)
+			if err != nil || after.State != model.SummaryDone || after.Transcripts != 1 {
+				t.Fatalf("resend restarted the report: %+v %v", after, err)
+			}
+		})
+	}
+}
+
+func TestQueuedReportFailsAtFinalDeadline(t *testing.T) {
+	e := newEnv(t, "frames")
+	e.rec.SetFinished(nil)
+	e.s.Close()
+	r := e.stop(e.record(model.RecordingScreen, false, 3, 5).ID)
+
+	opts := e.options()
+	deadline := time.UnixMilli(r.EndedAt).Add(45 * time.Minute)
+	now := deadline.Add(-time.Second)
+	opts.Now = func() time.Time { return now }
+	s := New(opts)
+	t.Cleanup(s.Close)
+	s.FinishReport(r, "worker deadline", deadline)
+	s.check()
+	got, err := s.Get(r.ID)
+	if err != nil || got.State != model.SummaryQueued || got.DeadlineAt != deadline.UnixMilli() {
+		t.Fatalf("before final deadline: %+v, %v", got, err)
+	}
+	now = deadline
+	restarted := New(opts)
+	t.Cleanup(restarted.Close)
+	restarted.check()
+	got, err = restarted.Get(r.ID)
+	if err != nil || got.State != model.SummaryFailed || got.FinishedAt != now.UnixMilli() ||
+		!strings.Contains(got.Error, "still queued at its final deadline") {
+		t.Fatalf("after final deadline: %+v, %v", got, err)
+	}
+}
+
+func TestDaemonHandoffLabelsOnlyReportItStarts(t *testing.T) {
+	for _, workerStarted := range []bool{true, false} {
+		name := "daemon started"
+		if workerStarted {
+			name = "worker started"
+		}
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t, "frames")
+			e.rec.SetFinished(nil)
+			e.s.Close()
+			r := e.record(model.RecordingScreen, false, 1, 5)
+			e.frames(r, 1000)
+			r = e.stop(r.ID)
+			s := New(e.options())
+			t.Cleanup(s.Close)
+			if workerStarted {
+				s.Finished(r)
+			}
+			s.FinishedHere(r, "worker deadline")
+			s.check()
+			x, ok := s.next()
+			if !ok {
+				t.Fatal("no queued report")
+			}
+			s.runOne(x)
+			report, err := s.Get(r.ID)
+			daemonLabel := strings.Contains(report.Note, "Made by the daemon")
+			if err != nil || report.State != model.SummaryDone || daemonLabel == workerStarted {
+				t.Fatalf("report: %+v, %v", report, err)
+			}
+		})
+	}
+}
+
+func TestRestartBeforeReportWorkerTriggerResumesReservedReport(t *testing.T) {
+	e := newEnv(t, "frames")
+	e.rec.SetFinished(nil)
+	r := e.record(model.RecordingScreen, false, 1, 5)
+	e.frames(r, 1000)
+	r = e.stop(r.ID)
+	deadline := time.UnixMilli(r.EndedAt).Add(45 * time.Minute)
+	reserved, err := e.s.ReserveReport(r, deadline)
+	if err != nil || !reserved {
+		t.Fatalf("reserve report: %v, %v", reserved, err)
+	}
+	e.s.check()
+	before, err := e.st.GetSummary(r.ID)
+	if err != nil || !before.AwaitingWorker || before.State != model.SummaryTranscribing || before.DeadlineAt != deadline.UnixMilli() {
+		t.Fatalf("report started before the worker triggered: %+v, %v", before, err)
+	}
+	e.restart()
+	got := e.wait(r.ID, model.SummaryDone)
+	if got.AwaitingWorker || got.DeadlineAt != before.DeadlineAt ||
+		!strings.Contains(got.Note, "Made by the daemon: the daemon restarted before the report worker asked") {
+		t.Fatalf("restarted report: %+v", got)
+	}
+}
+
+func TestDaemonReportLabelSurvivesRestartWhileQueued(t *testing.T) {
+	e := newEnv(t, "frames")
+	e.rec.SetFinished(nil)
+	e.s.Close()
+	r := e.record(model.RecordingScreen, false, 1, 5)
+	e.frames(r, 1000)
+	r = e.stop(r.ID)
+	deadline := time.UnixMilli(r.EndedAt).Add(45 * time.Minute)
+	s := New(e.options())
+	t.Cleanup(s.Close)
+	if reserved, err := s.ReserveReport(r, deadline); err != nil || !reserved {
+		t.Fatalf("reserve report: %v, %v", reserved, err)
+	}
+	s.FinishReport(r, "worker never triggered", deadline)
+	s.check()
+	queued, err := e.st.GetSummary(r.ID)
+	if err != nil || queued.State != model.SummaryQueued || queued.MadeHere != "worker never triggered" {
+		t.Fatalf("fallback reason was not persisted: %+v, %v", queued, err)
+	}
+	s.Close()
+	e.start()
+	got := e.wait(r.ID, model.SummaryDone)
+	if !strings.HasPrefix(got.Note, "Made by the daemon: worker never triggered.") {
+		t.Fatalf("daemon reason lost across restart: %+v", got)
 	}
 }

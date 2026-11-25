@@ -22,7 +22,7 @@ func TestGateSessionCannotBeInheritedByFileTokenOrOtherUI(t *testing.T) {
 	}
 	owner := tc.New(d.URL, d.OwnerToken)
 	owner.Header = http.Header{api.UISessionHeader: {strings.Repeat("ab", 32)}}
-	status, conf := call(t, owner, "PUT", "/api/safety/guard", guard.Settings{Enabled: false, OffFor: []string{}}, nil)
+	status, conf := call(t, owner, "PUT", "/api/safety/guard", guard.Settings{AllowBrowserAutomation: true}, nil)
 	if status != http.StatusPreconditionRequired {
 		t.Fatalf("proof request: %d", status)
 	}
@@ -43,22 +43,22 @@ func TestGateSessionCannotBeInheritedByFileTokenOrOtherUI(t *testing.T) {
 			t.Fatal("other session inherited displayed grace")
 		}
 		other.Header.Set(api.ConfirmHeader, conf.ID)
-		if s, _ := call(t, other, "PUT", "/api/safety/guard", guard.Settings{Enabled: false, OffFor: []string{}}, nil); s == 0 {
+		if s, _ := call(t, other, "PUT", "/api/safety/guard", guard.Settings{AllowBrowserAutomation: true}, nil); s == 0 {
 			t.Fatal("other session replayed proof or grace")
 		}
 		// Cancel the fake prompt from the rejected replay before the next attempt.
 		d.Gate.Close()
 	}
-	if s, _ := call(t, proof, "PUT", "/api/safety/guard", guard.Settings{Enabled: false, OffFor: []string{}}, nil); s != 0 {
+	if s, _ := call(t, proof, "PUT", "/api/safety/guard", guard.Settings{AllowBrowserAutomation: true}, nil); s != 0 {
 		t.Fatalf("own proof: %d", s)
 	}
 	if s, _ := call(t, owner, "POST", "/api/gate/lock", nil, nil); s != 0 {
 		t.Fatal(s)
 	}
-	if s, _ := call(t, owner, "PUT", "/api/safety/guard", guard.Settings{Enabled: true, OffFor: []string{}}, nil); s != 0 {
+	if s, _ := call(t, owner, "PUT", "/api/safety/guard", guard.Settings{}, nil); s != 0 {
 		t.Fatal(s)
 	}
-	if s, _ := call(t, owner, "PUT", "/api/safety/guard", guard.Settings{Enabled: false, OffFor: []string{}}, nil); s != http.StatusPreconditionRequired {
+	if s, _ := call(t, owner, "PUT", "/api/safety/guard", guard.Settings{AllowBrowserAutomation: true}, nil); s != http.StatusPreconditionRequired {
 		t.Fatalf("lock retained grace: %d", s)
 	}
 }

@@ -20,8 +20,11 @@ type ImportReport struct {
 // ImportPeople applies a Python import plan (owner only). Idempotent: a person (by key) or a
 // promise (by its Python-derived ID) that is already here is left as it is.
 func (f *Fleet) ImportPeople(c Caller, plan people.Plan) (ImportReport, error) {
-	if !c.Owner {
-		return ImportReport{}, errf(KindForbidden, "only the owner can import people")
+	f.mu.Lock()
+	err := f.manageNodeLocked(c, "import people")
+	f.mu.Unlock()
+	if err != nil {
+		return ImportReport{}, err
 	}
 	rep := ImportReport{Planned: plan.Counts().String()}
 	keys := map[string]bool{}

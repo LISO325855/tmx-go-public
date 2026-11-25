@@ -100,7 +100,7 @@ export function ResourceSettings() {
 
   return (
     <Section
-      title={<span id="resources">Resources</span>}
+      title={<span id="resources">Machine load</span>}
       right={
         dirty && (
           <>

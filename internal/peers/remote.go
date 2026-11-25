@@ -33,7 +33,7 @@ func (c *Client) Remote(ctx context.Context, host, method, path, onBehalf string
 		return fail(400, "invalid remote method", "invalid_method")
 	}
 	host = strings.ToLower(host)
-	peer, ok := c.peers[host]
+	peer, ok := c.lookup(host)
 	if !ok {
 		return fail(404, "no peer machine "+host, "not_found")
 	}

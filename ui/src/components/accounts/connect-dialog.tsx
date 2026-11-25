@@ -16,6 +16,7 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { accountsApi, accountTitle, loadAccounts, sentence, useAccount, type AccountStatus } from "@/lib/accounts";
 import { loginTerminalPath } from "@/lib/transport";
@@ -32,13 +33,16 @@ export interface Connecting {
   session: string;
 }
 
-export function ConnectDialog({ connecting: current, onClose, onRetry }: { connecting: Connecting | null; onClose: () => void; onRetry: (a: AccountStatus) => void }) {
+export function ConnectDialog({ connecting: current, onClose, onRetry, restarting }: { connecting: Connecting | null; onClose: () => void; onRetry: (a: AccountStatus) => void; restarting: boolean }) {
   // The last session stays on screen while the dialog fades out.
   const last = useRef<Connecting | null>(current);
   if (current) last.current = current;
   const connecting = last.current;
   const a = useAccount(connecting?.harness ?? "", connecting?.account);
   const [ask, setAsk] = useState(false);
+  const [code, setCode] = useState("");
+  const loginCode = useRef<((code: string) => boolean) | null>(null);
+  const claude = connecting?.harness === "claude";
   // What we know of this session: "starting" until the daemon reports it running.
   const saw = useRef(false);
   const done = useRef("");
@@ -46,6 +50,7 @@ export function ConnectDialog({ connecting: current, onClose, onRetry }: { conne
   const phase = state === "running" ? "running" : saw.current ? state : "starting";
 
   useEffect(() => {
+    setCode("");
     saw.current = a?.login.state === "running";
     // The event that says "running" may have gone by before this opened: ask once.
     const t = setTimeout(() => !saw.current && void loadAccounts(), 1500);
@@ -101,16 +106,36 @@ export function ConnectDialog({ connecting: current, onClose, onRetry }: { conne
           <div className="flex h-[18.75rem] flex-col bg-background p-3 sm:h-[21.25rem]">
             {connecting && (
               <Suspense fallback={<div className="flex-1" />}>
-                <TerminalView key={connecting.session} path={loginTerminalPath(connecting.harness, connecting.account)} ended={null} className="p-0 md:p-0" />
+                <TerminalView key={connecting.session} path={loginTerminalPath(connecting.harness, connecting.account)} ended={null} className="p-0 md:p-0" loginCode={claude ? loginCode : undefined} />
               </Suspense>
             )}
           </div>
+          {claude && phase === "running" && (
+            <form className="flex gap-2 px-5 pb-3" onSubmit={(event) => {
+              event.preventDefault();
+              if (loginCode.current?.(code)) setCode("");
+              else toast.info("The terminal is unavailable or the code is not a single line.");
+            }}>
+              <Input aria-label="Paste the code" placeholder="Paste the code" value={code} onChange={(event) => setCode(event.target.value)} type="password" autoComplete="off" spellCheck={false} />
+              <Button type="submit" size="sm" disabled={!code.trim() || restarting}>Send code</Button>
+            </form>
+          )}
           <div className="flex min-h-[3.25rem] flex-wrap items-center gap-x-3 gap-y-2 border-t px-5 py-2.5" aria-live="polite">
             <div className="min-w-0 flex-1 basis-56">
               <Status phase={phase} message={sentence(a?.login.message)} label={label} />
             </div>
             <div className="ml-auto flex shrink-0 items-center gap-1.5">
-              {phase === "failed" || phase === "idle" ? (
+              {claude ? (
+                <>
+                  <Button variant="ghost" size="sm" disabled={restarting} onClick={close}>
+                    {phase === "running" || phase === "starting" ? "Cancel" : "Close"}
+                  </Button>
+                  <Button variant="brand" size="sm" disabled={!a || restarting} onClick={() => a && onRetry(a)}>
+                    <RotateCw className={cn(restarting && "animate-spin")} />
+                    Start again
+                  </Button>
+                </>
+              ) : phase === "failed" || phase === "idle" ? (
                 <>
                   <Button variant="ghost" size="sm" onClick={onClose}>
                     Close

@@ -10,6 +10,9 @@ import (
 // The empty allowlist preserves local-only access.
 type APIConfig struct {
 	TrustedHosts []string `json:"trusted_hosts,omitempty"`
+	// LANAccess is the same Wi-Fi fallback for Connect a phone (internal/api/phonelan.go):
+	// also serve plain http on this machine's private network addresses. Off by default.
+	LANAccess bool `json:"lan_access,omitempty"`
 }
 
 // NormalizeTrustedHost lowercases a DNS authority and removes the HTTPS default port.

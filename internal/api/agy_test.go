@@ -24,8 +24,21 @@ func TestAgyFullAccessRequiresOwnerGate(t *testing.T) {
 	if _, err := d.Fleet.Agent("full-agy"); fleet.KindOf(err) != fleet.KindNotFound {
 		t.Fatal("unconfirmed launch created agent")
 	}
-	// Even a confirmed owner cannot bypass the daemon's unsupported-harness guard.
-	if status, _ = call(t, confirmed(t, owner, proof), "POST", "/api/agents", req, nil); status != http.StatusForbidden {
-		t.Fatalf("opt-in bypassed guard: %d", status)
+	// With the owner's proof it starts: tmx has no command guard for agy, and that is a warning
+	// in the agent's timeline now, not a refusal (agents always start).
+	if status, _ = call(t, confirmed(t, owner, proof), "POST", "/api/agents", req, nil); status != 0 {
+		t.Fatalf("confirmed opt-in refused: %d", status)
+	}
+	a, err := d.Fleet.Agent("full-agy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tl, _ := d.Fleet.Timeline(a.ID, 0, 0)
+	warned := false
+	for _, e := range tl {
+		warned = warned || e.Meta["guard_warning"] != nil
+	}
+	if !warned {
+		t.Fatalf("no guard warning in the timeline: %+v", tl)
 	}
 }

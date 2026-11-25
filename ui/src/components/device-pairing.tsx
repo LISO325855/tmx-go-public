@@ -5,6 +5,10 @@ import { Section } from "@/components/page";
 import { useStore } from "@/lib/store";
 import { ownerAction, withConfirmation } from "@/lib/owner-gate";
 import { PinInput, validPin } from "@/components/pin-input";
+import { ui } from "@/lib/ui";
+import { remotePage } from "@/lib/phone-connect";
+import { WifiFallbackSetting } from "@/components/connect-phone";
+import { PhoneLockOnPhone, PhoneLockSetting } from "@/components/phone-lock";
 
 async function pairRequest<T>(path: string, body: unknown = {}): Promise<T> {
   const r = await fetch(path, { method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
@@ -79,7 +83,7 @@ export function PairDevice() {
   return <div className="w-full max-w-md space-y-4 rounded-xl border p-6">
     <h1 className="text-xl font-semibold">Pair this device</h1>
     {!code && <Input aria-label="Device name" value={name} onChange={e => setName(e.target.value)} maxLength={80} />}
-    <p className="text-sm text-muted-foreground">Keep this page open. Type your owner PIN, or approve the code in Settings → Owner devices on the host computer.</p>
+    <p className="text-sm text-muted-foreground">Easiest: on your computer, open Settings → Owner devices, click Connect a phone and scan the code with this device's camera. Or pair here: keep this page open and type your owner PIN, or approve the code in Settings → Owner devices on the host computer.</p>
     {code ? <form className="space-y-3" onSubmit={e => { e.preventDefault(); if (validPin(pin)) void pairWithPin(); }}>
       <PinInput label="Owner PIN" value={pin} onChange={setPin} autoFocus disabled={busy} />
       <Button type="submit" className="w-full" disabled={busy || !validPin(pin)}>Pair with my PIN</Button>
@@ -93,7 +97,7 @@ export function PairDevice() {
 type Device = { id: string; name: string; host: string; recovery?: boolean };
 export function OwnerDevices() {
   const tr = useStore(s => s.transport);
-  const remote = !tr?.desktop && window.location.protocol === "https:";
+  const remote = remotePage(window.location.hostname, !!tr?.desktop);
   const [devices, setDevices] = useState<Device[]>([]);
   const [code, setCode] = useState("");
   const [message, setMessage] = useState("");
@@ -107,12 +111,19 @@ export function OwnerDevices() {
   }
   return <Section title="Owner devices">
     <div className="space-y-3">
+      {!remote && <div className="flex flex-wrap items-center justify-between gap-3 rounded border p-3">
+        <div className="min-w-0"><div className="font-medium">Connect a phone</div><div className="text-sm text-muted-foreground">Scan a code with your phone's camera, type your owner PIN, done. Works at home and away.</div></div>
+        <Button onClick={() => ui.openConnectPhone()}>Connect a phone</Button>
+      </div>}
+      {!remote ? <PhoneLockSetting /> : <PhoneLockOnPhone />}
+      {!remote && <WifiFallbackSetting />}
       {!remote && <div className="space-y-2 rounded border p-3">
-        <p>Create a private one-pair link for another computer. Normal issuance requires fresh host confirmation. Restricted recovery requires unavailable host authentication and this UI's surviving proof session.</p>
-        <Input aria-label="Trusted HTTPS authority" placeholder="Trusted HTTPS hostname and port" value={bootstrapHost} onChange={e => setBootstrapHost(e.target.value)} />
-        <Button disabled={busy || !tr || !bootstrapHost} onClick={() => void act(() => ownerAction(id => tr!.request("POST", withConfirmation("/api/devices/bootstrap", id), { host: bootstrapHost, recovery: false })))}>Create one-pair link</Button>
-        <Button variant="outline" disabled={busy || !tr || !bootstrapHost} onClick={() => void act(() => tr!.request("POST", "/api/devices/bootstrap", { host: bootstrapHost, recovery: true }))}>Create restricted recovery link</Button>
-        <p>The private link is written to the host's owner-bootstrap-link file. Deliver it over a channel you control, never chat. It expires in ten minutes.</p>
+        <p>Connect another computer with a private link that works once. You will be asked to confirm on this computer. If you cannot confirm, recovery is available only while this window still has proof that you are the owner; the new device will have limited access.</p>
+        <Input aria-label="This computer's secure web address (without https://)" placeholder="For example: my-computer.example.ts.net" value={bootstrapHost} onChange={e => setBootstrapHost(e.target.value)} />
+        <p className="text-xs text-muted-foreground">Enter the address you use to open this computer securely, without https://. Include the port number only if your address has one.</p>
+        <Button disabled={busy || !tr || !bootstrapHost} onClick={() => void act(() => ownerAction(id => tr!.request("POST", withConfirmation("/api/devices/bootstrap", id), { host: bootstrapHost, recovery: false })))}>Create connection link</Button>
+        <Button variant="outline" disabled={busy || !tr || !bootstrapHost} onClick={() => void act(() => tr!.request("POST", "/api/devices/bootstrap", { host: bootstrapHost, recovery: true }))}>Recover limited access</Button>
+        <p>The link is saved on this computer in a file named <code>owner-bootstrap-link</code>. Open that file to get the link and transfer it privately to your other computer, never through chat. Use it within ten minutes.</p>
         {devices.filter(d => d.recovery).map(d => <Button key={d.id} disabled={busy || !tr} onClick={() => void act(() => ownerAction(id => tr!.request("POST", withConfirmation(`/api/devices/${d.id}/upgrade`, id), {})))}>Upgrade recovery device: {d.name}</Button>)}
       </div>}
       <p className="text-sm text-muted-foreground">A new device pairs itself with your owner PIN. Or approve here only the code visible on your own device.</p>

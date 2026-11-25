@@ -1,7 +1,7 @@
 // Package recworker makes a recording's report without anyone asked (the owner's rule "tool > agent", G5): when
 // a recording is done, the recorder itself launches a short-lived worker through the daemon's own launch path,
 // and tracks it. No lead is in the loop. When the worker cannot do its job (no harness, a failed start, it ends
-// before it asked) the daemon makes the report itself; only a report not finished by the deadline fails, with why.
+// before it asked) the daemon makes the report itself, including at the report deadline.
 //
 // The worker is a cheap model and only an orchestrator: its one command is `tmx rec process <id>`, which asks
 // this daemon to make the report (transcription, the summary with the model internal/summarize picks, key
@@ -12,7 +12,6 @@
 package recworker
 
 import (
-	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -31,6 +30,9 @@ const ProfileSlug = "recording-worker"
 // Model is the worker's model: the cheapest Haiku. It never sees the recording, only states.
 const Model = summarize.DefaultModel
 
+const workerTriggerTimeout = 5 * time.Minute
+const reportFallbackWindow = 15 * time.Minute
+
 // Fleet is the daemon's launch path (*fleet.Fleet).
 type Fleet interface {
 	LaunchAgent(fleet.Caller, fleet.LaunchRequest) (model.Agent, error)
@@ -45,9 +47,9 @@ type Fleet interface {
 // Summaries makes the report (*summarize.Service).
 type Summaries interface {
 	Finished(model.Recording)
-	FinishedHere(r model.Recording, why string) // the daemon makes it: the report says why
+	ReserveReport(r model.Recording, deadline time.Time) (bool, error)
+	FinishReport(r model.Recording, why string, deadline time.Time)
 	Get(id string) (model.RecordingSummary, error)
-	Fail(id, reason string) (bool, error)
 	Settings() summarize.Settings
 }
 
@@ -82,9 +84,10 @@ type job struct {
 	rec       string
 	agent     string // "" once the worker is gone
 	name      string
+	triggerBy time.Time
 	deadline  time.Time
 	budget    time.Duration // deadline - Stop
-	triggered bool          // the worker asked for the report (Process)
+	triggered bool          // the worker or daemon started the report
 }
 
 // Service launches and tracks the workers. New, then Start; Close at the end.
@@ -170,7 +173,21 @@ func workerName(id string) string {
 
 func (s *Service) launch(r model.Recording) {
 	name := workerName(r.ID)
-	fail := func(why string) { s.makeHere(r, why) }
+	budget := s.o.Deadline(len(r.Segments))
+	stopped := s.o.Now()
+	if r.EndedAt != 0 {
+		stopped = time.UnixMilli(r.EndedAt)
+	}
+	deadline := stopped.Add(budget)
+	fail := func(why string) { s.makeHere(r, why, deadline.Add(reportFallbackWindow)) }
+	reserved, err := s.o.Summaries.ReserveReport(r, deadline.Add(reportFallbackWindow))
+	if err != nil {
+		fail("the report deadline couldn't be saved (" + err.Error() + ")")
+		return
+	}
+	if !reserved {
+		return // the recording already has a report
+	}
 	if err := s.ensureProfile(); err != nil {
 		fail("the report worker couldn't be set up (" + err.Error() + ")")
 		return
@@ -185,8 +202,7 @@ func (s *Service) launch(r model.Recording) {
 		s.mu.Unlock()
 		return
 	}
-	budget := s.o.Deadline(len(r.Segments))
-	j := &job{rec: r.ID, name: name, budget: budget, deadline: s.o.Now().Add(budget)}
+	j := &job{rec: r.ID, name: name, budget: budget, triggerBy: s.o.Now().Add(workerTriggerTimeout), deadline: deadline}
 	s.jobs[r.ID] = j
 	s.mu.Unlock()
 
@@ -197,16 +213,26 @@ func (s *Service) launch(r model.Recording) {
 		Brief:  "Run this one command and nothing else, then say its last line: " + cmd,
 		Prompt: "Run exactly this command with Bash, once, and wait for it to finish: " + cmd + "\nThen answer with its last line only. Do nothing else.",
 	})
+	s.mu.Lock()
+	current := s.jobs[r.ID] == j && !j.triggered
+	if current {
+		if err == nil {
+			j.agent = a.ID
+		} else {
+			delete(s.jobs, r.ID)
+		}
+	}
+	s.mu.Unlock()
 	if err != nil {
-		s.mu.Lock()
-		delete(s.jobs, r.ID)
-		s.mu.Unlock()
-		fail("the report worker couldn't start (" + err.Error() + ")")
+		if current {
+			fail("the report worker couldn't start (" + err.Error() + ")")
+		}
 		return
 	}
-	s.mu.Lock()
-	j.agent = a.ID
-	s.mu.Unlock()
+	if !current {
+		s.removeAgent(a.ID)
+		return
+	}
 	s.log.Info("recworker: worker launched", "id", r.ID, "agent", name)
 }
 
@@ -263,7 +289,7 @@ func (s *Service) Process(c fleet.Caller, id string) (model.SummaryState, string
 		if err != nil {
 			return "", "", err
 		}
-		s.o.Summaries.Finished(r)
+		s.o.Summaries.FinishReport(r, "", j.deadline.Add(reportFallbackWindow))
 	}
 	x, err := s.o.Summaries.Get(id)
 	if err != nil {
@@ -289,15 +315,19 @@ func (s *Service) Check() {
 func (s *Service) check(j job, now time.Time) {
 	x, err := s.o.Summaries.Get(j.rec)
 	if err != nil { // the recording is gone
-		s.done(j, "")
+		s.done(j)
 		return
 	}
 	if j.triggered && !x.State.Pending() && x.State != model.SummaryNone {
-		s.done(j, "") // the report is made (or failed on its own, with its own reason)
+		s.done(j) // the report is made (or failed on its own, with its own reason)
 		return
 	}
-	if now.After(j.deadline) {
-		s.done(j, fmt.Sprintf("the report was not finished in time (%s after Stop); worker %s was stopped", j.budget.Round(time.Minute), j.name))
+	if !now.Before(j.deadline) {
+		s.fallback(j, "the report deadline passed ("+j.budget.Round(time.Minute).String()+" after Stop)", true)
+		return
+	}
+	if !j.triggered && !now.Before(j.triggerBy) {
+		s.fallback(j, "the report worker "+j.name+" did not start the report within five minutes", false)
 		return
 	}
 	if j.agent == "" {
@@ -322,50 +352,66 @@ func (s *Service) check(j job, now time.Time) {
 	default:
 		return // starting, queued, working, paused: give it time
 	}
-	if !j.triggered { // it never asked: the daemon makes the report itself, the deadline still holds
-		s.mu.Lock()
-		if cur := s.jobs[j.rec]; cur != nil {
-			cur.triggered = true
-		}
-		s.mu.Unlock()
-		if r, err := s.o.Recordings.Get(j.rec); err == nil {
-			s.makeHere(r, "the report worker "+j.name+" didn't make it ("+why+")")
-		}
+	if !j.triggered {
+		s.fallback(j, "the report worker "+j.name+" didn't make it ("+why+")", false)
+		return
 	}
 	s.retire(j) // the daemon finishes the report
 }
 
 // makeHere: the worker could not do its job (no harness, a failed start, it ended before it asked). A report is
 // never lost to that: the daemon makes it itself, as it would for the worker.
-func (s *Service) makeHere(r model.Recording, why string) {
-	s.log.Warn("recworker: the daemon makes the report itself", "id", r.ID, "why", why)
-	s.o.Summaries.FinishedHere(r, why)
+func (s *Service) makeHere(r model.Recording, why string, deadline time.Time) {
+	s.log.Warn("recworker: handing the report to the daemon", "id", r.ID, "why", why)
+	s.o.Summaries.FinishReport(r, why, deadline)
 }
 
-// retire stops and removes the worker but keeps tracking the report until it is finished or late.
-func (s *Service) retire(j job) {
-	s.removeAgent(j.agent)
+// fallback claims the handoff before dismissing the worker, so a late Process
+// cannot start the same report. At the deadline the summary service owns it.
+func (s *Service) fallback(j job, why string, deadline bool) {
 	s.mu.Lock()
-	if cur := s.jobs[j.rec]; cur != nil {
-		cur.agent = ""
-	}
-	s.mu.Unlock()
-}
-
-// done ends the job: the worker is stopped and removed, and the report is marked failed with why ("" = it is fine).
-func (s *Service) done(j job, why string) {
-	s.mu.Lock()
-	delete(s.jobs, j.rec)
-	s.mu.Unlock()
-	if j.agent != "" {
-		s.removeAgent(j.agent)
-	}
-	if why == "" {
+	cur := s.jobs[j.rec]
+	if cur == nil || cur.triggered && !deadline {
+		s.mu.Unlock()
 		return
 	}
-	s.log.Warn("recworker: report failed", "id", j.rec, "why", why)
-	if _, err := s.o.Summaries.Fail(j.rec, why); err != nil {
-		s.log.Warn("recworker: mark failed", "id", j.rec, "err", err)
+	cur.triggered = true
+	agent := cur.agent
+	cur.agent = ""
+	if deadline {
+		delete(s.jobs, j.rec)
+	}
+	s.mu.Unlock()
+
+	if r, err := s.o.Recordings.Get(j.rec); err == nil {
+		s.makeHere(r, why, j.deadline.Add(reportFallbackWindow))
+	}
+	if agent != "" {
+		s.removeAgent(agent)
+	}
+}
+
+// retire stops the worker while the summary service is still making the report.
+func (s *Service) retire(j job) {
+	s.mu.Lock()
+	cur := s.jobs[j.rec]
+	if cur == nil || cur.agent != j.agent {
+		s.mu.Unlock()
+		return
+	}
+	cur.agent = ""
+	s.mu.Unlock()
+	s.removeAgent(j.agent)
+}
+
+// done ends tracking when the recording is gone or the report has an outcome.
+func (s *Service) done(j job) {
+	s.mu.Lock()
+	cur := s.jobs[j.rec]
+	delete(s.jobs, j.rec)
+	s.mu.Unlock()
+	if cur != nil && cur.agent != "" {
+		s.removeAgent(cur.agent)
 	}
 }
 

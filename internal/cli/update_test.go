@@ -9,9 +9,13 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/blackcode-ch/tmx-go/internal/api/apitest"
 	"github.com/blackcode-ch/tmx-go/internal/config"
+	"github.com/blackcode-ch/tmx-go/internal/model"
+	"github.com/blackcode-ch/tmx-go/internal/rollback"
+	"github.com/blackcode-ch/tmx-go/internal/store"
 )
 
 // tmx update against a daemon with an updater (a dev build: it never checks or installs). Gate
@@ -41,10 +45,10 @@ func TestUpdateCommandsThroughTheGate(t *testing.T) {
 	if err := d.Gate.SetEnabled(true); err != nil {
 		t.Fatal(err)
 	}
-	// v1: automatic installs stay off; refused before anyone is asked.
+	// Enabling auto persists through the owner gate.
 	n0 := len(d.GateAuth.Prompts())
 	out, errs, code = tmx(t, "update", "auto", "on")
-	if code != 1 || !strings.Contains(errs, "automatic updates are off in this version") || auto() != "off" || len(d.GateAuth.Prompts()) != n0 {
+	if code != 0 || !strings.Contains(out, "auto on") || auto() != "on" || len(d.GateAuth.Prompts()) != n0+1 {
 		t.Fatalf("auto on: %d %q %q", code, out, errs)
 	}
 	out, errs, code = tmx(t, "update", "channel", "latest")
@@ -78,7 +82,7 @@ func TestUpdateCommandsThroughTheGate(t *testing.T) {
 
 	// Refused on this machine: a clear error, nothing changes.
 	d.GateAuth.SetAnswer(func(context.Context, string) error { return errors.New("Authentication failed") })
-	if _, errs, code := tmx(t, "update", "auto", "off"); code != 1 || !strings.Contains(errs, "not confirmed (Authentication failed)") || auto() != "off" {
+	if _, errs, code := tmx(t, "update", "auto", "off"); code != 1 || !strings.Contains(errs, "not confirmed (Authentication failed)") || auto() != "on" {
 		t.Fatalf("refused: %d %q", code, errs)
 	}
 	if _, errs, code := tmx(t, "update", "token", "-"); code != 1 || !strings.Contains(errs, "tmx is trying to remove the GitHub token for updates.") {
@@ -115,5 +119,45 @@ func TestUpdateKeysCommand(t *testing.T) {
 		if _, _, code := tmx(t, args...); code == 0 {
 			t.Errorf("%v accepted", args)
 		}
+	}
+}
+
+func TestConfirmedUpdateNoticeOnce(t *testing.T) {
+	d := apitest.New(t)
+	r := rollback.ProbationResult{From: "fleet-v1.0.3-303-g5e633723", To: "fleet-v1.0.3-304-g12345678", Outcome: "confirmed", At: time.Now()}
+	for i := 0; i < 2; i++ {
+		if err := d.Fleet.UpdateNotice(r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st, err := store.Open(config.Paths{Home: d.Home}.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	msgs, err := st.ListMessages(store.MessageFilter{From: model.WatchParty, To: d.Fleet.HeadID()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 1 || msgs[0].Body != "updated from "+r.From+" to "+r.To {
+		t.Fatalf("not exactly one update notice: %+v", msgs)
+	}
+	r.Outcome = "rolled back"
+	if err := d.Fleet.UpdateNotice(r); err != nil {
+		t.Fatal(err)
+	}
+	msgs, _ = st.ListMessages(store.MessageFilter{From: model.WatchParty, To: d.Fleet.HeadID()})
+	if len(msgs) != 1 {
+		t.Fatal("rollback announced success")
+	}
+}
+
+func TestUpdateKeysShowsBuiltInOrigin(t *testing.T) {
+	d := apitest.New(t)
+	url, _ := d.WithUpdater(t)
+	useHome(t, d.Home, urlPort(t, url))
+	out, errs, code := tmx(t, "update", "keys")
+	if code != 0 || errs != "" || !strings.Contains(out, "origin: built-in") || !strings.Contains(out, "fleet-release-v1") {
+		t.Fatalf("effective trust not visible: %d %s %s", code, out, errs)
 	}
 }

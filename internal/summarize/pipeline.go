@@ -35,7 +35,7 @@ func (s *Service) watch() {
 
 // check looks at every summary waiting for transcripts, and at the recordings waiting for voice.
 func (s *Service) check() {
-	waiting, err := s.o.Store.SummariesIn(model.SummaryTranscribing)
+	waiting, err := s.o.Store.SummariesIn(model.SummaryTranscribing, model.SummaryQueued, model.SummaryRunning)
 	if err != nil {
 		s.log.Warn("summaries: read", "err", err)
 		return
@@ -44,8 +44,14 @@ func (s *Service) check() {
 		if s.ctx.Err() != nil {
 			return
 		}
-		s.advance(x)
+		if s.expireReport(x) {
+			continue
+		}
+		if x.State == model.SummaryTranscribing && !x.AwaitingWorker {
+			s.advance(x)
+		}
 	}
+	s.checkTranscriptResends()
 	s.mu.Lock()
 	ids := make([]string, 0, len(s.voiceWait))
 	for id := range s.voiceWait {
@@ -55,7 +61,7 @@ func (s *Service) check() {
 	for _, id := range ids {
 		r, err := s.o.Recordings.Get(id)
 		if err == nil {
-			if p := s.transcription(r, true); p.settingUp {
+			if p := s.transcription(r, true, 0); p.settingUp {
 				continue
 			} else if p.note != "" {
 				s.log.Info("summaries: automatic transcription", "id", id, "note", p.note)
@@ -65,6 +71,32 @@ func (s *Service) check() {
 		delete(s.voiceWait, id)
 		s.mu.Unlock()
 	}
+}
+
+func (s *Service) expireReport(x model.RecordingSummary) bool {
+	if x.DeadlineAt == 0 || s.now() < x.DeadlineAt {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur, err := s.o.Store.GetSummary(x.RecordingID)
+	if err != nil || !cur.State.Pending() || cur.DeadlineAt == 0 || s.now() < cur.DeadlineAt {
+		return false
+	}
+	now := s.now()
+	cur.Error = "The recording report was still " + string(cur.State) + " at its final deadline, 15 minutes after the worker deadline."
+	cur.State, cur.FinishedAt, cur.UpdatedAt = model.SummaryFailed, now, now
+	cur.AwaitingWorker = false
+	labelDaemonReport(&cur)
+	if err := s.saveLocked(cur); err != nil {
+		s.log.Warn("summaries: cannot record final deadline", "id", x.RecordingID, "err", err)
+		return false
+	}
+	delete(s.again, x.RecordingID)
+	if s.running == x.RecordingID && s.runningCancel != nil {
+		s.runningCancel()
+	}
+	return true
 }
 
 // advance moves one waiting summary on.
@@ -79,11 +111,23 @@ func (s *Service) advance(x model.RecordingSummary) {
 		return
 	}
 	may := x.Requested || (s.o.Voice != nil && s.o.Voice.AutoTranscribe())
-	p := s.transcription(r, may)
+	var resendAt int64
+	if !x.Requested {
+		stoppedAt := r.EndedAt
+		if stoppedAt == 0 {
+			stoppedAt = x.CreatedAt // older recordings may have no Stop timestamp
+		}
+		resendAt = stoppedAt + transcriptWait.Milliseconds()
+		if s.now() >= resendAt {
+			s.skipLateTranscripts(r, may)
+			return
+		}
+	}
+	p := s.transcription(r, may, resendAt)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cur, err := s.o.Store.GetSummary(x.RecordingID) // it may have changed meanwhile
-	if err != nil || cur.State != model.SummaryTranscribing {
+	if err != nil || cur.State != model.SummaryTranscribing || cur.Requested != x.Requested {
 		return
 	}
 	switch {
@@ -100,6 +144,85 @@ func (s *Service) advance(x model.RecordingSummary) {
 	}
 	if cur.State == model.SummaryQueued {
 		s.kickRun()
+	}
+}
+
+const transcriptWait = 10 * time.Minute
+
+type transcriptRetry struct {
+	at    int64
+	parts map[int]model.RecordingSegment
+}
+
+// skipLateTranscripts moves a report on with the material already available.
+// Its background resend must not move the report back to transcribing.
+func (s *Service) skipLateTranscripts(r model.Recording, may bool) {
+	s.mu.Lock()
+	cur, err := s.o.Store.GetSummary(r.ID)
+	if err != nil || cur.State != model.SummaryTranscribing || cur.Requested {
+		s.mu.Unlock()
+		return
+	}
+	cur.State, cur.Note, cur.UpdatedAt = model.SummaryQueued, "", s.now()
+	if err := s.saveLocked(cur); err != nil {
+		s.mu.Unlock()
+		s.log.Warn("summaries: save", "id", r.ID, "err", err)
+		return
+	}
+	delete(s.missingAttempts, r.ID)
+	s.mu.Unlock()
+	s.kickRun()
+	if may {
+		s.resendMissing(r.ID, wavSegments(r))
+	}
+}
+
+// checkTranscriptResends also retries a failed initial enqueue when the
+// report was able to finish before the ten-minute cutoff.
+func (s *Service) checkTranscriptResends() {
+	now := s.now()
+	due := map[string]transcriptRetry{}
+	s.mu.Lock()
+	for id, retry := range s.missingAttempts {
+		if now >= retry.at {
+			due[id] = retry
+			delete(s.missingAttempts, id)
+		}
+	}
+	s.mu.Unlock()
+	if len(due) == 0 || s.o.Voice == nil || !s.o.Voice.AutoTranscribe() {
+		return
+	}
+	for id, retry := range due {
+		if _, err := s.o.Recordings.Get(id); err != nil {
+			continue
+		}
+		parts := make([]model.RecordingSegment, 0, len(retry.parts))
+		for _, g := range retry.parts {
+			parts = append(parts, g)
+		}
+		s.resendMissing(id, parts)
+	}
+}
+
+func (s *Service) resendMissing(id string, parts []model.RecordingSegment) {
+	if s.o.Voice == nil || !s.o.Voice.Status().Ready {
+		return
+	}
+	for _, g := range parts {
+		source := recorder.Source(id, g.N)
+		if _, err := s.o.Store.TranscriptBySource(source); !errors.Is(err, store.ErrNotFound) {
+			continue
+		}
+		s.mu.Lock()
+		s.lateResends[source] = model.Now()
+		s.mu.Unlock()
+		if err := s.o.Voice.Enqueue(source, g.WAV, ""); err != nil {
+			s.mu.Lock()
+			delete(s.lateResends, source)
+			s.mu.Unlock()
+			s.log.Warn("summaries: final transcript resend failed", "id", id, "segment", g.N, "err", err)
+		}
 	}
 }
 
@@ -128,7 +251,7 @@ func wavSegments(r model.Recording) []model.RecordingSegment {
 
 // transcription queues the segments of r without a transcript when may (voice set up first if
 // it is missing), and says what is still running.
-func (s *Service) transcription(r model.Recording, may bool) progress {
+func (s *Service) transcription(r model.Recording, may bool, resendAt int64) progress {
 	var p progress
 	var missing []model.RecordingSegment
 	for _, g := range wavSegments(r) {
@@ -162,8 +285,27 @@ func (s *Service) transcription(r model.Recording, may bool) progress {
 	case st.Ready:
 		var errs []string
 		for _, g := range missing {
+			if resendAt != 0 {
+				s.mu.Lock()
+				_, failed := s.missingAttempts[r.ID].parts[g.N]
+				s.mu.Unlock()
+				if failed {
+					errs = append(errs, fmt.Sprintf("segment %d: initial transcription could not be queued", g.N))
+					continue
+				}
+			}
 			if err := s.o.Voice.Enqueue(recorder.Source(r.ID, g.N), g.WAV, ""); err != nil {
 				errs = append(errs, fmt.Sprintf("segment %d: %v", g.N, err))
+				if resendAt != 0 {
+					s.mu.Lock()
+					retry := s.missingAttempts[r.ID]
+					if retry.parts == nil {
+						retry = transcriptRetry{at: resendAt, parts: map[int]model.RecordingSegment{}}
+					}
+					retry.parts[g.N] = g
+					s.missingAttempts[r.ID] = retry
+					s.mu.Unlock()
+				}
 				continue
 			}
 			p.waiting++
@@ -281,18 +423,30 @@ func (s *Service) next() (model.RecordingSummary, bool) {
 
 // runOne writes one summary and stores the outcome.
 func (s *Service) runOne(x model.RecordingSummary) {
-	out := s.make(s.ctx, x)
+	s.expireReport(x)
+	ctx, cancel := context.WithCancel(s.ctx)
+	defer cancel()
+	s.mu.Lock()
+	cur, err := s.o.Store.GetSummary(x.RecordingID)
+	if err != nil || cur.State != model.SummaryRunning {
+		s.running = ""
+		s.mu.Unlock()
+		return
+	}
+	s.runningCancel = cancel
+	s.mu.Unlock()
+	out := s.make(ctx, x)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	again := s.again[x.RecordingID]
 	delete(s.again, x.RecordingID)
-	s.running = ""
+	s.running, s.runningCancel = "", nil
 	if s.ctx.Err() != nil {
 		return // the daemon stops: it stays running and is queued again at the next start
 	}
-	cur, err := s.o.Store.GetSummary(x.RecordingID)
-	if err != nil {
-		return // the recording was deleted meanwhile
+	cur, err = s.o.Store.GetSummary(x.RecordingID)
+	if err != nil || cur.State != model.SummaryRunning {
+		return // the recording was deleted, or its final deadline passed
 	}
 	now := s.now()
 	cur.FinishedAt, cur.UpdatedAt = now, now
@@ -315,15 +469,20 @@ func (s *Service) runOne(x model.RecordingSummary) {
 	}
 	if again {
 		cur.State = model.SummaryTranscribing
-	} else if why, ok := s.madeHere[cur.RecordingID]; ok { // which path made it, so a broken worker is seen
-		delete(s.madeHere, cur.RecordingID)
-		cur.Note = strings.TrimSpace("Made by the daemon: " + why + ". " + cur.Note)
+	} else if !cur.State.Pending() {
+		labelDaemonReport(&cur)
 	}
 	if err := s.saveLocked(cur); err != nil {
 		s.log.Warn("summaries: save", "id", cur.RecordingID, "err", err)
 	}
 	if again {
 		s.kickWatch()
+	}
+}
+
+func labelDaemonReport(x *model.RecordingSummary) {
+	if x.MadeHere != "" {
+		x.Note = strings.TrimSpace("Made by the daemon: " + x.MadeHere + ". " + x.Note)
 	}
 }
 

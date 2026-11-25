@@ -14,7 +14,6 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"github.com/blackcode-ch/tmx-go/internal/config"
 	"io"
 	"net/http"
 	"net/url"
@@ -34,6 +33,7 @@ import (
 	"github.com/wailsapp/wails/v2/pkg/options/windows"
 	wruntime "github.com/wailsapp/wails/v2/pkg/runtime"
 
+	"github.com/blackcode-ch/tmx-go/internal/config"
 	"github.com/blackcode-ch/tmx-go/internal/hiddenexec"
 	"github.com/blackcode-ch/tmx-go/ui"
 )
@@ -44,8 +44,9 @@ import (
 const Available = true
 
 type Options struct {
-	URL   string
-	Token string
+	URL         string
+	Token       string
+	StartDaemon func() error
 }
 
 // Run opens the window and blocks until it is closed. Closing the window never stops agents.
@@ -125,6 +126,15 @@ func (a *App) OpenURL(u string) {
 	if strings.HasPrefix(u, "http://") || strings.HasPrefix(u, "https://") {
 		wruntime.BrowserOpenURL(a.ctx, u)
 	}
+}
+
+// RestartDaemon starts this window's node through the same path as tmx app.
+// It also succeeds when the node has already recovered.
+func (a *App) RestartDaemon() error {
+	if a.opts.StartDaemon == nil {
+		return errors.New("this window cannot start the daemon")
+	}
+	return a.opts.StartDaemon()
 }
 
 // Relaunch opens the window again from the installed tmx and closes this one: after an update
@@ -270,30 +280,39 @@ func (a *App) relayEvents(ctx context.Context) {
 type termConn struct {
 	conn   *websocket.Conn
 	cancel context.CancelFunc
+	ready  chan struct{}
+	start  sync.Once
 }
 
 // TerminalOpen relays an agent's terminal WebSocket (bridge transport). Output arrives as
 // "tmx:term:<handle>" events carrying base64 bytes; "tmx:term-closed:<handle>" when it ends.
 func (a *App) TerminalOpen(agentID string, cols, rows int) (string, error) {
-	return a.openTerminal("/api/agents/"+url.PathEscape(agentID)+"/terminal", cols, rows)
+	return a.openTerminal("/api/agents/"+url.PathEscape(agentID)+"/terminal", cols, rows, nil, false)
 }
 
 // TerminalOpenPath relays any of the daemon's terminal WebSockets by path: an agent's
 // (/api/agents/{id}/terminal) or an AI account's sign-in (/api/accounts/{harness}/login/terminal).
 func (a *App) TerminalOpenPath(path string, cols, rows int) (string, error) {
+	return a.openTerminalPath(path, cols, rows, false)
+}
+
+// TerminalOpenPathDeferred lets the webview subscribe before replay is forwarded.
+func (a *App) TerminalOpenPathDeferred(path string, cols, rows int) (string, error) {
+	return a.openTerminalPath(path, cols, rows, true)
+}
+
+func (a *App) openTerminalPath(path string, cols, rows int, deferred bool) (string, error) {
 	p, q, err := TerminalPath(path)
 	if err != nil {
 		return "", err
 	}
-	return a.openTerminal(p, cols, rows, q)
+	return a.openTerminal(p, cols, rows, q, deferred)
 }
 
-func (a *App) openTerminal(path string, cols, rows int, extra ...url.Values) (string, error) {
+func (a *App) openTerminal(path string, cols, rows int, extra url.Values, deferred bool) (string, error) {
 	q := url.Values{}
-	for _, e := range extra {
-		for k, v := range e {
-			q[k] = v
-		}
+	for k, v := range extra {
+		q[k] = v
 	}
 	q.Set("cols", fmt.Sprint(cols))
 	q.Set("rows", fmt.Sprint(rows))
@@ -307,8 +326,12 @@ func (a *App) openTerminal(path string, cols, rows int, extra ...url.Values) (st
 	a.mu.Lock()
 	a.termSeq++
 	h := fmt.Sprintf("t%d", a.termSeq)
-	a.terms[h] = &termConn{conn: conn, cancel: cancel}
+	t := &termConn{conn: conn, cancel: cancel, ready: make(chan struct{})}
+	a.terms[h] = t
 	a.mu.Unlock()
+	if !deferred {
+		t.start.Do(func() { close(t.ready) })
+	}
 	go func() {
 		defer func() {
 			conn.CloseNow()
@@ -317,6 +340,11 @@ func (a *App) openTerminal(path string, cols, rows int, extra ...url.Values) (st
 			a.mu.Unlock()
 			wruntime.EventsEmit(a.ctx, "tmx:term-closed:"+h)
 		}()
+		select {
+		case <-t.ready:
+		case <-ctx.Done():
+			return
+		}
 		for {
 			_, data, err := conn.Read(ctx)
 			if err != nil {
@@ -326,6 +354,15 @@ func (a *App) openTerminal(path string, cols, rows int, extra ...url.Values) (st
 		}
 	}()
 	return h, nil
+}
+
+func (a *App) TerminalStartRelay(handle string) {
+	a.mu.Lock()
+	t := a.terms[handle]
+	a.mu.Unlock()
+	if t != nil {
+		t.start.Do(func() { close(t.ready) })
+	}
 }
 
 // TerminalSend writes a text frame ({"type":"input",...} or {"type":"resize",...}).

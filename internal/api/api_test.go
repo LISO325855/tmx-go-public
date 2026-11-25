@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -89,7 +88,7 @@ func TestHealthIsPublicRestNeedsToken(t *testing.T) {
 	}
 	// Owner-only routes refuse agents.
 	for _, r := range []struct{ m, p string }{
-		{"GET", "/api/approvals"}, {"GET", "/api/policy"}, {"POST", "/api/agents/head/send"},
+		{"GET", "/api/approvals"}, {"POST", "/api/agents/head/send"},
 		{"DELETE", "/api/agents/head"}, {"POST", "/api/approvals/x"},
 	} {
 		if s := agent.do(r.m, r.p, `{}`, nil); s != 403 {
@@ -142,12 +141,6 @@ func TestProjectHarnessSelectionAPI(t *testing.T) {
 		{"default", "", model.HarnessClaude}, {"explicit-claude", "claude", model.HarnessClaude}, {"selected-codex", "codex", model.HarnessCodex},
 	} {
 		var p model.Project
-		if tc.want == model.HarnessCodex && runtime.GOOS != "windows" {
-			if s := owner.do("POST", "/api/projects", map[string]string{"name": tc.name, "harness": tc.harness}, nil); s != 403 {
-				t.Fatalf("unsupported guard adapter: status %d", s)
-			}
-			continue
-		}
 		if s := owner.do("POST", "/api/projects", map[string]string{"name": tc.name, "harness": tc.harness}, &p); s != 201 {
 			t.Fatalf("%s: status %d", tc.name, s)
 		}
@@ -215,6 +208,7 @@ func TestProjectAgentAndApprovalRoutes(t *testing.T) {
 	}
 
 	// Owner message, timeline.
+	d.Ready(t, "alpha-lead")
 	var m model.Message
 	if s := owner.do("POST", "/api/agents/alpha-lead/send", map[string]string{"text": "hi"}, &m); s != 200 || m.From != "owner" {
 		t.Fatalf("send: %d %+v", s, m)
@@ -304,6 +298,7 @@ func TestEventsSocket(t *testing.T) {
 		t.Fatalf("first frame: %v", first)
 	}
 	owner := client{t: t, base: d.URL, token: d.OwnerToken}
+	d.Ready(t, "head")
 	owner.do("POST", "/api/agents/head/send", map[string]string{"text": "hello"}, nil)
 	seen := map[string]bool{}
 	for !(seen[model.EvMessageCreated] && seen[model.EvTimelineAppended]) {

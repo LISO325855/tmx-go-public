@@ -22,6 +22,8 @@ export interface AccountLimit {
 }
 
 export interface AccountStatus {
+	reset?: { state: string; kind?: string; message: string; attempt_at?: number };
+	free_resets?: { known: boolean; checked_at: number; note?: string; grants: { type: string; remaining: number; expires_at: number; usable_now: boolean }[] };
   harness: string;
   /** the account's name among the harness's; "default" is the harness's usual one */
   name: string;
@@ -30,6 +32,7 @@ export interface AccountStatus {
   label: string;
   installed: boolean;
   connected: boolean;
+  sign_out_reason?: string;
   account?: AccountIdentity | null;
   limits?: AccountLimit[] | null;
   /** why limits is empty */
@@ -45,9 +48,31 @@ export interface AccountStatus {
 export interface AccountsPayload {
   accounts: AccountStatus[];
   updated_at: number;
+  /** harnesses whose default account the owner took off the list ("Remove" on its card) */
+  hidden?: { harness: string; label: string }[];
 }
 
 export type LimitTone = "ok" | "warn" | "hot";
+
+/** Use the actual percentage: 94.9 must not trigger the owner's 95% threshold. */
+export function fableNeedsYou(a: AccountStatus): boolean {
+  if (a.reset?.state === "needs_you") return true;
+  return a.harness === "claude" && a.connected && (a.limits ?? []).some(
+    (l) => (l.id === "week_fable" || /\bfable\b/i.test(l.label)) && Number.isFinite(l.used_percent) && l.used_percent >= 95,
+  );
+}
+
+export function freeResetRows(a: AccountStatus, now: number): { label: string; detail: string }[] {
+  const snapshot = a.free_resets;
+  const fresh = snapshot?.known && snapshot.checked_at <= now && now - snapshot.checked_at <= 15 * 60_000;
+  return ["fable", "weekly"].map((type) => {
+    const label = type === "fable" ? "Fable reset" : "Weekly reset";
+    if (!fresh) return { label, detail: snapshot?.note || "Unknown: reset offers need a fresh usage check." };
+    const grants = snapshot.grants.filter((g) => g.type === type && g.remaining > 0 && (!g.expires_at || g.expires_at > now));
+    if (!grants.length) return { label, detail: "None offered (confirmed by an offer read)" };
+    return { label, detail: grants.map((g) => `${g.remaining} free remaining · ${g.expires_at ? `expires ${new Date(g.expires_at).toLocaleString()}` : "expiry not reported"}${g.usable_now ? "" : " · not usable yet"}`).join("; ") };
+  });
+}
 
 /** used_percent as a whole number in 0–100. */
 export function usedPct(p: number | undefined | null): number {
@@ -171,5 +196,13 @@ export function normalizeAccounts(p: Partial<AccountsPayload> | null | undefined
     error: a.error ?? "",
     login: { state: a.login?.state ?? "idle", message: a.login?.message ?? "" },
   }));
-  return { accounts, updated_at: p?.updated_at ?? 0 };
+  return { accounts, updated_at: p?.updated_at ?? 0, hidden: p?.hidden ?? [] };
+}
+
+/** What "Remove" does, said to the owner before it happens: a default account is only hidden. */
+export function removeExplanation(a: Pick<AccountStatus, "name" | "label">): string {
+  if (!a.name || a.name === DEFAULT_ACCOUNT) {
+    return `The card leaves this page. ${a.label}'s own sign-in on this machine stays as it is, and agents that use it keep using it. "Show again" below brings the card back.`;
+  }
+  return "It leaves the list. Its folder on this machine, and any sign-in in it, stay: sign out first to end the sign-in. Agents that already use it keep using it.";
 }

@@ -53,7 +53,7 @@ func PrepareCodexGuard(spec runner.Spec) (runner.Spec, *codexguard.Lease, error)
 			guardCtx.State = value
 		}
 	}
-	lease, err := codexguard.Prepare(spec.CodexGuardHome, spec.Cwd, path, spec.CodexGuardExecutable, os.Getenv("PATH"), guardCtx)
+	lease, err := codexguard.Prepare(spec.CodexGuardHome, spec.Cwd, path, spec.CodexGuardExecutable, os.Getenv("PATH"), guardCtx, CodexManagedServers(spec))
 	if err != nil {
 		return spec, nil, err
 	}
@@ -79,4 +79,17 @@ func PrepareCodexGuard(spec runner.Spec) (runner.Spec, *codexguard.Lease, error)
 	spec.Command = lease.Binary.Path
 	spec.Env = append(spec.Env, lease.Env(os.Getenv("PATH"))...)
 	return spec, lease, nil
+}
+
+func CodexManagedServers(spec runner.Spec) map[string]runner.MCPServer {
+	servers := make(map[string]runner.MCPServer, len(spec.ProfileMCP)+1)
+	for name, server := range spec.ProfileMCP {
+		if name != "tmxg" {
+			servers[name] = server
+		}
+	}
+	if spec.MCP != nil {
+		servers["tmxg"] = *spec.MCP
+	}
+	return servers
 }

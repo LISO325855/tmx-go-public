@@ -11,8 +11,9 @@ export function isTyping(t: EventTarget | null): boolean {
 }
 
 /** App-wide shortcuts. Page-specific ones (inbox j/k/a/d) live on their pages. */
-export function useGlobalHotkeys() {
+export function useGlobalHotkeys(enabled = true) {
   useEffect(() => {
+    if (!enabled) return;
     let g = 0;
     const onKey = (e: KeyboardEvent) => {
       const mod = e.metaKey || e.ctrlKey;
@@ -62,5 +63,5 @@ export function useGlobalHotkeys() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, []);
+  }, [enabled]);
 }

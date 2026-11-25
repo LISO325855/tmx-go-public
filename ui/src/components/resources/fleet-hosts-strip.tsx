@@ -4,20 +4,14 @@
 import { useEffect } from "react";
 import { Waypoints } from "lucide-react";
 import { StateDot } from "@/components/state";
-import { loadFleetHosts, useFleetHosts } from "@/lib/fleet-hosts";
+import { useFleetHosts, watchFleetHosts } from "@/lib/fleet-hosts";
 import { hostHeadLine, hostStatusLine } from "@/lib/fleet-hosts-format";
 import { bytes, pct } from "@/lib/resources";
-
-const POLL_MS = 15_000;
 
 /** Overview: a compact card per other local daemon, behind the per-host views above it. */
 export function FleetHostsStrip() {
   const hosts = useFleetHosts((s) => s.hosts);
-  useEffect(() => {
-    void loadFleetHosts();
-    const id = setInterval(() => void loadFleetHosts(), POLL_MS);
-    return () => clearInterval(id);
-  }, []);
+  useEffect(() => watchFleetHosts(), []);
   if (hosts.length === 0) return null;
   return (
     <section aria-label="Other hosts">
@@ -39,7 +33,7 @@ export function FleetHostsStrip() {
               {h.reachable ? (
                 <>
                   <p className="truncate text-xs text-muted-foreground">{hostStatusLine(h)}</p>
-                  {h.cpu !== undefined && (
+                  {(h.measured ?? h.cpu !== undefined) && (
                     <p className="tabular truncate text-2xs text-subtle-foreground">
                       {pct(h.cpu)} CPU · {bytes((h.mem_free_mb ?? 0) * 1024 * 1024)} free mem
                     </p>

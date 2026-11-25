@@ -1,6 +1,6 @@
 // The dictation button of the message boxes (agent composer, chat composer, WhatsApp): click to
-// start and click to stop, or hold it while speaking. The words go into the box at the cursor for
-// review; nothing is ever sent by itself. Transcription runs on this machine (Settings → Voice).
+// start and click to stop, or hold it while speaking. Message composers send immediately;
+// answer cards keep their separate draft-and-review flow. Transcription runs on this machine (Settings → Voice).
 // The dictation itself is the app's (lib/dictation-session.ts): leaving the page keeps it
 // running, the bar at the top stops it, and the words still reach this box (#45).
 import { useEffect, useRef, useState, type RefObject } from "react";
@@ -11,7 +11,6 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { dictationSupported, insertAtCursor } from "@/lib/dictation";
 import {
   cancelDictating,
-  dictationElapsed,
   dictationLevel,
   registerDictationBox,
   startDictating,
@@ -28,11 +27,6 @@ const HOLD_MS = 450; // a press longer than this is hold-to-talk: letting go sto
 
 let loading = false;
 
-function dictationClock(ms: number) {
-  const s = Math.floor(ms / 1000);
-  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
-}
-
 function openVoiceSettings() {
   navigate(paths.settings() + "?section=voice");
 }
@@ -41,6 +35,7 @@ export function DictateButton({
   target,
   value,
   onChange,
+  onSend,
   draft,
   disabled,
   className,
@@ -49,6 +44,7 @@ export function DictateButton({
   target: RefObject<HTMLTextAreaElement | null>;
   value: string;
   onChange: (next: string) => void;
+  onSend?: (text: string, requestId: string, signal?: AbortSignal) => Promise<void>;
   /** which box this is, app-wide: where the words go when the box has left the screen */
   draft: DictationTarget;
   disabled?: boolean;
@@ -61,11 +57,10 @@ export function DictateButton({
   const activeId = useDictation((s) => s.target?.id);
   const mine = activeId === draft.id;
   const state = mine ? phase : "idle";
-  const [elapsed, setElapsed] = useState(0);
   const [level, setLevel] = useState(0);
   const press = useRef<{ at: number; started: boolean } | null>(null);
-  const latest = useRef({ value, onChange, draft });
-  latest.current = { value, onChange, draft };
+  const latest = useRef({ value, onChange, draft, onSend });
+  latest.current = { value, onChange, draft, onSend };
 
   useEffect(() => {
     if (connected && !loaded && !loading) {
@@ -77,26 +72,30 @@ export function DictateButton({
   // This box takes its dictation's words directly while it is on screen.
   useEffect(
     () =>
-      registerDictationBox(draft.id, (text) => {
+      registerDictationBox(draft.id, async (text, requestId, signal) => {
+        if (latest.current.onSend) { await latest.current.onSend(text, requestId, signal); return; }
         const el = target.current;
         const { value: cur, onChange: set } = latest.current;
         const at = el ? [el.selectionStart, el.selectionEnd] : [cur.length, cur.length];
         const next = insertAtCursor(cur, at[0], at[1], text);
+        latest.current.value = next.value; // consecutive recovered clips before React rerenders
         set(next.value);
+        if (el) {
+          el.value = next.value;
+          el.setSelectionRange(next.caret, next.caret);
+        }
         requestAnimationFrame(() => {
           if (!el) return;
-          el.focus();
           el.setSelectionRange(next.caret, next.caret);
         });
       }),
     [draft.id, target],
   );
 
-  // The meter and the timer.
+  // The microphone meter; status and timer live outside the action row.
   useEffect(() => {
     if (state !== "recording") return;
     const tick = () => {
-      setElapsed(dictationElapsed());
       setLevel(dictationLevel());
     };
     tick();
@@ -107,7 +106,10 @@ export function DictateButton({
   if (!loaded || !status) return null; // an older daemon without voice
 
   const ready = status.ready && dictationSupported();
-  const start = () => void startDictating(latest.current.draft);
+  const start = () => {
+    target.current?.blur();
+    void startDictating({ ...latest.current.draft, send: latest.current.onSend });
+  };
   const stop = () => {
     if (useDictation.getState().target?.id === draft.id) void stopDictating();
   };
@@ -158,9 +160,12 @@ export function DictateButton({
             )}
             onPointerDown={(e) => {
               if (e.button !== 0 || !ready) return;
+              e.preventDefault();
+              (document.activeElement as HTMLElement | null)?.blur?.();
               press.current = { at: Date.now(), started: state === "idle" };
               if (state === "idle") start();
             }}
+            onMouseDown={(e) => e.preventDefault()}
             onPointerUp={() => {
               const p = press.current;
               if (p?.started && Date.now() - p.at > HOLD_MS) stop(); // hold-to-talk: letting go stops
@@ -202,12 +207,6 @@ export function DictateButton({
         </TooltipTrigger>
         <TooltipContent>{recording ? "Click to stop · Esc throws it away" : label}</TooltipContent>
       </Tooltip>
-      {(recording || state === "working") && (
-        <span className="flex items-center gap-1.5 text-2xs tabular-nums text-muted-foreground" aria-live="polite">
-          {recording && <span className="size-1.5 animate-pulse rounded-full bg-state-error" />}
-          {recording ? dictationClock(elapsed) : "Transcribing…"}
-        </span>
-      )}
     </div>
   );
 }

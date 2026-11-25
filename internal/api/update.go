@@ -15,20 +15,40 @@ import (
 	"github.com/blackcode-ch/tmx-go/internal/update"
 )
 
-// Updates (DESIGN.md "Updates"): owner only. Without an updater every route answers 501.
-// Changing the settings or the token and installing by hand are behind the owner gate once it
-// is on (DESIGN.md "Safety"); reading and checking are not. The background updater installs
+// Updates: owner routes plus a scoped direct local-head exception for status, check,
+// install and auto on/off. Trust, channel, token and rollback remain owner-only.
+// Owner changes and manual installs remain gated once enabled; the authenticated
+// local head bypasses that gate only for install and auto. The background updater installs
 // without any request, so automatic updates never wait for a confirmation.
 func (s *Server) updateRoutes(mux *http.ServeMux) {
 	o := func(h http.HandlerFunc) http.HandlerFunc { return s.ownerOnly(s.withUpdater(h)) }
-	mux.HandleFunc("GET /api/update", o(s.getUpdate))
-	mux.HandleFunc("PUT /api/update", o(s.putUpdate))
-	mux.HandleFunc("POST /api/update/check", o(s.checkUpdate))
-	mux.HandleFunc("POST /api/update/install", o(s.installUpdate))
+	u := func(h http.HandlerFunc) http.HandlerFunc { return s.updateOwnerOrHead(s.withUpdater(h)) }
+	mux.HandleFunc("GET /api/update", u(s.getUpdate))
+	mux.HandleFunc("PUT /api/update", u(s.putUpdate))
+	mux.HandleFunc("POST /api/update/check", u(s.checkUpdate))
+	mux.HandleFunc("POST /api/update/install", u(s.installUpdate))
 	mux.HandleFunc("PUT /api/update/token", o(s.putUpdateToken))
 	mux.HandleFunc("GET /api/update/keys", o(s.getUpdateKeys))
 	mux.HandleFunc("PUT /api/update/keys", o(s.putUpdateKeys))
 	mux.HandleFunc("PUT /api/update/drill", o(s.putUpdateDrill))
+}
+
+// localUpdateHead uses authenticated identity, never a claimed role/header. A peer
+// relay or proxy cannot acquire this exception, even when naming the local head.
+func (s *Server) localUpdateHead(r *http.Request) bool {
+	c, ok := caller(r)
+	return ok && !c.Owner && !c.Companion && c.Peer == "" && c.AgentID != "" &&
+		localRequest(r) && c.AgentID == s.f.HeadID()
+}
+
+func (s *Server) updateOwnerOrHead(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.localUpdateHead(r) {
+			h(w, r)
+			return
+		}
+		s.ownerOnly(h)(w, r)
+	}
 }
 
 // putUpdateDrill arms the forced-rollback drill {arm: true} (or takes it back): the next install
@@ -80,14 +100,12 @@ func (s *Server) putUpdate(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	if req.Auto == nil && req.Channel == nil {
-		writeJSON(w, http.StatusOK, s.updater.Status())
+	if s.localUpdateHead(r) && (req.Auto == nil || req.Channel != nil) {
+		writeError(w, http.StatusForbidden, "the local head may only change update auto on/off")
 		return
 	}
-	if req.Auto != nil && *req.Auto {
-		// v1: a lead installs each machine (staged rollout); config forces auto off at every load,
-		// so saying yes here would only be undone silently.
-		writeError(w, http.StatusBadRequest, "automatic updates are off in this version: install a release with tmx update now (or POST /api/update/install)")
+	if req.Auto == nil && req.Channel == nil {
+		writeJSON(w, http.StatusOK, s.updater.Status())
 		return
 	}
 	var what []string
@@ -105,7 +123,7 @@ func (s *Server) putUpdate(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if !s.RequireOwner(w, r, strings.Join(what, " and "), req) {
+	if !s.localUpdateHead(r) && !s.RequireOwner(w, r, strings.Join(what, " and "), req) {
 		return
 	}
 	st, err := s.updater.Configure(req.Auto, req.Channel)
@@ -148,7 +166,7 @@ func (s *Server) installUpdate(w http.ResponseWriter, r *http.Request) {
 	if req.Now {
 		reason = "install " + what + " now and restart, cutting off agents' steps in progress"
 	}
-	if !s.RequireOwner(w, r, reason, req) {
+	if !s.localUpdateHead(r) && !s.RequireOwner(w, r, reason, req) {
 		return
 	}
 	if req.Tag != "" {

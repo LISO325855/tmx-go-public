@@ -185,17 +185,21 @@ func (u *Updater) save(c config.UpdateConfig) error {
 // PinnedKeys is GET /api/update/keys: the pinned set (public keys only) and the last applied
 // rotation serial; Error says why the set is invalid (updates are then off).
 type PinnedKeys struct {
+	Origin     string            `json:"origin"` // built-in bootstrap, configured pins, or test injection
 	FleetKeys  []config.FleetKey `json:"fleet_keys"`
 	Require    []string          `json:"require"`
 	KeysSerial uint64            `json:"keys_serial"`
 	Error      string            `json:"error,omitempty"`
 }
 
-// Keys returns the pinned set.
+// Keys returns the effective verification set and its origin.
 func (u *Updater) Keys() PinnedKeys {
 	s := u.settings()
-	keys, require, err := s.PinnedKeys()
-	p := PinnedKeys{FleetKeys: keys, Require: require, KeysSerial: s.KeysSerial}
+	keys, require, origin, err := u.effectiveKeys(s)
+	if err == nil {
+		_, err = newKeySet(keys, require)
+	}
+	p := PinnedKeys{Origin: origin, FleetKeys: keys, Require: require, KeysSerial: s.KeysSerial}
 	if err != nil {
 		p.Error = err.Error()
 	}

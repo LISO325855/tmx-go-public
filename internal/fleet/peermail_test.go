@@ -127,7 +127,8 @@ func TestPeerInboundRefusals(t *testing.T) {
 	}
 }
 
-func TestPeerInboundQueueLimit(t *testing.T) {
+// Mail from a peer is taken however much is waiting already (no queue limit since 17 Nov).
+func TestPeerInboundHasNoQueueLimit(t *testing.T) {
 	e, f, _, lead, _ := peerEnv(t)
 	e.chat.Last(lead.ID).State(model.StateWorking) // busy: mail stays queued
 	waitState(t, f, "alpha-lead", model.StateWorking)
@@ -137,8 +138,8 @@ func TestPeerInboundQueueLimit(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if _, _, err := f.DeliverPeer(inbound("ffffffffffff", "x")); KindOf(err) != KindTooMany {
-		t.Fatalf("over the limit: %v", err)
+	if _, _, err := f.DeliverPeer(inbound("ffffffffffff", "x")); err != nil {
+		t.Fatalf("beyond the former limit: %v", err)
 	}
 }
 
@@ -206,7 +207,7 @@ func TestPeerSendAddresses(t *testing.T) {
 	if s := peers.Sent(); len(s) != 1 || s[0].Sender != PeerOperator || s[0].ReplyTo != nil {
 		t.Fatalf("owner: %+v", s)
 	}
-	// The per-window rate applies to a peer party.
+	// No per-window rate (17 Nov), to a peer party neither.
 	for i := 1; i < MaxPerWindow; i++ {
 		if _, err := f.SendMessage(wc, SendRequest{To: "bob@hostc", Body: "x"}); err != nil {
 			t.Fatal(err)
@@ -215,8 +216,8 @@ func TestPeerSendAddresses(t *testing.T) {
 	if _, err := f.SendMessage(wc, SendRequest{To: "bob@hostc", Body: "x"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.SendMessage(wc, SendRequest{To: "bob@hostc", Body: "x"}); KindOf(err) != KindTooMany {
-		t.Fatalf("rate: %v", err)
+	if _, err := f.SendMessage(wc, SendRequest{To: "bob@hostc", Body: "x"}); err != nil {
+		t.Fatalf("beyond the former rate: %v", err)
 	}
 }
 

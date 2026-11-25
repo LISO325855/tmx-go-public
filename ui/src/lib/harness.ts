@@ -1,6 +1,6 @@
 // Harness display helpers (DESIGN.md "Harnesses"): labels, the fallback list for when
 // /api/harnesses has not answered, and reading terminal menus off approvals.
-import type { Approval, Harness, HarnessInfo, TerminalMenu } from "./types";
+import type { Approval, Harness, HarnessInfo, Mode, TerminalMenu } from "./types";
 
 export const HARNESS_LABEL: Record<Harness, string> = {
   claude: "Claude Code",
@@ -31,6 +31,18 @@ export const FALLBACK_HARNESSES: HarnessInfo[] = [
 /** The harness has a chat mode as well as its own screen (Claude Code, Codex): the agent can switch live. */
 export function hasChatMode(h: string | undefined | null): boolean {
   return FALLBACK_HARNESSES.some((x) => x.name === (h || "claude") && x.modes.includes("chat"));
+}
+
+/**
+ * The mode the New agent form starts on for a harness: its first mode (chat for Claude Code and
+ * Codex), except under the classic UI profile, where Claude Code starts in its own screen as
+ * every Python tmx agent did (the daemon's default for launches that name no mode is the same:
+ * internal/fleet/harness.go defaultModeLocked). The owner can still pick the other one.
+ */
+export function defaultLaunchMode(h: Pick<HarnessInfo, "name" | "modes"> | undefined, classic: boolean): Mode {
+  if (!h?.modes?.length) return "chat";
+  if (classic && h.name === "claude" && h.modes.includes("terminal")) return "terminal";
+  return h.modes[0];
 }
 
 /** The agent shows its harness's own screen now (a TUI, not a shell). */

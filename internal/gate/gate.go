@@ -125,7 +125,8 @@ type Status struct {
 var GatedActions = []string{
 	"Allowing a command the guard held",
 	"Setting a permission mode to Bypass permissions",
-	"Switching the dangerous-command guard off",
+	"Changing what a guard rule does (Blocked, Held for me, Allowed), every time",
+	"Allowing agents to automate a browser",
 	"Deleting a project",
 	"Stopping an agent started outside tmx to adopt it",
 	"Handing Companion a task with money, accounts or outward actions",

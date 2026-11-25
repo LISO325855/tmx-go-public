@@ -82,12 +82,16 @@ func TestSetP2PName(t *testing.T) {
 	}
 }
 
-func TestUpdateRoutesOwnerOnly(t *testing.T) {
+func TestUpdateRoutesWithoutUpdater(t *testing.T) {
 	d := apitest.New(t)
 	owner := client{t: t, base: d.URL, token: d.OwnerToken}
 	agent := client{t: t, base: d.URL, token: d.AgentToken(t, "head")}
 	for _, r := range [][2]string{{"GET", "/api/update"}, {"POST", "/api/update/check"}, {"POST", "/api/update/install"}, {"PUT", "/api/update"}, {"PUT", "/api/update/token"}, {"GET", "/api/update/keys"}, {"PUT", "/api/update/keys"}, {"PUT", "/api/update/drill"}} {
-		if s := agent.do(r[0], r[1], map[string]any{}, nil); s != 403 {
+		want := 403
+		if r[1] == "/api/update" || r[1] == "/api/update/check" || r[1] == "/api/update/install" {
+			want = 501
+		}
+		if s := agent.do(r[0], r[1], map[string]any{}, nil); s != want {
 			t.Errorf("agent %s %s: %d", r[0], r[1], s)
 		}
 		if s := owner.do(r[0], r[1], map[string]any{}, nil); s != 501 { // this test daemon has no updater

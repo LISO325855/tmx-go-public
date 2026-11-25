@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/blackcode-ch/tmx-go/internal/hiddenexec"
 	"github.com/blackcode-ch/tmx-go/internal/runner/host/hosttest"
 )
 
@@ -38,6 +39,10 @@ func TestMain(m *testing.M) {
 		}
 		os.Exit(0)
 	}
+	if os.Getenv("TMXG_FAKE_PROG") == "hold" { // a tool the program started: it keeps the program's stdout open
+		time.Sleep(25 * time.Second)
+		os.Exit(0)
+	}
 	if os.Getenv("TMXG_FAKE_PROG") == "1" {
 		fakeProg()
 		os.Exit(0)
@@ -57,6 +62,17 @@ func fakeProg() {
 		case "bye":
 			fmt.Fprint(os.Stderr, "last words")
 			os.Exit(3)
+		case "tool":
+			// Start something that outlives this program and holds its stdout and stderr, as a
+			// command an agent runs does (a build, a test run).
+			tool := hiddenexec.Command(os.Args[0])
+			tool.Env = append(os.Environ(), "TMXG_FAKE_PROG=hold")
+			tool.Stdout, tool.Stderr = os.Stdout, os.Stderr
+			if err := tool.Start(); err != nil {
+				fmt.Printf("got:tool failed %v\n", err)
+				continue
+			}
+			fmt.Printf("got:tool %d\n", tool.Process.Pid)
 		default:
 			fmt.Printf("got:%s\n", line)
 		}
@@ -193,6 +209,55 @@ func TestPipedHostExit(t *testing.T) {
 	waitGone(t, dir)
 	if _, err := Dial(dir, 0); !errors.Is(err, ErrNoHost) {
 		t.Fatalf("dial after the end: %v", err)
+	}
+}
+
+// The program ends while something it started still holds its output pipe (an agent stopped in
+// the middle of a build): the host reports the exit all the same, with the exit code. Before,
+// it waited for the pipe's end, so a stop of a busy agent never came back.
+func TestPipedHostExitWhileAToolHoldsTheOutput(t *testing.T) {
+	_, c := spawn(t, 0)
+	var got strings.Builder
+	readUntil(t, c, &got, "ready\n")
+	c.Write([]byte("tool\n"))
+	readUntil(t, c, &got, "got:tool ")
+	if strings.Contains(got.String(), "tool failed") {
+		t.Fatalf("the tool did not start: %q", got.String())
+	}
+	// The tool is this test's own helper: end it afterwards (it holds the temp folder and the
+	// test binary). Its pid follows "got:tool " on that line.
+	t.Cleanup(func() {
+		var pid int
+		if i := strings.Index(got.String(), "got:tool "); i >= 0 {
+			fmt.Sscanf(got.String()[i:], "got:tool %d", &pid)
+		}
+		if pid > 0 {
+			if pr, err := os.FindProcess(pid); err == nil {
+				_ = pr.Kill()
+				_, _ = pr.Wait()
+			}
+			time.Sleep(200 * time.Millisecond) // Windows releases its files a moment after the end
+		}
+	})
+	readUntil(t, c, &got, "\n")
+	c.Write([]byte("bye\n"))
+	go io.Copy(io.Discard, c)
+	type exit struct {
+		code int
+		err  error
+	}
+	done := make(chan exit, 1)
+	go func() {
+		code, err := c.Wait()
+		done <- exit{code, err}
+	}()
+	select {
+	case e := <-done:
+		if e.err != nil || e.code != 3 {
+			t.Fatalf("exit %d %v", e.code, e.err)
+		}
+	case <-time.After(12 * time.Second):
+		t.Fatal("the host did not report the program's exit while a tool held its output")
 	}
 }
 
@@ -508,5 +573,59 @@ func TestWaitHostGoneBounded(t *testing.T) {
 				t.Fatalf("exceeded deadline: %v", elapsed)
 			}
 		})
+	}
+}
+
+// A new host is never started beside one that the folder still records and that still runs:
+// the earlier host and its program are ended first; when it cannot be told whether it runs,
+// nothing is started and nothing is removed.
+func TestSpawnEndsTheEarlierHostFirst(t *testing.T) {
+	oldAlive, oldHost, oldProgram := alive, killHost, killProgram
+	defer func() { alive, killHost, killProgram = oldAlive, oldHost, oldProgram }()
+	var ended []string
+	killProgram = func(in info) error { ended = append(ended, "program"); return nil }
+	killHost = func(in info) error { ended = append(ended, "host"); return nil }
+	earlier := info{PID: 4242, Start: 7, Image: "tmx-host-x", ChildPID: 4243, Port: 1, Secret: "s"}
+	noExe := filepath.Join(t.TempDir(), "no-such-tmx")
+
+	alive = func(info) liveness { return hostAlive }
+	dir := t.TempDir()
+	if err := writeJSON(dir, infoFile, earlier); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Spawn(context.Background(), noExe, dir, Spec{Path: "x"}); err == nil {
+		t.Fatal("a host was started from a program that does not exist")
+	}
+	if strings.Join(ended, ",") != "program,host" {
+		t.Fatalf("ended before the new start: %q, want the program, then the host", ended)
+	}
+
+	ended = nil
+	alive = func(info) liveness { return hostUnknown }
+	dir = t.TempDir()
+	if err := writeJSON(dir, infoFile, earlier); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Spawn(context.Background(), noExe, dir, Spec{Path: "x"}); !errors.Is(err, ErrHostUnknown) {
+		t.Fatalf("with an unsure check: %v", err)
+	}
+	if len(ended) != 0 {
+		t.Fatalf("something was ended on an unsure check: %q", ended)
+	}
+	if _, err := os.Stat(filepath.Join(dir, infoFile)); err != nil {
+		t.Fatalf("an unsure check removed host.json: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, specFile)); err == nil {
+		t.Fatal("a spec was written for a host that is not started")
+	}
+
+	// A folder whose recorded host is gone: started as before (here it fails on the program).
+	alive = func(info) liveness { return hostGone }
+	dir = t.TempDir()
+	if err := writeJSON(dir, infoFile, earlier); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Spawn(context.Background(), noExe, dir, Spec{Path: "x"}); err == nil || errors.Is(err, ErrHostUnknown) || len(ended) != 0 {
+		t.Fatalf("with the earlier host gone: %v, ended %q", err, ended)
 	}
 }

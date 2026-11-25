@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 
+	"github.com/blackcode-ch/tmx-go/internal/fleet"
 	"github.com/blackcode-ch/tmx-go/internal/gate"
 )
 
@@ -14,6 +15,27 @@ func (s *Server) agentControlRoutes(mux *http.ServeMux) {
 		mux.HandleFunc("POST "+base+"unshelve", s.unshelveAgent)
 		mux.HandleFunc("POST "+base+"rename", s.renameAgent)
 	}
+	// The rest of the session routes the relay admits (remote.go's remoteSessionPath, Python's
+	// names), so the owner's window on one Go machine can work an agent on another Go machine
+	// exactly as it works one on a Python machine. Each is the SAME handler as its /api/agents
+	// twin (routes.go) - same caller, same authority checks, same answer - never a second
+	// implementation: a caller without the right to stop an agent there has none here either.
+	// "forget" is DELETE /api/agents/{id}: the owner at this machine only, so a relayed request
+	// is refused. "open" is already served for both bases (agent_files.go).
+	mux.HandleFunc("GET /api/sessions/{id}/screen", s.screen)
+	mux.HandleFunc("POST /api/sessions/{id}/keys", s.sendKeys)
+	mux.HandleFunc("POST /api/sessions/{id}/stop", s.act((*fleet.Fleet).StopAgent))
+	mux.HandleFunc("POST /api/sessions/{id}/start", s.start)
+	mux.HandleFunc("POST /api/sessions/{id}/restart", s.restart)
+	mux.HandleFunc("POST /api/sessions/{id}/forget", s.ownerOnly(s.removeAgent))
+	// "send" is NOT the twin of POST /api/agents/{id}/send (the owner's mail, sent as the owner
+	// and for the owner alone). On a Python machine, and for the Python CLI that calls this
+	// path (`tmx send name@machine`), it types text into the agent: body {text, submit}. So it
+	// is POST /api/agents/{id}/type under Python's name - what a paired machine may already do,
+	// with typeText's own checks; nothing it sends ever becomes mail from the owner.
+	mux.HandleFunc("POST /api/sessions/{id}/send", s.typeText)
+	// POST /api/sessions launches, as POST /api/agents does (Go's own body: fleet.LaunchRequest).
+	mux.HandleFunc("POST /api/sessions", s.launch)
 }
 
 func (s *Server) renameAgent(w http.ResponseWriter, r *http.Request) {

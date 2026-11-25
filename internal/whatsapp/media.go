@@ -21,7 +21,7 @@ import (
 	"github.com/blackcode-ch/tmx-go/internal/store"
 )
 
-// Attachments are fetched from WhatsApp only when someone opens them, into whatsapp/media/
+// Attachments are fetched by the background worker or on demand into whatsapp/media/
 // (0600, folder 0700), up to the size cap (config whatsapp.media_max_mb, default 64 MB).
 // Files the owner sends are kept there from the start.
 
@@ -79,6 +79,10 @@ func fileName(chat, id, mimeType string) string {
 
 // Media returns a message's attachment, downloading it first if needed.
 func (s *Service) Media(ctx context.Context, chat, id string) (MediaFile, error) {
+	return s.media(ctx, chat, id, false)
+}
+
+func (s *Service) media(ctx context.Context, chat, id string, automatic bool) (MediaFile, error) {
 	if err := s.ready(false); err != nil {
 		return MediaFile{}, err
 	}
@@ -89,7 +93,7 @@ func (s *Service) Media(ctx context.Context, chat, id string) (MediaFile, error)
 	if err != nil {
 		return MediaFile{}, err
 	}
-	if row.Media == nil {
+	if row.Media == nil || row.Deleted {
 		return MediaFile{}, errorf(http.StatusNotFound, "this message has no attachment")
 	}
 	out := MediaFile{Mime: firstNonEmpty(row.Media.Mime, "application/octet-stream"), Name: row.Media.Name}
@@ -117,10 +121,11 @@ func (s *Service) Media(ctx context.Context, chat, id string) (MediaFile, error)
 	if err := s.ready(true); err != nil {
 		return MediaFile{}, err
 	}
-	name, err := s.download(ctx, chat, id, ref, out.Mime, limit)
+	name, err := s.download(ctx, chat, id, ref, out.Mime, limit, automatic)
 	if err != nil {
 		return MediaFile{}, err
 	}
+	signal(s.maintenanceWake)
 	st, err := os.Stat(s.mediaPath(name))
 	if err != nil {
 		return MediaFile{}, err
@@ -131,7 +136,7 @@ func (s *Service) Media(ctx context.Context, chat, id string) (MediaFile, error)
 }
 
 // download fetches one attachment once, however many ask at the same time.
-func (s *Service) download(ctx context.Context, chat, id string, ref MediaRef, mimeType string, limit int64) (string, error) {
+func (s *Service) download(ctx context.Context, chat, id string, ref MediaRef, mimeType string, limit int64, automatic bool) (string, error) {
 	key := chat + "\x00" + id
 	for {
 		s.mu.Lock()
@@ -158,18 +163,56 @@ func (s *Service) download(ctx context.Context, chat, id string, ref MediaRef, m
 			return "", ctx.Err()
 		}
 	}
+	select {
+	case s.mediaWrite <- struct{}{}:
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+	defer func() { <-s.mediaWrite }()
 	if err := os.MkdirAll(s.o.MediaDir, 0o700); err != nil {
 		return "", err
 	}
 	name := fileName(chat, id, mimeType)
+	budget, err := s.mediaBudget(automatic)
+	if err != nil {
+		return "", err
+	}
+	wireLimit := limit
+	if len(ref.MediaKey) > 0 {
+		wireLimit += 26
+	} // AES padding plus HMAC
+	wireLimit = min(wireLimit, budget)
+	dctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+	defer cancel()
+	s.evMu.Lock()
+	// A delete while waiting for the writer slot must not create a new partial.
+	current, getErr := s.o.Store.WaGetMessage(chat, id)
+	if getErr != nil || current.Deleted || current.MediaRef != encodeRef(ref) {
+		s.evMu.Unlock()
+		return "", errorf(http.StatusNotFound, "this attachment is no longer available")
+	}
 	tmp, err := os.CreateTemp(s.o.MediaDir, ".download-*")
+	if err == nil {
+		s.markMedia(filepath.Base(tmp.Name()), true)
+		s.mu.Lock()
+		s.downloadCancels[key] = cancel
+		s.mu.Unlock()
+	}
+	s.evMu.Unlock()
 	if err != nil {
 		return "", err
 	}
 	defer os.Remove(tmp.Name()) // after the rename: nothing to remove
-	dctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
-	defer cancel()
-	err = s.o.Client.Download(dctx, ref, tmp)
+	defer s.markMedia(filepath.Base(tmp.Name()), false)
+	defer func() { s.mu.Lock(); delete(s.downloadCancels, key); s.mu.Unlock() }()
+	bounded := &limitedMediaFile{file: tmp, limit: wireLimit, cancel: cancel}
+	if automatic {
+		bounded.free = s.mediaFree
+	}
+	err = s.o.Client.Download(dctx, ref, bounded)
+	if bounded.err != nil {
+		err = bounded.err
+	}
 	if err == nil {
 		var st os.FileInfo
 		if st, err = tmp.Stat(); err == nil && st.Size() > limit {
@@ -190,10 +233,18 @@ func (s *Service) download(ctx context.Context, chat, id string, ref MediaRef, m
 	if err := os.Chmod(tmp.Name(), 0o600); err != nil {
 		return "", err
 	}
+	// A revoke, unlink or account change during the download must not restore media.
+	s.evMu.Lock()
+	defer s.evMu.Unlock()
+	cur, err := s.o.Store.WaGetMessage(chat, id)
+	if err != nil || cur.Deleted || cur.Media == nil || cur.MediaRef != encodeRef(ref) {
+		return "", errorf(http.StatusNotFound, "this attachment is no longer available")
+	}
 	if err := os.Rename(tmp.Name(), s.mediaPath(name)); err != nil {
 		return "", err
 	}
 	if err := s.o.Store.WaSetMediaFile(chat, id, name); err != nil {
+		s.removeFile(name)
 		return "", err
 	}
 	return name, nil
@@ -201,14 +252,28 @@ func (s *Service) download(ctx context.Context, chat, id string, ref MediaRef, m
 
 // keepFile stores a file the owner sends as the message's attachment.
 func (s *Service) keepFile(chat, id, mimeType string, data []byte) string {
+	select {
+	case s.mediaWrite <- struct{}{}:
+	case <-s.ctx.Done():
+		return ""
+	}
+	defer func() { <-s.mediaWrite }()
 	if s.o.MediaDir == "" || os.MkdirAll(s.o.MediaDir, 0o700) != nil {
 		return ""
 	}
 	name := fileName(chat, id, mimeType)
+	budget, err := s.mediaBudget(false)
+	if err != nil || int64(len(data)) > budget || int64(len(data)) > s.o.Config().MediaMax() {
+		return ""
+	}
+	s.evMu.Lock()
+	defer s.evMu.Unlock()
 	if err := os.WriteFile(s.mediaPath(name), data, 0o600); err != nil {
+		s.removeFile(name)
 		s.log.Warn("whatsapp keep file", "err", err)
 		return ""
 	}
+	s.markMedia(name, true) // retained until the outbound row is stored
 	return name
 }
 

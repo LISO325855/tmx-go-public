@@ -3,7 +3,9 @@ import { Pin, PinOff } from "lucide-react";
 import { toast } from "sonner";
 import { onBusEvent, useStore } from "@/lib/store";
 import { changeMessagePin, loadMessagePins, pinMessage, useMessagePins, type MessageSelection } from "@/lib/message-pins";
+import { pinsStripVisible } from "@/lib/message-pins-view";
 import { relativeTime } from "@/lib/format";
+import { useClassic } from "@/hooks/use-classic";
 import { useNow } from "@/hooks/use-now";
 import type { TimelineEntry } from "@/lib/types";
 
@@ -12,6 +14,8 @@ const control = "min-h-11 min-w-11 rounded-md border px-3 py-2 text-base font-se
 export function PinMessageButton({ selection }: { selection: MessageSelection }) {
   const pin = useMessagePins((s) => s.pins.find((p) => p.source === selection.source && p.state === "active"));
   const [busy, setBusy] = useState(false);
+  // Classic (the Python dashboard has no pins; architect, 17 Nov): no Pin button on any message.
+  if (useClassic()) return null;
   return <button type="button" className={control + " inline-flex items-center gap-2"} disabled={busy} aria-pressed={!!pin}
     aria-label={pin ? "Unpin message" : "Pin message"} onClick={async () => {
       setBusy(true);
@@ -34,15 +38,21 @@ export function MessagePinsStrip() {
   const status = useStore((s) => s.status);
   const [done, setDone] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
+  const classic = useClassic();
   useNow(30_000);
   useEffect(() => {
+    if (classic) return; // classic has no pins: nothing to load, nothing to draw
     void loadMessagePins();
     const off = onBusEvent((e) => { if (e.type === "message.pins.changed" || e.type === "snapshot") void loadMessagePins(); });
     const refresh = () => { if (!document.hidden) void loadMessagePins(); };
     window.addEventListener("focus", refresh);
     document.addEventListener("visibilitychange", refresh);
     return () => { off(); window.removeEventListener("focus", refresh); document.removeEventListener("visibilitychange", refresh); };
-  }, [transport, status]);
+  }, [transport, status, classic]);
+  // Classic: the strip is gone, pinned or not.
+  if (classic) return null;
+  // Nothing pinned (active or done) and nothing to report: the strip takes no room.
+  if (!pinsStripVisible(pins.length, error)) return null;
   const active = pins.filter((p) => p.state === "active");
   const finished = pins.filter((p) => p.state === "done");
   const shown = done ? finished : active;

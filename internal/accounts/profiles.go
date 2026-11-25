@@ -36,6 +36,8 @@ var (
 	ErrExists    = errors.New("that account already exists")
 	ErrNoAccount = errors.New("no such account")
 	ErrTooMany   = fmt.Errorf("at most %d accounts per harness", MaxPerHarness)
+	// ErrIsDefault is kept for callers that still name it; the default account is hidden now
+	// (Remove), not refused.
 	ErrIsDefault = errors.New("the default account cannot be removed")
 )
 
@@ -48,14 +50,19 @@ type profileFile struct {
 	Names map[model.Harness][]string `json:"names"`
 	// Defaults is each harness's account for an agent launched without one ("" = "default").
 	Defaults map[model.Harness]string `json:"defaults"`
+	// Hidden lists the harnesses whose "default" account the owner took off the list (Remove
+	// on its card). Only the list changes: the harness's own sign-in stays, and agents that
+	// use the default account keep using it. Adding "default" again shows it.
+	Hidden []model.Harness `json:"hidden,omitempty"`
 }
 
 // Profiles is the list of accounts per harness, kept in <root>/profiles.json; each account's
 // home is <root>/homes/<harness>/<name>.
 type Profiles struct {
-	root string
-	mu   sync.Mutex
-	f    profileFile
+	root        string
+	defaultHome string
+	mu          sync.Mutex
+	f           profileFile
 }
 
 // OpenProfiles reads root's list; a missing file is the single "default" account per harness.
@@ -87,16 +94,47 @@ func OpenProfiles(root string) (*Profiles, error) {
 			p.f.Defaults[h] = n
 		}
 	}
+	for _, h := range f.Hidden {
+		if Known(string(h)) && !slices.Contains(p.f.Hidden, h) {
+			p.f.Hidden = append(p.f.Hidden, h)
+		}
+	}
 	return p, nil
 }
 
 func (p *Profiles) file() string { return filepath.Join(p.root, "profiles.json") }
 
-// Names is h's accounts: "default" first, then the others in the order added.
+// Names is h's listed accounts: "default" first (unless the owner hid it), then the others in
+// the order added.
 func (p *Profiles) Names(h model.Harness) []string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if slices.Contains(p.f.Hidden, h) {
+		return slices.Clone(p.f.Names[h])
+	}
 	return append([]string{DefaultName}, p.f.Names[h]...)
+}
+
+// HiddenDefaults are the harnesses whose default account is off the list.
+func (p *Profiles) HiddenDefaults() []model.Harness {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return slices.Clone(p.f.Hidden)
+}
+
+// setHiddenLocked hides or shows h's default account on the list and saves.
+func (p *Profiles) setHiddenLocked(h model.Harness, hidden bool) error {
+	old := slices.Clone(p.f.Hidden)
+	if hidden {
+		p.f.Hidden = append(p.f.Hidden, h)
+	} else {
+		p.f.Hidden = slices.DeleteFunc(p.f.Hidden, func(x model.Harness) bool { return x == h })
+	}
+	if err := p.saveLocked(); err != nil {
+		p.f.Hidden = old
+		return err
+	}
+	return nil
 }
 
 // Has reports whether h has the account name ("" = the default).
@@ -140,7 +178,13 @@ func (p *Profiles) Add(h model.Harness, name string) error {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if name == DefaultName || slices.Contains(p.f.Names[h], name) {
+	if name == DefaultName {
+		if !slices.Contains(p.f.Hidden, h) {
+			return ErrExists
+		}
+		return p.setHiddenLocked(h, false) // the default account is listed again; nothing else changed meanwhile
+	}
+	if slices.Contains(p.f.Names[h], name) {
 		return ErrExists
 	}
 	if len(p.f.Names[h]) >= MaxPerHarness-1 {
@@ -167,13 +211,21 @@ func (p *Profiles) Add(h model.Harness, name string) error {
 }
 
 // Remove takes the account name off h's list. Its home is left in place (the owner signs out
-// first; tmx deletes no credentials): adding the name again finds it signed in.
+// first; tmx deletes no credentials): adding the name again finds it signed in. The default
+// account is only hidden: it is the harness's own sign-in, which tmx neither owns nor ends, and
+// launches without an account keep using it.
 func (p *Profiles) Remove(h model.Harness, name string) error {
-	if name == DefaultName || name == "" {
-		return ErrIsDefault
-	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if name == DefaultName || name == "" {
+		if !Known(string(h)) {
+			return ErrUnknown
+		}
+		if slices.Contains(p.f.Hidden, h) {
+			return ErrNoAccount
+		}
+		return p.setHiddenLocked(h, true)
+	}
 	i := slices.Index(p.f.Names[h], name)
 	if i < 0 {
 		return ErrNoAccount
@@ -217,8 +269,15 @@ func (p *Profiles) SetDefault(h model.Harness, name string) error {
 	return nil
 }
 
-// Home is the private home of h's account name; "" for "default" (the harness's usual one).
+// Home is the account's private home. The default uses the harness's usual home
+// unless IsolateDefaults configured node-local storage.
 func (p *Profiles) Home(h model.Harness, name string) string {
+	if (name == "" || name == DefaultName) && p.defaultHome != "" {
+		if h == Claude {
+			return filepath.Join(p.defaultHome, "claude-config")
+		}
+		return p.home(h, DefaultName)
+	}
 	if name == "" || name == DefaultName || !ValidName(name) {
 		return ""
 	}
@@ -246,7 +305,7 @@ func HomeEnv(h model.Harness, home string) []string {
 		return []string{"CODEX_HOME=" + home}
 	case Antigravity:
 		// agy has no variable of its own for ~/.gemini: its home folder is moved instead.
-		return []string{"HOME=" + home, "USERPROFILE=" + home}
+		return []string{"HOME=" + home, "USERPROFILE=" + home, "APPDATA=" + filepath.Join(home, "AppData", "Roaming"), "LOCALAPPDATA=" + filepath.Join(home, "AppData", "Local"), "XDG_CONFIG_HOME=" + filepath.Join(home, ".config")}
 	case Gemini:
 		// GEMINI_CLI_HOME moves ~/.gemini; the sign-in's token would still go to the OS
 		// keychain under one name for every home, so it is kept in that folder's file (gemini.go).
@@ -269,3 +328,6 @@ func (p *Profiles) saveLocked() error {
 	}
 	return os.Rename(tmp, p.file())
 }
+
+// IsolateDefaults must be called before sharing Profiles with services or agents.
+func (p *Profiles) IsolateDefaults(nodeHome string) { p.defaultHome = nodeHome }

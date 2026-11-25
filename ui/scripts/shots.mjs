@@ -335,7 +335,7 @@ const SHOTS = [
     async (p) => {
       await p.getByText("Kill processes by name").first().click();
       await p.waitForTimeout(250);
-      await p.getByText("Dangerous-command guard", { exact: true }).scrollIntoViewIfNeeded();
+      await p.getByText("Command guard", { exact: true }).scrollIntoViewIfNeeded();
       await p.waitForTimeout(250);
     },
   ],

@@ -8,6 +8,7 @@ import (
 
 	"github.com/blackcode-ch/tmx-go/internal/config"
 	"github.com/blackcode-ch/tmx-go/internal/model"
+	"github.com/blackcode-ch/tmx-go/internal/slots"
 	"github.com/blackcode-ch/tmx-go/internal/sysinfo"
 )
 
@@ -262,6 +263,37 @@ func TestMemGuardPausesOneAtATimeByPriorityNeverTheHead(t *testing.T) {
 	}
 	if ok, _ := r.m.Admit(0); !ok {
 		t.Fatal("warn must not refuse starts")
+	}
+}
+
+// Voice uses an owner-held heavy slot, independently of agent-start admission.
+// A refusal must not pause an existing voice lease or prevent the next note.
+func TestMemGuardRefuseDoesNotGateVoiceSlots(t *testing.T) {
+	r := protectRig(t, config.Resources{Slots: map[string]int{"heavy": 1}})
+	sl := slots.New(slots.Options{Sizes: map[string]int{"heavy": 1}})
+	r.m.opts.Slots = sl
+	owner := slots.Holder{}
+	first, err := sl.Acquire("heavy", owner, "voice transcription: dictation", 0)
+	if err != nil || first.State != slots.Held {
+		t.Fatalf("first note: %+v %v", first, err)
+	}
+	r.setMachine(5.5, 25)
+	r.step()
+	if ok, _ := r.m.Admit(0); ok {
+		t.Fatal("test did not reach memory refusal")
+	}
+	if renewed, err := sl.Renew(first.ID, owner); err != nil || renewed.State != slots.Held {
+		t.Fatalf("refusal interrupted voice: %+v %v", renewed, err)
+	}
+	if err := sl.Release(first.ID, owner); err != nil {
+		t.Fatal(err)
+	}
+	next, err := sl.Acquire("heavy", owner, "voice transcription: dictation", 0)
+	if err != nil || next.State != slots.Held {
+		t.Fatalf("refusal delayed the next note: %+v %v", next, err)
+	}
+	if len(r.fleet.brakes) != 0 {
+		t.Fatalf("refusal paused agents: %v", r.fleet.brakes)
 	}
 }
 

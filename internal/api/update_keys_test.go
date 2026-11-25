@@ -87,13 +87,16 @@ func TestUpdateKeysRepin(t *testing.T) {
 	}
 }
 
-// v1 refuses turning automatic installs on, and an install of a tag that is not a fleet release
-// tag, both before anyone is asked. A valid tag asks with the tag in the reason, then is checked
+// Auto-on is accepted with the gate off. Invalid fleet tags are refused before
+// anyone is asked. A valid tag asks with the tag in the reason, then is checked
 // (here: a dev build, updates off = 409).
 func TestUpdateAutoOnAndInstallTag(t *testing.T) {
 	d, owner, _, _ := configAndUpdateDaemon(t)
-	if s, _ := call(t, owner, "PUT", "/api/update", map[string]bool{"auto": true}, nil); s != http.StatusBadRequest {
+	if s, _ := call(t, owner, "PUT", "/api/update", map[string]bool{"auto": true}, nil); s != 0 {
 		t.Fatalf("auto on: %d", s)
+	}
+	if a := d.UpdateSettings().Auto; a == nil || !*a {
+		t.Fatal("auto on was not saved")
 	}
 	for _, tag := range []string{"v1.0.0", "fleet-v1.0.0-2-gabcdef0", "latest"} {
 		if s, _ := call(t, owner, "POST", "/api/update/install", map[string]any{"tag": tag}, nil); s != http.StatusBadRequest {

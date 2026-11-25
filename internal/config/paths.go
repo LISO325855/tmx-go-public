@@ -37,7 +37,7 @@ func defaultHome() (string, error) {
 	if h := os.Getenv(EnvHome); h != "" {
 		return filepath.Abs(h)
 	}
-	return OSDefaultHome()
+	return selectedOSHome()
 }
 
 // OSDefaultHome is the per-OS state directory used when $TMXG_HOME is not set.

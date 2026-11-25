@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"github.com/blackcode-ch/tmx-go/internal/config"
 	"net/http"
-	"strings"
 )
 
 // ExportStream pulls an offered export using the configured peer URL and pair token.
@@ -22,7 +21,7 @@ func (c *Client) RelayExportStream(ctx context.Context, via, source, ticket stri
 	return c.exportStream(ctx, via, source, ticket, offset)
 }
 func (c *Client) exportStream(ctx context.Context, host, source, ticket string, offset int64) (*http.Response, error) {
-	p, ok := c.peers[strings.ToLower(host)]
+	p, ok := c.lookup(host)
 	if !ok {
 		return nil, fmt.Errorf("unknown peer %s", host)
 	}

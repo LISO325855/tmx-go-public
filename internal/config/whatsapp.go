@@ -3,6 +3,7 @@ package config
 import (
 	"path/filepath"
 	"slices"
+	"time"
 
 	"github.com/blackcode-ch/tmx-go/internal/model"
 )
@@ -19,8 +20,18 @@ type WhatsAppConfig struct {
 	NotifyHeadChats []string `json:"notify_head_chats,omitempty"`
 	// AgentProfiles may read WhatsApp and ask to send; nil = only the head ("head").
 	AgentProfiles []string `json:"agent_profiles,omitempty"`
+	// ChatAccess: per profile slug or "agent:<name>", the chats its agents may read and ask to
+	// write to (model.WaSettings.ChatAccess).
+	ChatAccess map[string]model.WaChatAccess `json:"chat_access,omitempty"`
+	// PrivateChats: chats the head may not read (model.WaSettings.PrivateChats).
+	PrivateChats []string `json:"private_chats,omitempty"`
 	// MediaMaxMB caps one downloaded attachment; 0 = 64.
 	MediaMaxMB int `json:"media_max_mb,omitempty"`
+	// MediaRetentionDays expires cached files by write time; <=0 = 30 days.
+	// Positive values are capped at 100 years to keep duration arithmetic bounded.
+	MediaRetentionDays int `json:"media_retention_days,omitempty"`
+	// MediaQuotaMB caps the entire media cache; <=0 = 2048 MB.
+	MediaQuotaMB int `json:"media_quota_mb,omitempty"`
 }
 
 // On reports whether the WhatsApp service runs (default false).
@@ -29,7 +40,7 @@ func (w *WhatsAppConfig) On() bool { return w != nil && w.Enabled != nil && *w.E
 // Settings returns the owner's settings with the defaults filled in (w may be nil).
 func (w *WhatsAppConfig) Settings() model.WaSettings {
 	s := model.WaSettings{AgentsSend: model.WaAgentsAsk, AllowedChats: []string{}, NotifyHeadChats: []string{},
-		AgentProfiles: []string{"head"}}
+		AgentProfiles: []string{"head"}, ChatAccess: map[string]model.WaChatAccess{}, PrivateChats: []string{}}
 	if w == nil {
 		return s
 	}
@@ -46,6 +57,12 @@ func (w *WhatsAppConfig) Settings() model.WaSettings {
 	if w.AgentProfiles != nil {
 		s.AgentProfiles = slices.Clone(w.AgentProfiles)
 	}
+	for k, a := range w.ChatAccess {
+		s.ChatAccess[k] = model.WaChatAccess{Read: append([]string{}, a.Read...), Send: append([]string{}, a.Send...)}
+	}
+	if w.PrivateChats != nil {
+		s.PrivateChats = slices.Clone(w.PrivateChats)
+	}
 	return s
 }
 
@@ -56,6 +73,14 @@ func (w *WhatsAppConfig) SetSettings(s model.WaSettings) {
 	w.AllowedChats = slices.Clone(s.AllowedChats)
 	w.NotifyHeadChats = slices.Clone(s.NotifyHeadChats)
 	w.AgentProfiles = slices.Clone(s.AgentProfiles)
+	w.PrivateChats = slices.Clone(s.PrivateChats)
+	w.ChatAccess = nil
+	for k, a := range s.ChatAccess {
+		if w.ChatAccess == nil {
+			w.ChatAccess = map[string]model.WaChatAccess{}
+		}
+		w.ChatAccess[k] = model.WaChatAccess{Read: slices.Clone(a.Read), Send: slices.Clone(a.Send)}
+	}
 }
 
 // MediaMax is the largest attachment the daemon downloads, in bytes.
@@ -64,6 +89,21 @@ func (w *WhatsAppConfig) MediaMax() int64 {
 		return 64 << 20
 	}
 	return int64(min(w.MediaMaxMB, 2048)) << 20
+}
+
+func (w *WhatsAppConfig) MediaRetention() time.Duration {
+	days := 30
+	if w != nil && w.MediaRetentionDays > 0 {
+		days = min(w.MediaRetentionDays, 36500)
+	}
+	return time.Duration(days) * 24 * time.Hour
+}
+
+func (w *WhatsAppConfig) MediaQuota() int64 {
+	if w == nil || w.MediaQuotaMB <= 0 {
+		return 2 << 30
+	}
+	return int64(min(w.MediaQuotaMB, 1<<20)) << 20
 }
 
 // WhatsAppDB is whatsmeow's own database: the linked device's keys and sessions. It is a

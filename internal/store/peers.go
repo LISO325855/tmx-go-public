@@ -16,21 +16,23 @@ const (
 // PeerMessage maps a local message to its wire ID on a peer machine (fleet peer mail).
 // NextAttemptAt > 0: an outbound message still to be sent (at or after that time).
 type PeerMessage struct {
-	LocalID       string
-	Peer          string
-	WireID        string
-	Direction     string // PeerIn or PeerOut
-	SHA256        string // of the body, lowercase hex
-	Attempts      int
-	NextAttemptAt int64
-	LastError     string
+	VerifiedGeneration string
+	VerifiedSender     string // receiving daemon's authenticated local-agent attestation
+	LocalID            string
+	Peer               string
+	WireID             string
+	Direction          string // PeerIn or PeerOut
+	SHA256             string // of the body, lowercase hex
+	Attempts           int
+	NextAttemptAt      int64
+	LastError          string
 }
 
-const peerCols = `local_id, peer, wire_id, direction, sha256, attempts, next_attempt_at, last_error`
+const peerCols = `local_id, peer, wire_id, direction, sha256, attempts, next_attempt_at, last_error, verified_sender, verified_generation`
 
 func scanPeer(r scanner) (PeerMessage, error) {
 	var p PeerMessage
-	err := r.Scan(&p.LocalID, &p.Peer, &p.WireID, &p.Direction, &p.SHA256, &p.Attempts, &p.NextAttemptAt, &p.LastError)
+	err := r.Scan(&p.LocalID, &p.Peer, &p.WireID, &p.Direction, &p.SHA256, &p.Attempts, &p.NextAttemptAt, &p.LastError, &p.VerifiedSender, &p.VerifiedGeneration)
 	if errors.Is(err, sql.ErrNoRows) {
 		err = ErrNotFound
 	}
@@ -45,12 +47,12 @@ func (s *Store) PutPeerMessage(m model.Message, p PeerMessage) error {
 		return err
 	}
 	defer tx.Rollback()
-	if _, err := tx.Exec(`INSERT INTO peer_messages (`+peerCols+`) VALUES (?,?,?,?,?,?,?,?)`,
-		p.LocalID, p.Peer, p.WireID, p.Direction, p.SHA256, p.Attempts, p.NextAttemptAt, p.LastError); err != nil {
+	if _, err := tx.Exec(`INSERT INTO peer_messages (`+peerCols+`) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+		p.LocalID, p.Peer, p.WireID, p.Direction, p.SHA256, p.Attempts, p.NextAttemptAt, p.LastError, p.VerifiedSender, p.VerifiedGeneration); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(upsert("messages", messageCols),
-		m.ID, m.From, m.To, m.Body, m.State, nullable(m.ReplyTo), m.CreatedAt, m.DeliveredAt, m.ThreadID, m.RetryID, m.RetryHash, m.Receipt, m.ReceiptAt); err != nil {
+		m.ID, m.From, m.To, m.Body, m.State, nullable(m.ReplyTo), m.CreatedAt, m.DeliveredAt, m.ThreadID, m.RetryID, m.RetryHash, m.Receipt, m.ReceiptAt, m.Urgent); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -102,7 +104,7 @@ func (s *Store) SetPeerAttempt(localID string, attempts int, next int64, lastErr
 // putPeerMapping participates in the caller's transaction so owner decisions
 // cannot commit without the durable peer outbox entry needed to deliver them.
 func putPeerMapping(tx *sql.Tx, p PeerMessage) error {
-	_, err := tx.Exec(`INSERT INTO peer_messages (`+peerCols+`) VALUES (?,?,?,?,?,?,?,?)`,
-		p.LocalID, p.Peer, p.WireID, p.Direction, p.SHA256, p.Attempts, p.NextAttemptAt, p.LastError)
+	_, err := tx.Exec(`INSERT INTO peer_messages (`+peerCols+`) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+		p.LocalID, p.Peer, p.WireID, p.Direction, p.SHA256, p.Attempts, p.NextAttemptAt, p.LastError, p.VerifiedSender, p.VerifiedGeneration)
 	return err
 }

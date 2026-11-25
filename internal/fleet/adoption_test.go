@@ -177,8 +177,22 @@ func TestInstructionsAgainForTerminalHarnesses(t *testing.T) {
 	if !strings.HasPrefix(f.instructionsLocked(r), "[tmx instructions]") {
 		t.Fatal("no reminder after instructionsEvery")
 	}
-	c := &agentRec{a: model.Agent{ID: "a-cl", Name: "cl", Harness: model.HarnessClaude, Level: model.LevelWorker}, instructionsDue: true}
+	// A harness that takes its instructions at launch (Claude): never from time to time, but
+	// once after a start on an earlier conversation, where the launch instructions do not
+	// reach (17 Nov, harness.go resumedNoteLocked).
+	c := &agentRec{a: model.Agent{ID: "a-cl", Name: "cl", Harness: model.HarnessClaude, Level: model.LevelWorker}, sessionConfirmed: true}
 	if f.instructionsLocked(c) != "" {
-		t.Fatal("a harness with a system prompt got them typed in")
+		t.Fatal("a harness with a system prompt got them typed in without a new start")
+	}
+	c.instructionsAt = time.Now().Add(-instructionsEvery - time.Minute)
+	if f.instructionsLocked(c) != "" {
+		t.Fatal("a harness with a system prompt got a reminder from time to time")
+	}
+	c.instructionsDue = true // a start on its earlier conversation
+	if got := f.instructionsLocked(c); !strings.HasPrefix(got, "[tmx instructions: you were started again") || !strings.Contains(got, `"cl"`) {
+		t.Fatalf("after a start on an earlier conversation: %q", got)
+	}
+	if f.instructionsLocked(c) != "" {
+		t.Fatal("the instructions were given twice for one start")
 	}
 }

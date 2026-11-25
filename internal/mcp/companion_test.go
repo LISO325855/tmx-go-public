@@ -79,10 +79,16 @@ func TestCompanionMessageTool(t *testing.T) {
 	}
 	wait(model.CompanionCompleted)
 
-	// send to companion: the same path; one that reads like an errand waits for the owner.
+	// send to companion: the same path; a money word makes no card (it did until 17 Nov).
 	out = mustOK(t, head, "send", map[string]any{"to": "companion", "body": "Please buy two tickets for Friday"})
-	if !strings.HasPrefix(out, "This reads like it asks Companion to act (may spend or move money); it waits for the owner's approval") {
+	if !strings.HasPrefix(out, "Sent to Companion as message ") {
 		t.Fatalf("send to companion: %s", out)
+	}
+	// companion_status: the link's state and what became of each message, for the head.
+	out = mustOK(t, head, "companion_status", map[string]any{})
+	if !strings.Contains(out, "Companion link: connected (a key is set) yes") || !strings.Contains(out, "- message ") ||
+		!strings.Contains(out, "Please buy two tickets for Friday") {
+		t.Fatalf("companion_status: %s", out)
 	}
 
 	// reply to Companion's mail (tmx_message_head) starts a new message.
@@ -228,7 +234,7 @@ func TestCompanionTaskToolFollowsProfile(t *testing.T) {
 		t.Fatal("companion_task missing once the profile allows it")
 	}
 	cs := session(t, d, "head")
-	out := mustOK(t, cs, "companion_task", map[string]any{"goal": "Check the train times to Bern", "steps": []string{"open sbb.ch"}})
+	out := mustOK(t, cs, "companion_task", map[string]any{"goal": "Send the train times to the client", "steps": []string{"open sbb.ch"}})
 	if !strings.Contains(out, "waiting for the owner's OK") || !strings.Contains(out, "1. open sbb.ch") {
 		t.Fatalf("companion_task: %s", out)
 	}
@@ -239,5 +245,9 @@ func TestCompanionTaskToolFollowsProfile(t *testing.T) {
 	out = mustOK(t, cs, "companion_task_status", map[string]any{"id": list[0].ID})
 	if !strings.Contains(out, "awaiting_approval") {
 		t.Fatalf("status: %s", out)
+	}
+	out = mustOK(t, cs, "companion_task_cancel", map[string]any{"id": list[0].ID})
+	if !strings.Contains(out, "canceled") {
+		t.Fatalf("cancel: %s", out)
 	}
 }

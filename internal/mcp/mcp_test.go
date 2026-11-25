@@ -101,7 +101,7 @@ func TestToolList(t *testing.T) {
 					t.Errorf("earlier tool name %q is not registered", o)
 				}
 			}
-			want := "agent_keys,agent_launch,agent_restart,agent_screen,agent_start,agent_status,agent_stop,agent_type,announce_set,ask_owner,chat_move,chat_read,chat_send,chat_topic,chats,companion_message,daemon_log,daemon_restart,fleet,inbox,matrix,message_pins,my_part,owner_status,p2p_fetch_file,p2p_files,p2p_invite_create,p2p_join,p2p_send_file,process_start,process_stop,processes,profiles,project_artifacts,project_create,project_import,project_member_add,recording_summary,recordings,reply,report,send,thread_add,thread_read,thread_set,thread_update,threads,tmx_person_ask_close,tmx_person_draft_withdraw,tmx_person_outbox,tmx_person_propose,transcript_read,transcripts,whatsapp_chats,whatsapp_read,whatsapp_send,whoami,withdraw_hold"
+			want := "agent_edit,agent_keys,agent_launch,agent_mode,agent_remove,agent_restart,agent_screen,agent_shelve,agent_start,agent_status,agent_stop,agent_type,agent_unshelve,announce_set,ask_owner,cards_close,chat_move,chat_read,chat_send,chat_topic,chats,companion_message,companion_status,companion_task_cancel,daemon_log,daemon_restart,fleet,inbox,machine_process_restart,machine_process_stop,machine_processes,matrix,message_pins,my_cards,my_part,owner_status,p2p_fetch_file,p2p_files,p2p_invite_create,p2p_invite_whatsapp,p2p_join,p2p_send_file,people,person_message,person_remove,person_set,process_start,process_stop,processes,profile_delete,profile_reset,profile_set,profiles,project_artifacts,project_create,project_delete,project_import,project_lead_set,project_member_add,project_update,promise_close,promise_drop,promise_list,promise_propose,recording_summary,recordings,reply,report,resource,resources,rules_read,send,thread_add,thread_read,thread_set,thread_update,threads,transcript_read,transcripts,whatsapp_chats,whatsapp_read,whatsapp_send,whoami,withdraw_card,withdraw_hold"
 			if !enabled {
 				want = strings.Replace(want, "whatsapp_chats,whatsapp_read,whatsapp_send,", "", 1)
 			}
@@ -223,7 +223,7 @@ func TestProfilesTool(t *testing.T) {
 	lead := session(t, d, "shop-lead")
 	out := mustOK(t, lead, "profiles", nil)
 	if !strings.Contains(out, "Your profile: Lead (lead)") || !strings.Contains(out, "- reviewer: Reviewer, a worker on claude-sonnet-5, read-only") ||
-		strings.Contains(out, "- head") {
+		!strings.Contains(out, "opencode, account none, provider fae") || strings.Contains(out, "- head") {
 		t.Fatalf("profiles: %s", out)
 	}
 	out = mustOK(t, lead, "agent_launch", map[string]any{"name": "rev", "profile": "reviewer", "task": "review the diff"})
@@ -291,15 +291,19 @@ func TestThreadLogTools(t *testing.T) {
 	out := mustOK(t, lead, "thread_add", map[string]any{"kind": "decision", "text": "Use SQLite, not Postgres."})
 	id := strings.TrimSuffix(out[strings.Index(out, "[")+1:], "].")
 	mustOK(t, lead, "thread_add", map[string]any{"kind": "decision", "text": "Use Postgres after all.", "corrects": id})
-	if out, isErr := call(t, lead, "thread_add", map[string]any{"kind": "info", "text": "token=" + "ghp_" + strings.Repeat("A1b2", 8)}); !isErr || !strings.Contains(out, "secret") {
-		t.Fatalf("secret filed: %s", out)
+	// A line with a token in it is filed as written: no filter, no rewrite (17 Nov).
+	if out, isErr := call(t, lead, "thread_add", map[string]any{"kind": "info", "text": "token=" + "ghp_" + strings.Repeat("A1b2", 8) + " is the old one"}); isErr || !strings.Contains(out, "Filed") {
+		t.Fatalf("a line with a token was refused: %s", out)
+	}
+	if out := mustOK(t, lead, "thread_read", nil); !strings.Contains(out, "ghp_A1b2") || strings.Contains(out, "removed by tmx") || !strings.Contains(out, "is the old one") {
+		t.Fatalf("the line was changed: %s", out)
 	}
 	head := session(t, d, "head")
 	out = mustOK(t, head, "thread_read", map[string]any{"topic": "alpha"})
 	if !strings.Contains(out, "decision · Use SQLite, not Postgres. (alpha-lead) ["+id+"] (corrected by") || !strings.Contains(out, "Use Postgres after all.") {
 		t.Fatalf("head reads alpha: %s", out)
 	}
-	if out := mustOK(t, head, "threads", nil); !strings.Contains(out, "alpha (project): 0 cards, 1 log line") {
+	if out := mustOK(t, head, "threads", nil); !strings.Contains(out, "alpha (project): 0 cards, 2 log lines") {
 		t.Fatalf("threads: %s", out)
 	}
 }

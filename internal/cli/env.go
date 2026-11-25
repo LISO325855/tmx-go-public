@@ -28,6 +28,10 @@ func (e *env) load() error {
 	if err != nil {
 		return err
 	}
+	return e.loadPaths(p)
+}
+
+func (e *env) loadPaths(p config.Paths) error {
 	c, err := config.Load(p)
 	if err != nil {
 		return err

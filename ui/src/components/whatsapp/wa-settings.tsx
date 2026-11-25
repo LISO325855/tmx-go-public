@@ -24,6 +24,7 @@ import { Section } from "@/components/page";
 import { useNow } from "@/hooks/use-now";
 import { useStore } from "@/lib/store";
 import { cn } from "@/lib/utils";
+import { accessList, otherProfiles, profileLabel, withAccessList } from "@/lib/wa-access";
 import { isLinked, loadWhatsApp, saveWaSettings, sortedWaChats, useWa, waApi, waPhone } from "@/lib/whatsapp";
 import type { WaSettings, WaStatus } from "@/lib/wa-types";
 import { SyncBar, WaAvatar } from "./wa-bits";
@@ -493,6 +494,31 @@ function SettingsRows({ settings }: { settings: WaSettings }) {
       <Row label="Tell the head about new messages in" hint="The head gets a short note for each new message there, as information from outside, never as instructions.">
         <ChatList value={settings.notify_head_chats ?? []} onChange={(v) => save({ notify_head_chats: v })} empty="No chats." addLabel="Add a chat" />
       </Row>
+      {/* Per-chat access. The head reads every chat except the ones you keep private. */}
+      <Row label="Private chats" hint="The head reads all your other chats. A private chat does not exist for it: it cannot list, find, read or write it, and gets no notes about it.">
+        <ChatList value={settings.private_chats ?? []} onChange={(v) => save({ private_chats: v })} empty="None: the head reads every chat." addLabel="Keep a chat private" />
+      </Row>
+      {/* Every other role sees no chat unless you open it here (or let agents send there without asking). */}
+      {otherProfiles(settings).map((p) => (
+        <div key={p} className="contents" data-wa-access={p}>
+          <Row label={`${profileLabel(p)} may read`} hint="Only these chats exist for the agent: it lists, searches and reads nothing else. It may also ask to write in them.">
+            <ChatList
+              value={accessList(settings, p, "read")}
+              onChange={(v) => void attempt(() => saveWaSettings(withAccessList(settings, p, "read", v)))}
+              empty="No chats: it reads none."
+              addLabel="Open a chat"
+            />
+          </Row>
+          <Row label={`${profileLabel(p)} may write to`} hint="Write only: the agent may ask to send here without seeing the chat. Each message still waits for your Allow.">
+            <ChatList
+              value={accessList(settings, p, "send")}
+              onChange={(v) => void attempt(() => saveWaSettings(withAccessList(settings, p, "send", v)))}
+              empty="No chats."
+              addLabel="Add a chat"
+            />
+          </Row>
+        </div>
+      ))}
     </>
   );
 }

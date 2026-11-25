@@ -1,6 +1,7 @@
 package fleet
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -44,11 +45,37 @@ func (f *Fleet) handleEvent(r *agentRec, proc runner.Process, ev runner.Event) (
 	f.observeTasksLocked(r, ev)
 	switch ev.Kind {
 	case runner.EvMailDelivery:
-		if ev.Delivery == "submitted" || ev.Delivery == "unconfirmed" {
+		if ev.Delivery == "submitted" || ev.Delivery == "unconfirmed" || ev.Delivery == "menu_wait" || ev.Delivery == "dispatching" {
 			f.mailReceiptLocked(r.a.ID, ev.MessageIDs, ev.Delivery)
+			if d, ok := proc.(runner.MailDiagnoser); ok && (ev.Delivery == "submitted" || ev.Delivery == "unconfirmed") {
+				for _, id := range ev.MessageIDs {
+					d.ForgetMailStage(id)
+				}
+			}
 		}
 	case runner.EvState:
 		st := ev.State
+		if st == model.StateIdle {
+			f.confirmClaudeAccountSwitchLocked(r)
+			r.mailInterrupt = false
+			r.updateIdleAt = time.Now()
+		} else {
+			r.updateIdleAt = time.Time{}
+			// Runner transitions are activity even if the fleet's stale state
+			// already says working (for example after a missed idle event).
+			r.updateActivity = time.Now()
+		}
+		// A positively observed idle input box supersedes stale screen-menu approvals.
+		// Other permission/guard requests remain in force.
+		if st == model.StateIdle && typedTerminal(r.a) {
+			for id, pr := range f.perms {
+				if pr.agentID == r.a.ID && pr.proc == proc {
+					if ap, err := f.st.GetApproval(id); err == nil && ap.Tool == model.ToolTerminalMenu {
+						f.cancelPermissionLocked(r, pr.requestID)
+					}
+				}
+			}
+		}
 		if f.pausedStateLocked(r, st) {
 			return false
 		}
@@ -56,7 +83,7 @@ func (f *Fleet) handleEvent(r *agentRec, proc runner.Process, ev runner.Event) (
 			st = model.StateWaiting // a permission request is still open
 		}
 		if st == r.a.State {
-			return false
+			return st == model.StateIdle
 		}
 		r.a.State = st
 		r.a.LastActivityAt = model.Now()
@@ -80,6 +107,10 @@ func (f *Fleet) handleEvent(r *agentRec, proc runner.Process, ev runner.Event) (
 			f.appendLocked(r, *ev.Entry)
 			if ev.Entry.Kind == model.EntryResult && isHead(r) {
 				f.endTurnLocked(r)
+				if r.nextThread != "" { // the owner wrote on another topic meanwhile (mail.go deliverOwner)
+					f.beginTurnLocked(r, r.nextThread, r.nextExplicit)
+					r.nextThread, r.nextExplicit = "", false
+				}
 			}
 		}
 	case runner.EvApproval:
@@ -91,17 +122,42 @@ func (f *Fleet) handleEvent(r *agentRec, proc runner.Process, ev runner.Event) (
 			f.cancelPermissionLocked(r, ev.Approval.ID)
 		}
 	case runner.EvSession:
+		if origin := r.accountOrigin; origin != nil && origin.resume && ev.SessionID != "" && ev.SessionID != origin.session {
+			if !origin.rejected {
+				origin.rejected = true
+				f.goTracked(func() {
+					ctx, cancel := context.WithTimeout(f.ctx, stopGrace)
+					defer cancel()
+					if err := proc.Stop(ctx); err != nil {
+						f.log.Warn("stop Claude alternate with wrong conversation", "err", err)
+					}
+				})
+			}
+			return false
+		}
 		r.sessionConfirmed = true
 		if ev.SessionID != "" && ev.SessionID != r.a.SessionID {
+			if r.codexLost && r.a.SessionID != "" {
+				// The stored conversation could not be found for this start (codex_carry.go): the
+				// new one is named, never stored over it.
+				f.appendLocked(r, model.TimelineEntry{Kind: model.EntrySystem,
+					Text: "This start runs as a new conversation " + ev.SessionID + "; the stored conversation is still " + r.a.SessionID + "."})
+				break
+			}
 			r.a.SessionID = ev.SessionID
 			f.saveAgentLocked(r)
 		}
 	case runner.EvUsage:
 		// Each result's cost and turns are counted as that turn's and added (claude's
 		// total_cost_usd is not verified to be cumulative across turns or --resume).
-		r.a.CostUSD += ev.CostUSD
+		if r.a.Profile != model.FreeWorkerProfile {
+			r.a.CostUSD += ev.CostUSD
+		}
 		r.a.Turns += ev.Turns
 		f.saveAgentLocked(r)
+	case runner.EvProgress:
+		r.updateActivity = time.Now()
+		r.updateIdleAt = time.Time{}
 	case runner.EvOutput:
 		r.a.LastActivityAt = model.Now()
 		f.fanOutLocked(r, ev.Output)
@@ -124,6 +180,7 @@ func (f *Fleet) handleExit(r *agentRec, proc runner.Process, code int, err error
 		r.proc = nil
 		return
 	}
+	f.deleteCodexGuardAuth(r.a.ID)
 	f.observeTasksLocked(r, runner.Event{Kind: runner.EvExit})
 	f.processes.StopOwner(r.a.ID)
 	if ids, receiptErr := f.st.PendingMailReceipts(r.a.ID); receiptErr == nil {
@@ -131,6 +188,19 @@ func (f *Fleet) handleExit(r *agentRec, proc runner.Process, code int, err error
 	} else {
 		f.log.Error("interrupted mail receipts", "err", receiptErr)
 	}
+	if ids, receiptErr := f.st.RequeueMenuMail(r.a.ID); receiptErr == nil {
+		for _, id := range ids {
+			if m, err := f.st.GetMessage(id); err == nil {
+				f.bus.Publish(model.BusEvent{Type: model.EvMessageUpdated, AgentID: r.a.ID, Data: m})
+			}
+		}
+		if n, err := f.st.CountQueued(r.a.ID); err == nil {
+			r.a.Queued = n
+		}
+	} else {
+		f.log.Error("recover unpasted menu mail", "err", receiptErr)
+	}
+
 	r.proc = nil
 	r.a.PID = 0
 	if r.token != "" {
@@ -156,7 +226,24 @@ func (f *Fleet) handleExit(r *agentRec, proc runner.Process, code int, err error
 	r.stopping = false
 	f.expirePermsLocked(r.a.ID)
 	f.appendLocked(r, model.TimelineEntry{Kind: model.EntrySystem, Text: text, IsError: r.a.State == model.StateError})
-	if unexpected {
+	switch {
+	case r.accountOrigin != nil:
+		origin, id := r.accountOrigin, r.a.ID
+		r.a.Account, r.a.SessionID, r.sessionConfirmed = origin.account, origin.session, origin.confirmed
+		r.accountOrigin = nil
+		if unexpected && !f.closed {
+			f.goTracked(func() {
+				if err := f.startAgentOpts(id, "", startOpts{StartOptions: StartOptions{Force: true}, accountSwitch: true}); err != nil {
+					f.log.Warn("restore Claude account after pre-ready exit", "agent", id, "err", err)
+				}
+			})
+		}
+	case unexpected && f.freshAfterLostConversationLocked(r, err):
+		// The harness does not have the conversation it was told to resume: one fresh start
+		// instead of restarts that fail the same way (resume_fallback.go).
+		id := r.a.ID
+		f.goTracked(func() { _ = f.startAgentOpts(id, "", startOpts{}) }) // a failed start leaves the agent in state error
+	case unexpected:
 		f.scheduleRecoveryLocked(r)
 	}
 	f.saveAgentLocked(r)
@@ -165,6 +252,11 @@ func (f *Fleet) handleExit(r *agentRec, proc runner.Process, code int, err error
 
 // appendLocked assigns seq/agent/time, stores the entry and publishes timeline.appended.
 func (f *Fleet) appendLocked(r *agentRec, e model.TimelineEntry) model.TimelineEntry {
+	if e.Kind != model.EntrySystem {
+		r.updateActivity = time.Now()
+		r.updateTurnActivity = r.updateActivity
+		r.updateIdleAt = time.Time{}
+	}
 	if e.Kind == model.EntryUser || e.Kind == model.EntryMessageIn {
 		r.a.DoneAt = 0 // new work supersedes the previous completion report
 	}

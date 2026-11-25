@@ -48,7 +48,7 @@ func TestLiveLoginURL(t *testing.T) {
 			if err := p.Add(h, "live-check"); err != nil {
 				t.Fatal(err)
 			}
-			s := New(Options{Dir: t.TempDir(), Every: -1, Profiles: p, StopGrace: 2 * time.Second})
+			s := New(Options{Dir: t.TempDir(), NodeHome: p.root, Every: -1, Profiles: p, StopGrace: 2 * time.Second})
 			defer s.Close()
 			if _, err := s.lookPath(h); err != nil {
 				t.Skipf("%s is not installed", h)

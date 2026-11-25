@@ -1,3 +1,6 @@
+import { focusComposer } from "@/lib/composer-focus";
+import { reloadGate } from "@/lib/reload-guard";
+import { clearSubmittedDraft, ReloadSafeDrafts } from "@/lib/composer-draft";
 // The WhatsApp composer: text (Enter sends), a reply, files (paperclip, paste, drop) and
 // dictation, built from the same pieces as the chat composer. Files go with the message itself
 // (POST …/messages uploads), so "uploading" here only reads them; the daemon sends them on.
@@ -7,13 +10,14 @@ import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { AttachButton, AttachChips, DropOverlay, useAttachments } from "@/components/attach";
 import { DictateButton } from "@/components/dictate-button";
+import { DictationInline } from "@/components/dictation-inline";
 import { paths } from "@/lib/router";
 import { cn } from "@/lib/utils";
 import { upsertWaMessage, waApi, waSummary } from "@/lib/whatsapp";
 import type { WaChat, WaMessage, WaUpload } from "@/lib/wa-types";
 import { WA_MAX_FILE_BYTES, WA_MAX_FILES } from "@/lib/wa-types";
 
-const drafts = new Map<string, string>();
+const drafts = new ReloadSafeDrafts("tmx.whatsapp-composer-drafts");
 // Files read for the next message, by the id the attach chips know them by.
 const staged = new Map<string, WaUpload>();
 let seq = 0;
@@ -60,29 +64,33 @@ export function WaComposer({
 
   const canSend = ready && !sending && !att.uploading && (!!text.trim() || att.readyIds.length > 0);
 
-  async function send() {
-    if (!canSend) return;
-    const body = text.trim();
-    const ids = att.readyIds;
+  async function send(voiceText?: string, _voiceId?: string, signal?: AbortSignal) {
+    const voice = voiceText !== undefined;
+    if (!voice && !canSend) return;
+    const body = (voiceText ?? text).trim();
+    const ids = voice ? [] : att.readyIds;
     const uploads = ids.map((id) => staged.get(id)).filter((u): u is WaUpload => !!u);
+    if (voice && !ready) throw new Error("WhatsApp is not connected.");
+    const releaseReload = reloadGate.hold();
     setSending(true);
     try {
       const m = await waApi.send(chat.jid, {
         ...(body ? { text: body } : {}),
         ...(replyTo ? { reply_to: replyTo.id } : {}),
         ...(uploads.length ? { uploads } : {}),
-      });
+      }, signal);
       if (m?.id) upsertWaMessage(m);
-      setText("");
-      drafts.delete(chat.jid);
+      if (!voice && clearSubmittedDraft(drafts, chat.jid, text)) setText("");
       for (const id of ids) staged.delete(id);
-      att.clear();
-      onClearReply();
+      if (!voice) att.clear();
+      if (!voice) onClearReply();
     } catch (e) {
+      if (voice) throw e;
       toast.error(sentence((e as Error).message || "the message wasn't sent"));
     } finally {
       setSending(false);
-      ta.current?.focus();
+      releaseReload();
+      if (!voice) focusComposer(ta.current);
     }
   }
 
@@ -91,6 +99,7 @@ export function WaComposer({
   return (
     <div className="shrink-0 px-4 pt-2 pb-4 md:px-6">
       <div className="mx-auto max-w-[51.25rem]">
+        <DictationInline boxId={"wa:" + chat.jid} />
         <div
           className={cn(
             "relative rounded-xl border border-border-strong bg-card transition-[border-color,box-shadow] duration-150 focus-within:border-ring focus-within:ring-2 focus-within:ring-ring/25",
@@ -146,10 +155,11 @@ export function WaComposer({
               hint={`Photos, videos and files (up to ${WA_MAX_FILE_BYTES >> 20} MB) · or paste / drop them here`}
               onFiles={(f) => {
                 att.add(f);
-                ta.current?.focus();
+                focusComposer(ta.current);
               }}
             />
             <DictateButton
+              onSend={send}
               target={ta}
               value={text}
               draft={{ id: "wa:" + chat.jid, label: chat.name, path: paths.waChat(chat.jid), drafts, draftKey: chat.jid }}

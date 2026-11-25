@@ -92,6 +92,7 @@ type Agent struct {
 	CostUSD        float64    `json:"cost_usd"`
 	Turns          int        `json:"turns"`
 	Error          string     `json:"error"`
+	MCPWarnings    []string   `json:"mcp_warnings,omitempty"` // launch diagnostics, visible without opening the timeline
 	Queued         int        `json:"queued"`
 	// Resource control; kept in memory (not in the store), rebuilt after a restart.
 	QueuePos     int    `json:"queue_pos,omitempty"`     // state queued: 1 = next to start
@@ -99,8 +100,7 @@ type Agent struct {
 	PausedReason string `json:"paused_reason,omitempty"` // state paused: write_budget | memory | disk
 	PausedDetail string `json:"paused_detail,omitempty"` // state paused: a sentence for the owner
 	PausedAt     int64  `json:"paused_at,omitempty"`
-	// Live mode switch (DESIGN.md "Switching live"); kept in memory, not in the store, so a
-	// daemon restart brings the agent back in the mode it was launched in.
+	// Runtime switch metadata is transient. The applied Mode is stored for restart.
 	HomeMode    Mode `json:"home_mode,omitempty"`    // set while switched: the mode it was launched in
 	PendingMode Mode `json:"pending_mode,omitempty"` // it switches to this mode when its current turn ends
 
@@ -213,8 +213,8 @@ func validateProgressBasis(b ProgressBasis) error {
 	if !progressIDRx.MatchString(b.Revision) {
 		return errors.New("progress_basis.revision must be a short stable identifier")
 	}
-	if len(b.Steps) < 1 || len(b.Steps) > 40 {
-		return errors.New("progress_basis.steps must contain 1 to 40 steps")
+	if len(b.Steps) < 1 || len(b.Steps) > 4000 { // a storage ceiling (40 until 17 Nov)
+		return errors.New("progress_basis.steps must contain 1 to 4000 steps")
 	}
 	seen := make(map[string]bool, len(b.Steps))
 	for _, s := range b.Steps {
@@ -222,8 +222,8 @@ func validateProgressBasis(b ProgressBasis) error {
 			return errors.New("progress step ids must be unique short identifiers")
 		}
 		seen[s.ID] = true
-		if strings.TrimSpace(s.Label) == "" || len(s.Label) > 120 {
-			return errors.New("progress labels must contain 1 to 120 characters")
+		if strings.TrimSpace(s.Label) == "" || len(s.Label) > 2000 { // 120 until 17 Nov
+			return errors.New("progress labels must contain 1 to 2000 characters")
 		}
 		// Cf (Unicode "format") runes — bidi overrides, zero-width joiners, and the like — can
 		// make a label render as something other than its actual text; never accepted, since a
@@ -496,12 +496,14 @@ type MessageState string
 
 const (
 	MsgQueued    MessageState = "queued"
+	MsgSending   MessageState = "sending" // claimed, but submission is not confirmed
 	MsgDelivered MessageState = "delivered"
 	MsgRead      MessageState = "read"
 	MsgFailed    MessageState = "failed"
 )
 
 type Message struct {
+	Urgent      bool         `json:"urgent,omitempty"`
 	RetryID     string       `json:"retry_id,omitempty"`
 	RetryHash   string       `json:"-"`
 	Receipt     string       `json:"receipt,omitempty"` // queued, dispatching, accepted, submitted, unconfirmed, read, owner
@@ -555,6 +557,9 @@ type GuardHold struct {
 	Tool      string          `json:"tool"`
 	ToolInput json.RawMessage `json:"tool_input,omitempty"`
 	Cwd       string          `json:"cwd,omitempty"`
+	// NoAlways: this call cannot be remembered as a standing allow (its command depends on
+	// values only known when it runs), so a card must not offer "Allow always" for it.
+	NoAlways bool `json:"no_always,omitempty"`
 }
 
 type ApprovalState string
@@ -634,14 +639,15 @@ type Policy struct {
 	Levels map[Level]LevelPolicy `json:"levels"`
 }
 
-// DefaultPolicy: head on Opus, everyone below on Sonnet (owner's rule, 21 Oct 2026).
+// DefaultPolicy: head on Opus, everyone below on Sonnet (owner's rule, 21 Oct 2026). Every
+// level may also be given Fable (FableModel: allowed, never the default).
 func DefaultPolicy() Policy {
 	return Policy{Levels: map[Level]LevelPolicy{
-		LevelHead: {Model: "claude-opus-5-5", AllowedModels: []string{"claude-opus-5-5"},
+		LevelHead: {Model: "claude-opus-5-5", AllowedModels: []string{"claude-opus-5-5", FableModel},
 			PermissionMode: "auto", CanCreateProjects: true, CanLaunch: []Level{LevelLead, LevelWorker}},
-		LevelLead: {Model: "claude-opus-5-5", AllowedModels: []string{"claude-opus-5-5", "claude-sonnet-5"},
+		LevelLead: {Model: "claude-opus-5-5", AllowedModels: []string{"claude-opus-5-5", "claude-sonnet-5", FableModel},
 			PermissionMode: "auto", CanLaunch: []Level{LevelWorker}},
-		LevelWorker: {Model: "claude-sonnet-5", AllowedModels: []string{"claude-sonnet-5", "claude-opus-5-5", "claude-haiku-4-5-20251001"},
+		LevelWorker: {Model: "claude-sonnet-5", AllowedModels: []string{"claude-sonnet-5", "claude-opus-5-5", "claude-haiku-4-5-20251001", FableModel},
 			PermissionMode: "auto"},
 	}}
 }
@@ -657,6 +663,12 @@ type Snapshot struct {
 	Policy          Policy     `json:"policy"` // derived from the built-in profiles
 	Profiles        []Profile  `json:"profiles"`
 	Workspace       string     `json:"workspace"`
+	// UIProfile is config.json "ui.profile": "classic" = the dashboard is a copy of the Python
+	// one (DESIGN.md "Classic UI profile"); absent = the default dashboard.
+	UIProfile string `json:"ui_profile,omitempty"`
+	// ShelvedOmitted: the caller asked for the snapshot without shelved agents (?shelved=0);
+	// this many were left out. nil = every agent is in Agents.
+	ShelvedOmitted *int `json:"shelved_omitted,omitempty"`
 }
 
 // Bus event types (WebSocket /api/events).

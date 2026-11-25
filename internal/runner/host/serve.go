@@ -20,6 +20,7 @@ import (
 	"github.com/blackcode-ch/tmx-go/internal/hiddenexec"
 	"github.com/blackcode-ch/tmx-go/internal/runner/ptyproc"
 	"github.com/blackcode-ch/tmx-go/internal/sysinfo"
+	"github.com/blackcode-ch/tmx-go/internal/winshim"
 )
 
 const (
@@ -142,6 +143,9 @@ type host struct {
 }
 
 func (h *host) start(spec Spec) error {
+	// A .cmd shim would go through cmd.exe, which cuts the arguments at the first line break
+	// (the agent's instructions): start what the shim starts (winshim).
+	spec.Path, spec.Args = winshim.Apply(spec.Path, spec.Args)
 	if !spec.Piped {
 		cols, rows := spec.Cols, spec.Rows
 		if cols <= 0 || rows <= 0 {
@@ -251,6 +255,10 @@ func (h *host) read(done chan<- struct{}) {
 	}
 }
 
+// pipeDrain: how long the host still reads a piped program's output after the program ended,
+// for its last lines, before it reports the exit although something else holds the pipe.
+const pipeDrain = 2 * time.Second
+
 func (h *host) wait(readDone <-chan struct{}) {
 	var code int
 	if h.pcmd != nil {
@@ -264,16 +272,24 @@ func (h *host) wait(readDone <-chan struct{}) {
 		case <-time.After(500 * time.Millisecond): // a background job may still hold the tty
 		}
 		h.pt.Close()
+		<-readDone
 	} else {
-		<-readDone // stdout first: Wait closes the pipes
-		_ = h.cmd.Wait()
-		reapGroup(h.cmd) // whatever the agent left running in its process group
+		// The program's own end is what counts, not the end of its output: a command it
+		// started (a build, a test run) inherits the output pipe and may hold it open long after
+		// the program is gone, and whoever waited for the pipe's end waited for that command
+		// (a stop of a busy agent never came back). So: wait for the process itself, give its
+		// last output pipeDrain to arrive, and report the exit. cmd.Wait is not used: it must
+		// not run before the reads are done, which is exactly what may never happen.
 		code = -1
-		if st := h.cmd.ProcessState; st != nil {
+		if st, err := h.cmd.Process.Wait(); err == nil && st != nil {
 			code = st.ExitCode()
 		}
+		select {
+		case <-readDone:
+		case <-time.After(pipeDrain): // something else still holds the pipe; its output is not the program's
+		}
+		reapGroup(h.cmd) // whatever the agent left running in its process group
 	}
-	<-readDone
 	h.mu.Lock()
 	h.code = code
 	if h.stderr != nil {

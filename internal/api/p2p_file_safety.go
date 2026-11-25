@@ -10,22 +10,34 @@ import (
 	"strings"
 )
 
-// Keep this superset in sync with Python tmx/servedcheck.py BAD_FILE/BAD_DIR.
-var servedUnsafeName = regexp.MustCompile(`(?i)(\.(py|pyw|ps1|psm1|sh|bash|bat|cmd|exe|dll|key|pem|p12|pfx|kdbx|sqlite|db|npmrc|pypirc)$|signature|^profile [0-9]+$)`)
+// Python tmx/servedcheck.py BAD_FILE/BAD_DIR is the older, wider list; this one is narrower on purpose.
+// A file an agent sends to a chat, or the folder it works in, is refused when a part of its path
+// names a place where credentials or an application's state live. Exact names and the file types
+// of keys only: until 17 Nov this also refused every dot-folder, every script and program
+// extension (.py, .sh, .exe, .db ...) and ordinary words (default, venv, node_modules, tmx,
+// "signature", "Profile 12"), which stopped agents sending ordinary project files. Programs are
+// still refused by what they are (chat/filepolicy.go), not by a word in their path.
+var secretFileName = regexp.MustCompile(`(?i)\.(key|pem|p12|pfx|kdbx|npmrc|pypirc)$`)
+
+// secretFolders: dot-folders and files that hold credentials or a tool's sign-in.
+var secretFolders = map[string]bool{
+	".ssh": true, ".gnupg": true, ".aws": true, ".azure": true, ".kube": true, ".docker": true, ".config": true,
+	".git": true, ".git-credentials": true, ".netrc": true, ".npmrc": true, ".pypirc": true,
+	".claude": true, ".codex": true, ".gemini": true,
+	// application state and browser profiles
+	"appdata": true, "tokens": true, "claude-config": true, "ai-accounts": true, "terminalmatrix2": true, "tmxg-trial": true,
+	"tmx-go": true, "hosts.yml": true, "cookies": true, "login data": true, "local state": true, "web data": true, "user data": true,
+}
 
 func sensitiveFilePart(part string) bool {
 	p := strings.ToLower(strings.TrimRight(part, " ."))
-	if strings.HasPrefix(p, ".") || strings.ContainsAny(p, ":\x00") || servedUnsafeName.MatchString(p) {
+	if strings.ContainsAny(p, ":\x00") || secretFileName.MatchString(p) || secretFolders[p] || strings.HasPrefix(p, ".env") {
 		return true
 	}
 	for _, x := range []string{"credentials", "secret"} {
 		if strings.Contains(p, x) {
 			return true
 		}
-	}
-	switch p {
-	case "appdata", "tokens", "claude-config", "ai-accounts", "terminalmatrix2", "tmxg-trial", "tmx-go", "tmx", "hosts.yml", "cookies", "login data", "local state", "web data", "venv", "node_modules", "default", "user data":
-		return true
 	}
 	return strings.HasPrefix(p, "id_rsa") || strings.HasPrefix(p, "id_ed25519")
 }
@@ -135,29 +147,4 @@ func resolvedFolder(path string) string {
 		return resolved
 	}
 	return path
-}
-
-// The shell guard has no reusable content scanner; the mirror uses external
-// gitleaks. These conservative prefix rules apply to the exact bytes sent,
-// scanning ALL bytes (including binary files), beyond the 1 MiB minimum.
-var p2pSecretRules = []struct {
-	name string
-	re   *regexp.Regexp
-}{
-	{"github-token", regexp.MustCompile(`(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]+`)},
-	{"aws-access-key", regexp.MustCompile(`(?:AKIA|ASIA)[A-Z0-9]{16}`)},
-	{"private-key", regexp.MustCompile(`-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----`)},
-	{"sk-key", regexp.MustCompile(`sk-[A-Za-z0-9_-]+`)},
-	{"bk-live-key", regexp.MustCompile(`bk_live_[A-Za-z0-9_-]+`)},
-	{"slack-token", regexp.MustCompile(`xox[baprs]-[A-Za-z0-9-]+`)},
-}
-
-func p2pContentRule(data []byte) error {
-	for _, rule := range p2pSecretRules {
-		if rule.re.Match(data) {
-			// Never include matching bytes in responses or logs.
-			return fmt.Errorf("content-%s: refused; remove credentials and send a sanitized document from your project folder", rule.name)
-		}
-	}
-	return nil
 }

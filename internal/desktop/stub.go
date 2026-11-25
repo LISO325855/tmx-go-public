@@ -10,8 +10,9 @@ const Available = false
 
 // Options configures the window. URL is the daemon base URL, Token the owner token.
 type Options struct {
-	URL   string
-	Token string
+	URL         string
+	Token       string
+	StartDaemon func() error
 }
 
 // Run reports that this build has no desktop app.

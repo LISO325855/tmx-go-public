@@ -2,6 +2,8 @@ package fleet
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"sync"
@@ -17,11 +19,17 @@ import (
 // fake process running, Reattach hands it back with the credential it was started with.
 type hostedRunner struct {
 	*fake.Runner
-	mu         sync.Mutex
-	live       map[string]*fake.Process // agent id → its running program
-	cred       map[string]string
-	reattached int
-	unsure     int // the next unsure Reattach answers (ErrHostUnknown)
+	mu           sync.Mutex
+	live         map[string]*fake.Process // agent id → its running program
+	cred         map[string]string
+	reattached   int
+	silent       bool
+	repaintDelay time.Duration
+	repaint      int // verified host without a fresh screen
+	unsure       int // the next unsure Reattach answers (ErrHostUnknown)
+	// sibling: the runner of the agent's other mode. An agent has ONE session host: when this
+	// runner has no live program for it but the sibling has, the host runs the other mode.
+	sibling *hostedRunner
 }
 
 func newHostedRunner(r *fake.Runner) *hostedRunner {
@@ -40,19 +48,47 @@ func (h *hostedRunner) Start(ctx context.Context, spec runner.Spec) (runner.Proc
 	return newHostedProc(fp), nil
 }
 
-func (h *hostedRunner) Reattach(_ context.Context, spec runner.Spec) (runner.Process, string, error) {
+func (h *hostedRunner) Reattach(ctx context.Context, spec runner.Spec) (runner.Process, string, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if h.repaint > 0 {
+		h.repaint--
+		if h.repaintDelay > 0 {
+			delay := h.repaintDelay
+			h.repaintDelay = 0 // retry assertions need not repeat the real wait
+			select {
+			case <-time.After(delay):
+			case <-ctx.Done():
+				return nil, "", errors.Join(runner.ErrHostUnknown, ctx.Err())
+			}
+		}
+		err := errors.Join(runner.ErrHostUnknown, runner.ErrHostRepaint)
+		if h.silent {
+			err = errors.Join(err, runner.ErrHostSilent)
+		}
+		return nil, "", err
+	}
 	if h.unsure > 0 {
 		h.unsure--
 		return nil, "", runner.ErrHostUnknown
 	}
 	fp := h.live[spec.AgentID]
 	if fp == nil || fp.Stopped() {
+		if h.sibling != nil && h.sibling.runs(spec.AgentID) {
+			return nil, "", runner.ErrHostMode
+		}
 		return nil, "", runner.ErrNoHost
 	}
 	h.reattached++
 	return newHostedProc(fp), h.cred[spec.AgentID], nil
+}
+
+// runs reports whether this runner's program for the agent is still running in its host.
+func (h *hostedRunner) runs(agentID string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	fp := h.live[agentID]
+	return fp != nil && !fp.Stopped()
 }
 
 // hostedProc is one daemon's view of a hosted fake process.
@@ -401,5 +437,181 @@ func TestNoStartWhileAnUnknownHostIsStopped(t *testing.T) {
 	}
 	if got, _ := f2.Agent(a.ID); got.State != model.StateStopped {
 		t.Fatalf("after the stop: %s", got.State)
+	}
+}
+
+func TestLegacyRepaintRecoveryResumesOnce(t *testing.T) {
+	for _, tc := range []struct {
+		name                       string
+		before                     model.AgentState
+		silent, stopFails, restart bool
+	}{
+		{"silent idle", model.StateIdle, true, false, true},
+		{"real budget silent idle", model.StateIdle, true, false, true},
+		{"real budget unrecognized", model.StateIdle, false, false, false},
+		{"silent starting", model.StateStarting, true, false, true},
+		{"stop failure", model.StateIdle, true, true, true},
+		{"working before handover", model.StateWorking, true, false, false},
+		{"approval before handover", model.StateWaiting, true, false, false},
+		{"idle but output", model.StateIdle, false, false, false},
+		{"unknown before handover", model.StateError, true, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			oldStop, oldRetry := stopHost, hostRetry
+			defer func() { stopHost, hostRetry = oldStop, oldRetry }()
+			hostRetry = time.Hour
+			e := newEnv(t)
+			hr := newHostedRunner(e.term)
+			e.hostExe, e.termRunner = "/opt/tmx/tmx-host", hr
+			f1 := e.started()
+			a, err := f1.LaunchAgent(OwnerCaller, LaunchRequest{ProjectID: workerProject(t, f1), Name: "legacy", Mode: model.ModeTerminal})
+			if err != nil {
+				t.Fatal(err)
+			}
+			eventually(t, "started", func() bool { return e.term.Last(a.ID) != nil })
+			prog := e.term.Last(a.ID)
+			prog.Emit(runner.Event{Kind: runner.EvSession, SessionID: "legacy-conversation"})
+			prog.Emit(runner.Event{Kind: runner.EvTimeline, Entry: &model.TimelineEntry{Kind: model.EntryAssistant, Text: "existing answer"}})
+			prog.Emit(runner.Event{Kind: runner.EvState, State: tc.before})
+			eventually(t, "saved pre-handover state", func() bool {
+				got, _ := f1.Agent(a.ID)
+				return got.SessionID == "legacy-conversation" && got.State == tc.before
+			})
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := f1.Close(ctx); err != nil {
+				t.Fatal(err)
+			}
+			calls := 0
+			stopHost = func(string) (bool, error) {
+				calls++
+				if tc.stopFails {
+					return false, runner.ErrHostUnknown
+				}
+				return false, prog.Stop(context.Background())
+			}
+			hr.mu.Lock()
+			hr.repaint = 100
+			hr.silent = tc.silent
+			if strings.HasPrefix(tc.name, "real budget") {
+				// Real repaint timeout plus the mandatory 100ms resize jiggle.
+				hr.repaintDelay = 20*time.Second + 100*time.Millisecond
+			}
+			hr.mu.Unlock()
+			f2 := e.started()
+			if tc.restart && !tc.stopFails {
+				eventually(t, "resumed", func() bool { return e.term.Last(a.ID) != prog })
+				if !prog.Stopped() {
+					t.Fatal("old agent not stopped")
+				}
+				if next := e.term.Last(a.ID); next.Spec.SessionID != "legacy-conversation" {
+					t.Fatalf("lost resume: %+v", next.Spec)
+				}
+			} else {
+				eventually(t, "needs attention", func() bool { got, _ := f2.Agent(a.ID); return strings.Contains(got.Error, "needs attention") })
+				hr.mu.Lock()
+				hr.silent = true // later silence must not override an earlier activity warning
+				hr.mu.Unlock()
+				if err := f2.startAgentOpts(a.ID, "", startOpts{reattach: true}); err == nil {
+					t.Fatal("expected unknown host")
+				}
+				if e.term.Last(a.ID) != prog || prog.Stopped() {
+					t.Fatal("uncertain live agent was stopped or duplicated")
+				}
+			}
+			wantCalls := 0
+			if tc.restart {
+				wantCalls = 1
+			}
+			if calls != wantCalls {
+				t.Fatalf("stops=%d want %d", calls, wantCalls)
+			}
+			tl, _ := e.st.Timeline(a.ID, 0, 1000)
+			notes := 0
+			for _, en := range tl {
+				if tc.restart && strings.Contains(en.Text, "restarting the agent once") {
+					notes++
+				}
+				if !tc.restart && en.Meta["terminal_recovery"] == "needs_attention" {
+					notes++
+				}
+			}
+			if notes != 1 {
+				t.Fatalf("visible notes=%d", notes)
+			}
+		})
+	}
+}
+
+func TestOwnerRestartNeedsAttentionHostResumesConversation(t *testing.T) {
+	for _, stopFails := range []bool{false, true} {
+		t.Run(fmt.Sprint(stopFails), func(t *testing.T) {
+			oldStop, oldRetry := stopHost, hostRetry
+			defer func() { stopHost, hostRetry = oldStop, oldRetry }()
+			hostRetry = time.Hour
+			e := newEnv(t)
+			hr := newHostedRunner(e.term)
+			e.hostExe, e.termRunner = "/opt/tmx/tmx-host", hr
+			f1 := e.started()
+			a, err := f1.LaunchAgent(OwnerCaller, LaunchRequest{ProjectID: workerProject(t, f1), Name: "needs-restart", Mode: model.ModeTerminal})
+			if err != nil {
+				t.Fatal(err)
+			}
+			eventually(t, "started", func() bool { return e.term.Last(a.ID) != nil })
+			prog := e.term.Last(a.ID)
+			prog.Emit(runner.Event{Kind: runner.EvSession, SessionID: "keep-conversation"})
+			prog.Emit(runner.Event{Kind: runner.EvTimeline, Entry: &model.TimelineEntry{Kind: model.EntryAssistant, Text: "existing answer"}})
+			prog.Emit(runner.Event{Kind: runner.EvState, State: model.StateWorking})
+			eventually(t, "working", func() bool {
+				got, _ := f1.Agent(a.ID)
+				return got.SessionID == "keep-conversation" && got.State == model.StateWorking
+			})
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := f1.Close(ctx); err != nil {
+				t.Fatal(err)
+			}
+			calls := 0
+			stopHost = func(dir string) (bool, error) {
+				calls++
+				if dir != prog.Spec.HostDir {
+					t.Errorf("wrong host: %s", dir)
+				}
+				if stopFails {
+					return false, runner.ErrHostUnknown
+				}
+				return false, prog.Stop(context.Background())
+			}
+			hr.mu.Lock()
+			hr.repaint = 100
+			hr.mu.Unlock()
+			f2 := e.started()
+			got, _ := f2.Agent(a.ID)
+			if !strings.Contains(got.Error, "needs attention") || calls != 0 {
+				t.Fatalf("before owner restart: %+v stops=%d", got, calls)
+			}
+			// Shutdown's keepDesired path must continue preserving the hosted program.
+			f2.stopProcess(ctx, a.ID, true)
+			if calls != 0 || prog.Stopped() {
+				t.Fatal("shutdown path stopped unknown host")
+			}
+			_, err = f2.RestartAgent(OwnerCaller, a.ID)
+			if calls != 1 {
+				t.Fatalf("owner restart stop calls=%d", calls)
+			}
+			if stopFails {
+				if err == nil || prog.Stopped() || e.term.Last(a.ID) != prog {
+					t.Fatalf("failed stop launched duplicate: %v", err)
+				}
+			} else {
+				if err != nil {
+					t.Fatal(err)
+				}
+				next := e.term.Last(a.ID)
+				if next == prog || !prog.Stopped() || next.Spec.SessionID != "keep-conversation" {
+					t.Fatalf("did not stop then resume: %+v", next.Spec)
+				}
+			}
+		})
 	}
 }

@@ -30,7 +30,7 @@ func TestLiveCodexManagedMCPConfig(t *testing.T) {
 		}
 	}
 	env = append(env, "CODEX_HOME="+l.Home)
-	if err := codexguard.ProbeEffective(context.Background(), exe, CodexAppServerArgs(spec), env, root, tmx); err != nil {
+	if err := codexguard.ProbeEffective(context.Background(), exe, CodexAppServerArgs(spec), env, root, tmx, CodexManagedServers(spec)); err != nil {
 		t.Fatal(err)
 	}
 }

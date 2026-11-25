@@ -42,9 +42,11 @@ import { after, ColourSubmenu } from "@/components/board/canvas";
 import { RenameDialog } from "@/components/board/dialogs";
 import { EntryForm, firstSentence, LogView } from "@/components/board/log";
 import { MoveMenu, SidePanelFrame } from "@/components/board/side-panel";
-import { buildItems } from "@/components/conversation/build";
+import { buildItems, conversationItems } from "@/components/conversation/build";
+import { useClassic } from "@/hooks/use-classic";
 import { Composer } from "@/components/conversation/composer";
-import { ItemView, spacing } from "@/components/conversation/conversation";
+import { AgentMessageToggle, ItemView, spacing } from "@/components/conversation/conversation";
+import { useAgentMessagePreference } from "@/lib/agent-message-preference";
 import { useNow } from "@/hooks/use-now";
 import { boardApi, loadBoard, threadColor } from "@/lib/board";
 import { absoluteTime, relativeTime } from "@/lib/format";
@@ -432,7 +434,12 @@ function Turn({ head, card }: { head: Agent; card: BoardCard }) {
     };
   }, [transport, head.id, card.id, card.to]);
 
-  const items = useMemo(() => buildItems(entries ?? []), [entries]);
+  const classic = useClassic();
+  const showAgentMessages = useAgentMessagePreference((s) => s.show);
+  const items = useMemo(
+    () => conversationItems(buildItems(entries ?? []), classic, showAgentMessages, head.parent_id ?? "owner"),
+    [entries, classic, showAgentMessages, head.parent_id],
+  );
 
   useLayoutEffect(() => {
     const el = scroller.current;
@@ -440,7 +447,11 @@ function Turn({ head, card }: { head: Agent; card: BoardCard }) {
   }, [entries, card.done]);
 
   return (
-    <div ref={scroller} data-scrolls className="scroll-thin min-h-0 flex-1 overflow-y-auto px-5 py-5">
+    <>
+      <div className="flex shrink-0 justify-end px-5">
+        <AgentMessageToggle />
+      </div>
+      <div ref={scroller} data-scrolls className="scroll-thin min-h-0 flex-1 overflow-y-auto px-5 py-5">
       {failed ? (
         <p className="text-sm text-muted-foreground">
           This turn could not be loaded.{" "}
@@ -455,14 +466,15 @@ function Turn({ head, card }: { head: Agent; card: BoardCard }) {
         </div>
       ) : (
         items.map((it, i) => (
-          <div key={i} className={spacing(items[i - 1], it)}>
-            <ItemView item={it} cwd={head.cwd} />
+          <div key={it.key} className={spacing(items[i - 1], it)}>
+            <ItemView item={it} cwd={head.cwd} classic={classic} />
           </div>
         ))
       )}
       {entries && entries.length > 0 && entries[entries.length - 1].seq < card.to && (
         <p className="mt-4 text-xs text-muted-foreground">This turn is long; the rest is in the head's conversation.</p>
       )}
-    </div>
+      </div>
+    </>
   );
 }

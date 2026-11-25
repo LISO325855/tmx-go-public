@@ -21,6 +21,7 @@ func (s *Server) accountRoutes(mux *http.ServeMux) {
 	o := func(h http.HandlerFunc) http.HandlerFunc { return s.ownerOnly(s.withAccounts(h)) }
 	mux.HandleFunc("GET /api/accounts", o(s.getAccounts))
 	mux.HandleFunc("POST /api/accounts/refresh", o(s.refreshAccounts))
+	mux.HandleFunc("POST /api/accounts/claude/reset", o(s.accountReset))
 	mux.HandleFunc("POST /api/accounts/{harness}/login", o(s.accountLogin))
 	mux.HandleFunc("DELETE /api/accounts/{harness}/login", o(s.cancelAccountLogin))
 	mux.HandleFunc("GET /api/accounts/{harness}/login/terminal", o(s.accountLoginTerminal))
@@ -28,6 +29,28 @@ func (s *Server) accountRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/accounts/{harness}/accounts", o(s.addAccount))
 	mux.HandleFunc("DELETE /api/accounts/{harness}/accounts/{name}", o(s.removeAccount))
 	mux.HandleFunc("PUT /api/accounts/{harness}/launch-default", o(s.setLaunchDefault))
+}
+
+func (s *Server) accountReset(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Account string `json:"account"`
+		Email   string `json:"email"`
+		Kind    string `json:"kind"`
+		Confirm bool   `json:"confirm"`
+		DryRun  bool   `json:"dry_run"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, MaxBody)).Decode(&req); err != nil || (!req.Confirm && !req.DryRun) {
+		writeError(w, http.StatusBadRequest, "Confirm the account and reset type, or request a read-only check")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
+	defer cancel()
+	p, err := s.accounts.OwnerReset(ctx, req.Account, req.Email, req.Kind, req.DryRun)
+	if err != nil {
+		writeAccountErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, p)
 }
 
 // acctName is the ?account= of a sign-in route ("" = "default"): a harness's routes act on one
@@ -48,6 +71,8 @@ func (s *Server) withAccounts(h http.HandlerFunc) http.HandlerFunc {
 // sign-in 404.
 func writeAccountErr(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, accounts.ErrNotOwned):
+		writeError(w, http.StatusForbidden, err.Error())
 	case errors.Is(err, accounts.ErrUnknown), errors.Is(err, accounts.ErrNoLogin), errors.Is(err, accounts.ErrNoAccount):
 		writeError(w, http.StatusNotFound, err.Error())
 	case errors.Is(err, accounts.ErrNotInstalled), errors.Is(err, accounts.ErrExists), errors.Is(err, accounts.ErrSigningIn),

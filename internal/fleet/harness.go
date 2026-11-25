@@ -13,9 +13,23 @@ import (
 	"github.com/blackcode-ch/tmx-go/internal/runner"
 )
 
-// TypingQuiet: mail is typed into a terminal agent only if no human typed into it for this
-// long (they may be in the middle of a sentence).
+// TypingQuiet protects agent-driven raw terminal controls, not message delivery.
 const TypingQuiet = 20 * time.Second
+
+// defaultModeLocked is the mode of a launch that names none: the harness's own default (chat for
+// Claude and Codex), except under the classic UI profile, where a Claude agent starts in Claude
+// Code's own screen as every Python tmx agent did (the owner, 17 Nov 2026; DESIGN.md "Classic UI
+// profile"). Codex stays in chat (its screen's conversation is not followed), and a daemon
+// without a terminal runner keeps the harness default. An explicit mode always wins, and
+// agents that exist keep the mode they were launched in.
+func (f *Fleet) defaultModeLocked(info harness.Info) model.Mode {
+	if f.opts.UIProfile == config.UIProfileClassic && info.Name == model.HarnessClaude && info.Supports(model.ModeTerminal) {
+		if _, ok := f.opts.Runners[model.ModeTerminal]; ok {
+			return model.ModeTerminal
+		}
+	}
+	return info.DefaultMode()
+}
 
 // harnessModeLocked resolves a launch's harness and mode: the harness must be known, run in
 // that mode, and this daemon must have a runner that takes it.
@@ -28,7 +42,7 @@ func (f *Fleet) harnessModeLocked(h model.Harness, m model.Mode) (model.Harness,
 		return "", "", errf(KindInvalid, "unknown harness %q", h)
 	}
 	if m == "" {
-		m = info.DefaultMode()
+		m = f.defaultModeLocked(info)
 	}
 	if m != model.ModeChat && m != model.ModeTerminal {
 		return "", "", errf(KindInvalid, "unknown mode %q", m)
@@ -49,14 +63,24 @@ func (f *Fleet) harnessModeLocked(h model.Harness, m model.Mode) (model.Harness,
 	return h, m, nil
 }
 
-// pickHarnessModelLocked: Claude's model is the profile's (pickModel). Another harness uses
-// its own default ("") unless a model is asked for: the owner may name any (a profile's
-// models are Claude's), an agent only one the profile allows. A shell has none.
+// Claude workers use the profile's model and allowlist. Fae checks the selected model
+// against Ollama at start. Other harnesses use their
+// own default unless a model is requested. The owner may pick any for those harnesses.
+// A shell has no model.
 func (f *Fleet) pickHarnessModelLocked(h model.Harness, prof model.Profile, requested string, byOwner bool) (string, error) {
-	switch h {
-	case model.HarnessClaude:
+	if prof.Provider == model.FaeProvider {
+		if requested == "" {
+			requested = prof.Model
+		}
+		if _, ok := model.FaeModelName(requested); !ok {
+			return "", errf(KindInvalid, "model %s must use the fae/ provider", requested)
+		}
+		return requested, nil
+	}
+	if h == model.HarnessClaude {
 		return pickModel(prof, requested)
-	case model.HarnessShell:
+	}
+	if h == model.HarnessShell {
 		return "", nil
 	}
 	if requested == "" || byOwner {
@@ -94,23 +118,30 @@ func (f *Fleet) harnessSpecLocked(r *agentRec, spec runner.Spec) runner.Spec {
 	if prof.ReadOnly {
 		spec.PermissionMode = "plan"
 	}
-	spec.SystemPrompt = f.systemPromptLocked(a)
 	spec.SessionID = a.SessionID
 	switch a.Harness {
-	case "agy", "antigravity":
-		spec.AgyFullAccess = a.AgyFullAccess && !prof.ReadOnly
 	case model.HarnessCodex:
 		spec.CodexFullAccess = a.CodexFullAccess && !prof.ReadOnly
 		spec.MCP = &runner.MCPServer{Command: f.opts.Executable, Args: []string{"mcp"}, EnvKeys: []string{EnvURL, EnvAgent, EnvToken}}
 	case model.HarnessOpenCode:
-		// opencode's TUI has no --model flag and no id of its own to report back, so tmx
-		// assigns the session up front (opencode creates it on launch) and resumes it by id.
-		if r.a.SessionID == "" {
-			r.a.SessionID = harness.NewOpenCodeSession()
+		spec.Provider = prof.Provider
+		if spec.Provider == model.FaeProvider {
+			spec.OpenCodeDataDir = filepath.Join(f.opts.Paths.AgentDir(a.ID), "opencode-data")
+			spec.FaeRuntimeContextCap = f.opts.FaeRuntimeContextCap
 		}
-		spec.SessionID = r.a.SessionID
+		// opencode 1.19 refuses `-s <id>` for a session it did not create ("Session not found",
+		// exit 1), so only a conversation that exists (confirmed) is resumed by id. A new one
+		// starts without -s and the runner reads its id back from opencode's database.
+		spec.SessionID = ""
+		if r.sessionConfirmed {
+			spec.SessionID = r.a.SessionID
+		}
+		spec.MCP = &runner.MCPServer{Command: f.opts.Executable, Args: []string{"mcp"}, EnvKeys: []string{EnvURL, EnvAgent, EnvToken}}
+	case model.HarnessGemini, "agy", "antigravity":
+		spec.AgyFullAccess = a.AgyFullAccess && !prof.ReadOnly
 		spec.MCP = &runner.MCPServer{Command: f.opts.Executable, Args: []string{"mcp"}, EnvKeys: []string{EnvURL, EnvAgent, EnvToken}}
 	case model.HarnessPi: // pi takes the id of a new conversation up front, like Claude
+		spec.MCP = &runner.MCPServer{Command: f.opts.Executable, Args: []string{"mcp"}, EnvKeys: []string{EnvURL, EnvAgent, EnvToken}}
 		if r.a.SessionID == "" {
 			r.a.SessionID = harness.NewPiSession()
 		}
@@ -137,13 +168,22 @@ func (f *Fleet) withInstructions(id, prompt string) string {
 }
 
 // instructionsLocked is the "[tmx instructions]" block to put before what is sent to r now,
-// or "" (a harness with a system prompt, or not due yet); giving it clears the due flag.
+// or "" (not due yet); giving it clears the due flag. A harness that takes tmx's instructions
+// at launch gets only the short note of a resumed start (resumedNoteLocked).
 func (f *Fleet) instructionsLocked(r *agentRec) string {
 	if r.a.Harness == model.HarnessShell {
 		return ""
 	}
-	if info, ok := harness.Get(r.a.Harness); !ok || info.SystemPrompt {
+	info, ok := harness.Get(r.a.Harness)
+	if !ok {
 		return ""
+	}
+	if info.SystemPrompt {
+		if !r.instructionsDue {
+			return ""
+		}
+		r.instructionsDue, r.instructionsAt = false, time.Now()
+		return f.resumedNoteLocked(r.a)
 	}
 	if r.sessionConfirmed && !r.instructionsDue && time.Since(r.instructionsAt) < instructionsEvery {
 		return ""
@@ -152,37 +192,32 @@ func (f *Fleet) instructionsLocked(r *agentRec) string {
 	return "[tmx instructions]\n" + f.systemPromptLocked(r.a) + "\n\n"
 }
 
-// terminalMailLocked reports whether queued mail may be typed into a terminal agent now:
-// its harness takes typed mail (never a shell), it is idle, and no human typed into it in
-// the last TypingQuiet. When only recent typing is in the way, a retry is scheduled.
-func (f *Fleet) terminalMailLocked(r *agentRec) bool {
-	info, ok := harness.Get(r.a.Harness)
-	if !ok || !info.TypedMail || r.a.State != model.StateIdle {
-		return false
-	}
-	if wait := TypingQuiet - time.Since(r.humanInputAt); wait > 0 {
-		if !r.retryMail {
-			r.retryMail = true
-			id := r.a.ID
-			time.AfterFunc(wait+50*time.Millisecond, func() {
-				f.mu.Lock()
-				if rr, ok := f.agents[id]; ok {
-					rr.retryMail = false
-				}
-				closed := f.closed
-				f.mu.Unlock()
-				if !closed {
-					f.tryDeliver(id)
-				}
-			})
+// resumedNoteLocked is what an agent whose harness takes tmx's instructions at launch (Claude,
+// Codex) is told with the first message after a start on its EARLIER conversation: its whole
+// instructions as they are now (who it is, its project and lead, its brief, tmx's rules for
+// agents) and, for Claude, where the project's CLAUDE.md is.
+//
+// The launch instructions are passed again at every start, but they do not reach a
+// conversation that already exists: two live checks on hosta-go (17 Nov; an imported agent
+// and one launched by tmx, both started again on their conversations) found no per-agent text
+// in the agent's system instructions at all, only the description of tmx's tools. So the
+// instructions are also said in the conversation itself, once per start, in front of the next
+// prompt or mail. The cost is that text in the conversation at every restart; an agent that
+// does not know who it is, whom it answers to and what it may do costs more.
+func (f *Fleet) resumedNoteLocked(a model.Agent) string {
+	text := f.systemPromptLocked(a)
+	if a.Harness == model.HarnessClaude || a.Harness == "" {
+		if p := projectMemoryFor(a.Cwd).prompt(); p != "" {
+			text += "\n" + p
 		}
-		return false
 	}
-	return true
+	if strings.TrimSpace(text) == "" {
+		return ""
+	}
+	return "[tmx instructions: you were started again on your earlier conversation; these are your instructions as they are now]\n" + text + "\n\n"
 }
 
-// typedTerminal: owner mail to a harness TUI waits for its input box like any mail (typing
-// into a menu would answer it); a shell still gets the owner's text at once.
+// typedTerminal identifies native harness composers. Mail is sent regardless of state.
 func typedTerminal(a model.Agent) bool {
 	return a.Mode == model.ModeTerminal && a.Harness != model.HarnessShell
 }

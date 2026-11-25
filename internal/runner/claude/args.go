@@ -68,7 +68,13 @@ func ChatArgs(spec runner.Spec) []string {
 func TerminalArgs(spec runner.Spec) []string { return commonArgs(spec) }
 
 func commonArgs(spec runner.Spec) []string {
-	args := []string{"--setting-sources", ""}
+	// Never the user's or the local settings (the owner's ~/.claude hooks and permissions stay
+	// out of agents). The project source only where the fleet found it safe (Spec.ProjectSource).
+	sources := ""
+	if spec.ProjectSource {
+		sources = "project"
+	}
+	args := []string{"--setting-sources", sources}
 	if spec.Model != "" {
 		args = append(args, "--model", spec.Model)
 	}
@@ -95,7 +101,9 @@ func commonArgs(spec runner.Spec) []string {
 	if len(spec.DisallowedTools) > 0 {
 		args = append(args, "--disallowedTools="+strings.Join(spec.DisallowedTools, ","))
 	}
-	if spec.SystemPrompt != "" {
+	if spec.SystemPromptFile != "" {
+		args = append(args, "--append-system-prompt-file", spec.SystemPromptFile)
+	} else if spec.SystemPrompt != "" {
 		args = append(args, "--append-system-prompt", spec.SystemPrompt)
 	}
 	return append(args, spec.ExtraArgs...)

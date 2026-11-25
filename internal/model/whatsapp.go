@@ -32,6 +32,20 @@ type WaSettings struct {
 	// AgentProfiles are the profiles whose agents may read and ask to send (default ["head"]).
 	// Not in the contract's Settings form; PUT without it keeps the current list.
 	AgentProfiles []string `json:"agent_profiles"`
+	// ChatAccess: which chats agents may read and ask to write to (whatsapp/access.go). Key: a
+	// profile slug, or "agent:<name>" for one agent. No entry = none beyond allowed_chats and,
+	// for the head, notify_head_chats.
+	ChatAccess map[string]WaChatAccess `json:"chat_access"`
+	// PrivateChats: chats the head may not read (whatsapp/access.go). The head reads every other
+	// chat; all other agents read only what ChatAccess and the two lists above open to them.
+	PrivateChats []string `json:"private_chats"`
+}
+
+// WaChatAccess is one profile's or agent's chats: Read (list, read, and ask to write) and Send
+// (ask to write only).
+type WaChatAccess struct {
+	Read []string `json:"read"`
+	Send []string `json:"send"`
 }
 
 // Agents' sending rule (WaSettings.AgentsSend).
@@ -127,13 +141,22 @@ func WaStatusRank(s WaMessageStatus) int {
 
 // WaMedia describes a message's attachment. The file is fetched from WhatsApp on demand.
 type WaMedia struct {
-	Mime       string `json:"mime"`
-	Size       int64  `json:"size"`
-	Name       string `json:"name,omitempty"`
-	DurationMS int64  `json:"duration_ms,omitempty"`
-	Width      int    `json:"width,omitempty"`
-	Height     int    `json:"height,omitempty"`
-	Downloaded bool   `json:"downloaded"`
+	Transcript      string        `json:"transcript,omitempty"`
+	Expired         bool          `json:"expired,omitempty"`
+	DownloadRetry   *WaMediaRetry `json:"download_retry,omitempty"`
+	TranscribeRetry *WaMediaRetry `json:"transcribe_retry,omitempty"`
+	Mime            string        `json:"mime"`
+	Size            int64         `json:"size"`
+	Name            string        `json:"name,omitempty"`
+	DurationMS      int64         `json:"duration_ms,omitempty"`
+	Width           int           `json:"width,omitempty"`
+	Height          int           `json:"height,omitempty"`
+	Downloaded      bool          `json:"downloaded"`
+}
+
+type WaMediaRetry struct {
+	At       int64 `json:"at"`
+	Attempts int   `json:"attempts"`
 }
 
 // WaQuoted is the message a reply answers.

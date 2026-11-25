@@ -4,6 +4,8 @@
 import { useEffect, useState } from "react";
 import { Loader2, Square, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { useInlineDictation } from "@/components/dictation-inline";
+import { useClassic } from "@/hooks/use-classic";
 import { cancelDictating, dictationElapsed, stopDictating, useDictation } from "@/lib/dictation-session";
 import { useVoice } from "@/lib/voice";
 import { navigate } from "@/lib/router";
@@ -18,6 +20,8 @@ export function DictationBar() {
   const phase = useDictation((s) => s.phase);
   const target = useDictation((s) => s.target);
   const [elapsed, setElapsed] = useState(0);
+  const classic = useClassic();
+  const inline = useInlineDictation((s) => (target ? (s.boxes[target.id] ?? 0) > 0 : false));
 
   useEffect(() => {
     if (phase !== "recording") return;
@@ -28,6 +32,15 @@ export function DictationBar() {
   }, [phase]);
 
   if (phase === "idle" || !target) return null;
+  // A transcription that could not run yet is saved and retried by the daemon, possibly for a long
+  // time; a toast said so (lib/voice.ts). That wait gets no bar: the bar is for a dictation the
+  // owner can still stop or throw away, and for the short transcription right after it.
+  if (phase === "working" && pending) return null;
+  // Classic (the owner #14, 17 Nov: nothing permanent at the top; Python keeps the microphone state
+  // in the message box): while the box being dictated into is on screen it shows the state
+  // itself (components/dictation-inline.tsx). The bar is left for a dictation running into a box
+  // on another page, so a live microphone can always be seen and stopped.
+  if (classic && inline) return null;
   const recording = phase === "recording";
 
   return (
@@ -41,7 +54,7 @@ export function DictationBar() {
         {recording && <span className="absolute inline-flex size-full animate-ping rounded-full bg-state-error opacity-60" />}
         <span className="relative inline-flex size-2.5 rounded-full bg-state-error" />
       </span>
-      <span className="shrink-0 font-medium">{recording ? "Dictating" : phase === "starting" ? "Waiting for the microphone…" : pending ? "Transcription pending" : "Transcribing…"}</span>
+      <span className="shrink-0 font-medium">{recording ? "Dictating" : phase === "starting" ? "Waiting for the microphone…" : "Transcribing…"}</span>
       {recording && (
         <span className="tabular shrink-0 font-mono text-[0.7812rem]" data-dictation-time>
           {clock(elapsed)}

@@ -6,10 +6,13 @@ import "slices"
 // hierarchy rights), its instructions, its model and permission policy, its tool limits and
 // what it may launch. Agents carry the slug of their profile; changes apply at their next start.
 type Profile struct {
-	Slug        string `json:"slug"`
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	Level       Level  `json:"level"`
+	Harness     Harness `json:"harness,omitempty"`
+	Account     string  `json:"account,omitempty"`
+	Provider    string  `json:"provider,omitempty"`
+	Slug        string  `json:"slug"`
+	Name        string  `json:"name"`
+	Description string  `json:"description"`
+	Level       Level   `json:"level"`
 	// Instructions is a template ({{name}}, {{project}}, ...; see DESIGN.md "Profiles").
 	// tmx appends the role, the brief, the read-only note and the mail rules; those are not editable.
 	Instructions      string   `json:"instructions"`
@@ -24,10 +27,14 @@ type Profile struct {
 	// CompanionTasks lets agents of this profile hand tasks to Companion (MCP companion_task;
 	// every hand-off still waits for the owner's OK). Off by default.
 	CompanionTasks bool `json:"companion_tasks"`
+	// MCPServers are Claude Code MCP servers (ids from claudeext: a user server's name, or
+	// "plugin:<plugin>:<server>") translated into each supported harness's config next to tmxg.
+	MCPServers []string `json:"mcp_servers"`
 
 	// Derived, never stored.
-	BuiltIn  bool `json:"built_in"`
-	Modified bool `json:"modified"` // a built-in that differs from its default
+	MCPWarnings []string `json:"mcp_warnings,omitempty"` // derived launch diagnostics
+	BuiltIn     bool     `json:"built_in"`
+	Modified    bool     `json:"modified"` // a built-in that differs from its default
 
 	CreatedAt int64 `json:"created_at"`
 	UpdatedAt int64 `json:"updated_at"`
@@ -46,8 +53,8 @@ var ReadOnlyDenied = []string{"Write", "Edit", "MultiEdit", "NotebookEdit", "Bas
 // PermissionModes are the values claude's --permission-mode accepts.
 var PermissionModes = []string{"auto", "default", "acceptEdits", "plan", "dontAsk", "bypassPermissions"}
 
-// Built-in profile slugs: one per level, named after it. They cannot be deleted and keep their level.
-var BuiltInProfiles = []string{string(LevelHead), string(LevelLead), string(LevelWorker)}
+// Built-in profile slugs cannot be deleted and keep their level.
+var BuiltInProfiles = []string{string(LevelHead), string(LevelLead), string(LevelWorker), FreeWorkerProfile}
 
 // IsBuiltInProfile reports whether slug is one of the built-in profiles.
 func IsBuiltInProfile(slug string) bool { return slices.Contains(BuiltInProfiles, slug) }
@@ -83,26 +90,35 @@ You review; you never change anything. Read the code and the changes you are ask
 Report to {{parent}} with report: a verdict first (approve, or changes needed), then concrete findings with file and line, most important first.`
 )
 
+// FableModel is Fable 5.2, the top of the ladder ("Fable for hard work": the owner #11, 17 Nov
+// 2026). The head, lead and worker profiles ALLOW it; none starts on it by default.
+const FableModel = "claude-fable-5-2"
+
 // DefaultProfiles use Opus for leads and Sonnet for ordinary workers. Workers may
-// select Opus for senior work or Haiku for intern work; reviewer stays read-only.
+// select Opus for senior work or Haiku for intern work; head, lead and worker may be given
+// Fable for hard work (allowed, never the default); reviewer stays read-only.
 func DefaultProfiles() []Profile {
-	const opus, sonnet, haiku = "claude-opus-5-5", "claude-sonnet-5", "claude-haiku-4-5-20251001"
+	const opus, sonnet, haiku, fable = "claude-opus-5-5", "claude-sonnet-5", "claude-haiku-4-5-20251001", FableModel
 	return []Profile{
 		{Slug: "head", Name: "Head", Level: LevelHead,
 			Description:  "Talks with you, creates projects and briefs their leads.",
-			Instructions: headInstructions, Model: opus, AllowedModels: []string{opus}, PermissionMode: "auto",
-			CanCreateProjects: true, CanLaunch: []string{"lead", "worker", "reviewer"}},
+			Instructions: headInstructions, Model: opus, AllowedModels: []string{opus, fable}, PermissionMode: "auto",
+			CanCreateProjects: true, CanLaunch: []string{"lead", "worker", "reviewer", FreeWorkerProfile}},
 		{Slug: "lead", Name: "Lead", Level: LevelLead,
 			Description:  "Owns one project and launches its workers.",
-			Instructions: leadInstructions, Model: opus, AllowedModels: []string{opus, sonnet}, PermissionMode: "auto",
-			CanLaunch: []string{"worker", "reviewer"}},
+			Instructions: leadInstructions, Model: opus, AllowedModels: []string{opus, sonnet, fable}, PermissionMode: "auto",
+			CanLaunch: []string{"worker", "reviewer", FreeWorkerProfile}},
 		{Slug: "worker", Name: "Worker", Level: LevelWorker,
 			Description:  "Does the work and reports to its lead.",
-			Instructions: workerInstructions, Model: sonnet, AllowedModels: []string{sonnet, opus, haiku}, PermissionMode: "auto"},
+			Instructions: workerInstructions, Model: sonnet, AllowedModels: []string{sonnet, opus, haiku, fable}, PermissionMode: "auto"},
 		{Slug: "reviewer", Name: "Reviewer", Level: LevelWorker,
 			Description:  "Reviews code and changes without editing anything: no shell, no file edits.",
 			Instructions: reviewerInstructions, Model: sonnet, AllowedModels: []string{sonnet}, PermissionMode: "auto",
 			ReadOnly: true},
+		{Slug: FreeWorkerProfile, Name: "Free worker", Level: LevelWorker,
+			Description:  "Runs OpenCode on Fae's local Ollama models with zero API cost.",
+			Instructions: workerInstructions, Harness: HarnessOpenCode, Account: "none", Provider: FaeProvider,
+			Model: FaeDefaultModel, AllowedModels: []string{FaeDefaultModel}, PermissionMode: "auto"},
 	}
 }
 
@@ -121,11 +137,12 @@ func DefaultProfile(slug string) (Profile, bool) {
 func (p Profile) SameSettings(o Profile) bool {
 	eq := func(a, b []string) bool { return slices.Equal(nonNil(a), nonNil(b)) }
 	return p.Slug == o.Slug && p.Name == o.Name && p.Description == o.Description && p.Level == o.Level &&
+		p.Harness == o.Harness && p.Account == o.Account && p.Provider == o.Provider &&
 		p.Instructions == o.Instructions && p.Model == o.Model && eq(p.AllowedModels, o.AllowedModels) &&
 		p.PermissionMode == o.PermissionMode && eq(p.AllowedTools, o.AllowedTools) &&
 		eq(p.DisallowedTools, o.DisallowedTools) && p.ReadOnly == o.ReadOnly &&
 		p.CanCreateProjects == o.CanCreateProjects && eq(p.CanLaunch, o.CanLaunch) &&
-		p.CompanionTasks == o.CompanionTasks
+		p.CompanionTasks == o.CompanionTasks && eq(p.MCPServers, o.MCPServers)
 }
 
 // Clone returns a deep copy.
@@ -134,6 +151,8 @@ func (p Profile) Clone() Profile {
 	p.AllowedTools = slices.Clone(p.AllowedTools)
 	p.DisallowedTools = slices.Clone(p.DisallowedTools)
 	p.CanLaunch = slices.Clone(p.CanLaunch)
+	p.MCPServers = slices.Clone(p.MCPServers)
+	p.MCPWarnings = slices.Clone(p.MCPWarnings)
 	return p
 }
 

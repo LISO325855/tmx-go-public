@@ -63,8 +63,8 @@ export const waApi = {
   chats: (q = "", limit = 500) => t().request<WaChat[] | null>("GET", `${base}/chats?limit=${limit}${q ? `&q=${enc(q)}` : ""}`),
   messages: (jid: string, before = "", limit = WA_PAGE) =>
     t().request<WaMessage[] | null>("GET", `${base}/chats/${enc(jid)}/messages?limit=${limit}${before ? `&before=${enc(before)}` : ""}`),
-  send: (jid: string, b: { text?: string; reply_to?: string; uploads?: WaUpload[] }) =>
-    t().request<WaMessage>("POST", `${base}/chats/${enc(jid)}/messages`, b),
+  send: (jid: string, b: { text?: string; reply_to?: string; uploads?: WaUpload[] }, signal?: AbortSignal) =>
+    t().request<WaMessage>("POST", `${base}/chats/${enc(jid)}/messages`, b, signal),
   read: (jid: string) => t().request<void>("POST", `${base}/chats/${enc(jid)}/read`),
   media: (jid: string, id: string) => t().request<WaMediaData>("GET", `${base}/media/${enc(jid)}/${enc(id)}?data=1`),
   ticket: (jid: string, id: string) => t().request<{ ticket: string; expires_at: number }>("POST", `${base}/media/${enc(jid)}/${enc(id)}/ticket`),
@@ -86,8 +86,9 @@ export async function loadWhatsApp() {
     if (isLinked(s)) void loadWaChats();
     else if (was && isLinked(was)) set({ chats: {}, messages: {}, chatsLoaded: true });
   } catch (e) {
-    if (e instanceof ApiError && (e.status === 404 || e.status === 501)) set({ available: false });
-    else if (e instanceof ApiError && e.status === 503) set({ available: true, offMessage: e.message, status: null });
+    if (e instanceof ApiError && (e.status === 404 || e.status === 501)) set({ available: false, offMessage: "", status: null, qr: null });
+    else if (e instanceof ApiError && e.status === 503 && e.message.startsWith("WhatsApp is off")) set({ available: true, offMessage: e.message, status: null, qr: null });
+    else set({ available: null, offMessage: "", status: null, qr: null });
   }
 }
 
@@ -189,6 +190,7 @@ export function toggleWaChatSetting(key: "allowed_chats" | "notify_head_chats", 
 function handle(ev: BusEvent) {
   switch (ev.type) {
     case "snapshot":
+      if (useStore.getState().conn !== "open") set({ available: null, offMessage: "", status: null, qr: null });
       void loadWhatsApp();
       break;
     case "whatsapp.status": {

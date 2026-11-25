@@ -1,6 +1,7 @@
 // Invite someone: a big QR code (drawn here), the link to copy, its expiry; a new code or
 // revoke. A DM invite is for one person, once; a group invite works for several people until
 // it expires (the group's admin only).
+import { useClassic } from "@/hooks/use-classic";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Loader2, RefreshCw, Users, User, X } from "lucide-react";
 import { toast } from "sonner";
@@ -42,6 +43,7 @@ function KindSwitch({ kind, onChange }: { kind: InviteKind; onChange: (k: Invite
 }
 
 export function InviteDialog() {
+  const classic = useClassic();
   const { open, kind: initialKind, groupId: initialGroup } = useChats((s) => s.invite);
   const chats = useChats((s) => s.chats);
   const groups = useMemo(() => sortedChats(chats).filter((c) => c.kind === "group" && c.admin && c.status === "active"), [chats]);
@@ -74,7 +76,7 @@ export function InviteDialog() {
   // On open: pick the target and make a code at once (no extra click).
   useEffect(() => {
     if (!open) return;
-    const k = initialKind;
+    const k = classic ? "dm" : initialKind;
     const gid = initialGroup ?? (k === "group" ? (groups[0]?.id ?? NEW_GROUP) : "");
     setKind(k);
     setGroupId(gid);
@@ -138,7 +140,7 @@ export function InviteDialog() {
           </DialogDescription>
         </DialogHeader>
 
-        <KindSwitch kind={kind} onChange={switchKind} />
+        {!classic && <KindSwitch kind={kind} onChange={switchKind} />}
 
         {kind === "group" && (
           <div className="grid gap-2">

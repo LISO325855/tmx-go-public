@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"debug/pe"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -44,6 +45,8 @@ const (
 // staged is a downloaded, verified release ready to swap in.
 type staged struct {
 	version string
+	asset   string // signed artifact name
+	hash    string // SHA-256 of the signed artifact
 	path    string // the staged executable or bundle
 	cleanup string // what to remove if it is not used (a file, or the staging directory)
 }
@@ -57,7 +60,7 @@ func (u *Updater) stage(ctx context.Context, t target, r release, version string
 		return staged{}, errors.New("fleet release tag/version mismatch")
 	}
 	// No downgrade, checked here too and not only where the release was chosen.
-	if cur, ok := ParseVersion(u.o.Version); !ok || !cur.Less(rv) {
+	if !u.availableVersion(rv, u.settings()) {
 		return staged{}, fmt.Errorf("release %s is not newer than this tmx (%s)", r.TagName, u.o.Version)
 	}
 	// A rotation statement first: it may pin the key this release is signed with (rotation.go).
@@ -142,11 +145,38 @@ func (u *Updater) stage(ctx context.Context, t target, r release, version string
 		}
 		s = staged{version: version, path: p, cleanup: p}
 	}
+	s.asset, s.hash = name, want
+	if t.goos == "windows" && t.desk {
+		if err := verifyWindowsDesktop(s.path); err != nil {
+			os.RemoveAll(s.cleanup)
+			return staged{}, err
+		}
+	}
 	if err := u.check(ctx, t, s); err != nil {
 		os.RemoveAll(s.cleanup)
 		return staged{}, err
 	}
 	return s, nil
+}
+
+// Old public assets sometimes carried both names on identical bytes.
+func verifyWindowsDesktop(path string) error {
+	exe, err := pe.Open(path)
+	if err != nil {
+		return fmt.Errorf("desktop asset is not a Windows executable: %w", err)
+	}
+	defer exe.Close()
+	var subsystem uint16
+	switch h := exe.OptionalHeader.(type) {
+	case *pe.OptionalHeader32:
+		subsystem = h.Subsystem
+	case *pe.OptionalHeader64:
+		subsystem = h.Subsystem
+	}
+	if subsystem != 2 { // IMAGE_SUBSYSTEM_WINDOWS_GUI
+		return fmt.Errorf("desktop asset has PE subsystem %d, expected 2 (Windows GUI)", subsystem)
+	}
+	return nil
 }
 
 // check runs the staged binary ("version") and, for a bundle, the code signature check.

@@ -16,7 +16,7 @@ func (s *Server) messagePinRoutes(mux *http.ServeMux) {
 		}
 		writeJSON(w, http.StatusOK, pins)
 	})
-	mux.HandleFunc("POST /api/message-pins", s.ownerOnly(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST /api/message-pins", s.managers(func(w http.ResponseWriter, r *http.Request) {
 		var p model.MessagePin
 		if !decode(w, r, &p) {
 			return
@@ -28,7 +28,7 @@ func (s *Server) messagePinRoutes(mux *http.ServeMux) {
 		}
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 	}))
-	mux.HandleFunc("PATCH /api/message-pins/{id}", s.ownerOnly(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("PATCH /api/message-pins/{id}", s.managers(func(w http.ResponseWriter, r *http.Request) {
 		var p struct {
 			State string `json:"state"`
 		}

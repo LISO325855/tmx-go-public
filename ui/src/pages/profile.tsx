@@ -21,6 +21,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { LevelBadge } from "@/components/badges";
 import { EmptyState, PageBody, PageHeader, Section } from "@/components/page";
 import { InstructionsEditor, InstructionsPreview, TokenField, ToggleChip } from "@/components/profile-fields";
+import { ClaudeExtensionRows } from "@/components/claude-extensions";
 import { api } from "@/lib/api";
 import { LEVEL_LABEL, modelName, plural, slugify } from "@/lib/format";
 import { cleanList, profileOf, READ_ONLY_TOOLS, sortProfiles } from "@/lib/profiles";
@@ -53,6 +54,7 @@ type Draft = Pick<
   | "can_create_projects"
   | "can_launch"
   | "companion_tasks"
+  | "mcp_servers"
 >;
 
 function toDraft(p: Profile): Draft {
@@ -71,6 +73,7 @@ function toDraft(p: Profile): Draft {
     can_create_projects: p.can_create_projects,
     can_launch: p.can_launch ?? [],
     companion_tasks: !!p.companion_tasks,
+    mcp_servers: p.mcp_servers ?? [],
   };
 }
 
@@ -92,6 +95,7 @@ function newDraft(base: Profile | undefined): Draft {
     can_create_projects: false,
     can_launch: [],
     companion_tasks: false,
+    mcp_servers: [],
   };
 }
 
@@ -465,6 +469,17 @@ export function ProfilePage({ slug }: { slug: string }) {
                 validate={(s) => (s.includes(",") ? "One tool or rule per entry." : "")}
               />
             </Row>
+          </Card>
+        </Section>
+
+        <Section title="Profile MCP tools">
+          <p className="-mt-1 mb-3 text-xs text-muted-foreground">
+            Desktop, browser and other tools from your Claude Code setup, for this profile's agents. Off unless you pick them; the tmx tools
+            always stay.
+          </p>
+          <Card>
+            {!![...(profile?.mcp_warnings ?? []), ...users.flatMap((a) => a.mcp_warnings ?? [])].length && <div role="alert" className="py-3 text-sm text-state-error">{[...new Set([...(profile?.mcp_warnings ?? []), ...users.flatMap((a) => a.mcp_warnings ?? [])])].map((warning) => <p key={warning}>{warning}</p>)}</div>}
+            <ClaudeExtensionRows servers={draft.mcp_servers ?? []} onServers={(v) => set("mcp_servers", v)} />
           </Card>
         </Section>
 

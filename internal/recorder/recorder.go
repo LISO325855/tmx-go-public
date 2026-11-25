@@ -727,6 +727,7 @@ func (s *Service) liveRecLocked(sess *session) model.Recording {
 			r.Segments[i].WAVBytes += wavHeaderSize
 		}
 		r.Segments[i].DurationMS = segDuration(g)
+		r.SavedMS += r.Segments[i].DurationMS
 	}
 	return r
 }

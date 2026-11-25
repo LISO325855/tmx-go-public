@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/blackcode-ch/tmx-go/internal/model"
@@ -52,12 +53,12 @@ func TestAgentsCRUD(t *testing.T) {
 	if err := s.PutAgent(a); err != nil {
 		t.Fatal(err)
 	}
-	a.CostUSD, a.ProjectID = 1.5, "p1"
+	a.CostUSD, a.ProjectID, a.Account = 1.5, "p1", "second" // the account is stored (17 Nov)
 	if err := s.PutAgent(a); err != nil {
 		t.Fatal(err)
 	}
 	got, err := s.GetAgent("a1")
-	if err != nil || got != a {
+	if err != nil || !reflect.DeepEqual(got, a) {
 		t.Fatalf("got %+v %v", got, err)
 	}
 	dup := a
@@ -216,5 +217,26 @@ func TestEscapeURIPath(t *testing.T) {
 		if got := escapeURIPath(tc.path); got != tc.want {
 			t.Errorf("escapeURIPath(%q) = %q, want %q", tc.path, got, tc.want)
 		}
+	}
+}
+
+// A database written by a newer build is refused with a plain sentence, and is not changed: an
+// older build never runs on a schema it does not know (17 Nov: the list of migrations is
+// append-only in merge order, so a higher number always means a newer build).
+func TestNewerDatabaseIsRefused(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tmx.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`INSERT INTO schema_version(version) VALUES (?)`, len(migrations)+1); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	if s2, err := Open(path); err == nil {
+		s2.Close()
+		t.Fatal("a database one migration ahead was opened")
+	} else if !strings.Contains(err.Error(), "newer than this tmx") {
+		t.Fatalf("the refusal does not say why: %v", err)
 	}
 }

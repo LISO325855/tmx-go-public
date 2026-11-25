@@ -179,7 +179,7 @@ export class MockWhatsApp {
     this.ask = opts.ask;
     this.headId = opts.headId ?? (() => "");
     const p = new URLSearchParams(typeof location === "undefined" ? "" : location.search).get("wa") ?? "";
-    this.mode = p || (opts.scenario === "empty" ? "unlinked" : "");
+    this.mode = p || (opts.scenario === "empty" || opts.scenario === "onboarding" ? "unlinked" : "");
     const settings: WaSettings = {
       read_receipts: false,
       agents_send: "ask",
