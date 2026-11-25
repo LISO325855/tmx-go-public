@@ -398,7 +398,7 @@ func (s *Service) Incoming(b Record, from string) (Record, error) {
 		return nil, fail(403, "backups must come directly from their fleet machine")
 	}
 	if size > MaxFile {
-		return nil, fail(413, "copy exceeds 4 GB size cap")
+		return nil, fail(413, fmt.Sprintf("copy exceeds the %d GB size cap", MaxFile>>30))
 	}
 	if b.flag("backup") && b.flag("trusted_backup") {
 		return nil, fail(400, "choose backup or trusted_backup, not both")

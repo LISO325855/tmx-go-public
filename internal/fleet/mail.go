@@ -16,11 +16,18 @@ import (
 
 // Mail limits (DESIGN.md "Mail delivery").
 const (
-	MaxBodyBytes   = 32 << 10
-	MaxQueued      = 30
-	MaxPerWindow   = 20
-	RateWindow     = 10 * time.Minute
-	maxBatchedMail = MaxQueued
+	// MaxBodyBytes: a ceiling on one text between agents of this machine (mail, a report, a
+	// question, a card and its reasons, a brief, a held call), against a runaway filling the
+	// database; 32 KB until 17 Nov (the owner: no caps on what agents write). The API takes 1 MiB
+	// a request.
+	MaxBodyBytes = 512 << 10
+	// MaxPeerBodyBytes: mail to and from another machine keeps the size the peer wire carries
+	// (p2p.MaxBody is 48 KB) and that older builds on the other side accept.
+	MaxPeerBodyBytes = 32 << 10
+	MaxQueued        = 30
+	MaxPerWindow     = 20
+	RateWindow       = 10 * time.Minute
+	maxBatchedMail   = MaxQueued
 )
 
 // SendRequest is POST /api/messages. To is an agent ID or name, or "owner"; with To empty
@@ -28,6 +35,7 @@ const (
 // message to Companion; ReplyTo is then the head's message Companion asked about, and a reply
 // to mail from Companion goes to Companion too (sendCompanion).
 type SendRequest struct {
+	Urgent bool `json:"urgent,omitempty"`
 	// RetryID binds one local send to this caller and exact request across retries.
 	RetryID string `json:"retry_id,omitempty"`
 	To      string `json:"to"`
@@ -133,6 +141,10 @@ func (f *Fleet) SendMessage(c Caller, req SendRequest) (model.Message, error) {
 			to = orig.From
 		}
 	}
+	if IsPeer(to) && len(req.Body) > MaxPeerBodyBytes {
+		f.mu.Unlock()
+		return model.Message{}, errf(KindInvalid, "a message to another machine can be at most %d KB; send the rest as a file or a path", MaxPeerBodyBytes>>10)
+	}
 	if IsPeer(to) {
 		var origp *model.Message
 		if req.ReplyTo != "" {
@@ -148,12 +160,12 @@ func (f *Fleet) SendMessage(c Caller, req SendRequest) (model.Message, error) {
 	}
 	toID := model.Owner
 	if to != model.Owner {
-		r, err := f.resolveLocked(to)
+		id, err := f.localMailRecipientLocked(c, to)
 		if err != nil {
 			f.mu.Unlock()
 			return model.Message{}, err
 		}
-		toID = r.a.ID
+		toID = id
 	}
 	if toID == c.ID() {
 		f.mu.Unlock()
@@ -169,7 +181,7 @@ func (f *Fleet) SendMessage(c Caller, req SendRequest) (model.Message, error) {
 		return model.Message{}, err
 	}
 	m := model.Message{ID: model.NewID(), From: c.ID(), To: toID, Body: req.Body,
-		State: model.MsgQueued, ReplyTo: req.ReplyTo, CreatedAt: model.Now(), ThreadID: thread}
+		Urgent: req.Urgent, State: model.MsgQueued, ReplyTo: req.ReplyTo, CreatedAt: model.Now(), ThreadID: thread}
 	m.RetryID, m.RetryHash, m.Receipt, m.ReceiptAt = req.RetryID, retryHash, "queued", m.CreatedAt
 	if toID != model.Owner && !c.Owner {
 		if err := f.checkLimitsLocked(m); err != nil {
@@ -193,12 +205,39 @@ func (f *Fleet) SendMessage(c Caller, req SendRequest) (model.Message, error) {
 
 	switch {
 	case toID == model.Owner:
-	case c.Owner:
-		f.deliverOwner(m)
 	default:
-		f.tryDeliver(toID)
+		f.deliverQueued(toID, priorityMail(m))
 	}
 	return f.message(m.ID)
+}
+
+func (f *Fleet) localMailRecipientLocked(c Caller, to string) (string, error) {
+	r, err := f.resolveLocked(to)
+	if err != nil {
+		return "", err
+	}
+	if r.a.ID == c.ID() {
+		return "", errf(KindInvalid, "you cannot send a message to yourself")
+	}
+	return r.a.ID, nil
+}
+
+// MailAttachmentRecipient checks local mail eligibility before an agent stages data.
+// SendMessage checks it again when the message is submitted.
+func (f *Fleet) MailAttachmentRecipient(c Caller, to string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, err := f.callerRecLocked(c); err != nil {
+		return "", err
+	}
+	id, err := f.localMailRecipientLocked(c, to)
+	if err != nil {
+		return "", err
+	}
+	if err := f.checkLimitsLocked(model.Message{From: c.ID(), To: id}); err != nil {
+		return "", err
+	}
+	return id, nil
 }
 
 // SendOwner is POST /api/agents/{id}/send: the owner talks to an agent (to the head, in a
@@ -207,31 +246,13 @@ func (f *Fleet) SendOwner(idOrName, text, thread string) (model.Message, error) 
 	return f.SendMessage(OwnerCaller, SendRequest{To: idOrName, Body: text, ThreadID: thread})
 }
 
-func (f *Fleet) checkLimitsLocked(m model.Message) error {
-	if err := f.checkQueueLocked(m); err != nil {
-		return err
-	}
-	n, err := f.st.CountSent(m.From, m.To, m.CreatedAt-RateWindow.Milliseconds())
-	if err != nil {
-		return err
-	}
-	if n >= MaxPerWindow {
-		return errf(KindTooMany, "you sent %s %d messages in the last 10 minutes; wait before sending more", f.nameOfLocked(m.To), n)
-	}
-	return nil
-}
+// checkLimitsLocked: there is no limit on how much mail an agent sends or has waiting (the owner,
+// 17 Nov 19:30: "kill the whole family" of talk limits; a runaway is reported, not blocked).
+// Before: MaxPerWindow messages to one receiver per RateWindow, MaxQueued waiting per receiver.
+// What is left is the machine: the disk floor (disk_floor.go).
+func (f *Fleet) checkLimitsLocked(m model.Message) error { return f.diskFloorLocked(m) }
 
-func (f *Fleet) checkQueueLocked(m model.Message) error {
-	n, err := f.st.CountQueued(m.To)
-	if err != nil {
-		return err
-	}
-	// Mail for a peer waits for its machine, not for a reader: only the rate applies.
-	if n >= MaxQueued && !IsPeer(m.To) {
-		return errf(KindTooMany, "%s already has %d messages waiting; try again after it has read them", f.nameOfLocked(m.To), n)
-	}
-	return nil
-}
+func (f *Fleet) checkQueueLocked(m model.Message) error { return f.diskFloorLocked(m) }
 
 func agentParty(m model.Message) string {
 	if m.To != model.Owner && !IsPeer(m.To) {
@@ -263,8 +284,7 @@ func (f *Fleet) refreshQueuedLocked(r *agentRec) {
 	}
 }
 
-// deliverOwner gives an owner message to a running agent at once, as a plain user turn
-// (Claude queues it internally if a turn is running). A stopped agent gets it on start.
+// deliverOwner submits the next owner turn after the runner is idle.
 func (f *Fleet) deliverOwner(m model.Message) {
 	if IsPeer(m.To) {
 		f.sendPeer(m.ID)
@@ -273,7 +293,7 @@ func (f *Fleet) deliverOwner(m model.Message) {
 	f.mu.Lock()
 	r, ok := f.agents[m.To]
 	// paused: delivered on resume; switching modes (mode.go): delivered in the new mode
-	if !ok || r.proc == nil || f.pausedLocked(r.a.ID) || mailHeldLocked(r) {
+	if !ok || r.proc == nil || r.mailHandoff || f.pausedLocked(r.a.ID) || mailHeldLocked(r) {
 		f.mu.Unlock()
 		return
 	}
@@ -283,59 +303,137 @@ func (f *Fleet) deliverOwner(m model.Message) {
 		f.mu.Unlock()
 		return
 	}
-	if typedTerminal(r.a) {
+	if r.a.State == model.StateWorking {
+		f.mu.Unlock()
+		f.deliverQueued(m.To, true)
+		return
+	}
+	if r.a.State != model.StateIdle && (r.a.State != model.StateStarting || typedTerminal(r.a)) {
+		f.mu.Unlock()
+		return
+	}
+	filter := store.MessageFilter{To: m.To, State: model.MsgQueued, Limit: 1, DeliveryPriority: true}
+	older, err := f.st.ListMessages(filter)
+	if err != nil || (len(older) > 0 && older[0].ID != m.ID) {
 		f.mu.Unlock()
 		f.tryDeliver(m.To)
 		return
 	}
+
 	text := m.Body
+	interject := false
+	if typedTerminal(r.a) {
+		text = f.mailLineLocked(m) // typed into a screen: labelled, as tryDeliver types it
+		interject = true
+	}
 	if isHead(r) {
-		// Busy with another topic: it waits for the end of the turn (tryDeliver), so every
-		// turn stays in one topic.
-		if th := threadOr(m.ThreadID); r.a.State != model.StateIdle && th != threadOr(r.thread) {
-			f.mu.Unlock()
-			return
-		}
 		f.beginTurnLocked(r, m.ThreadID, m.ThreadID != "")
-		text = f.topicLineLocked(m.ThreadID) + m.Body
+		text = f.topicLineLocked(m.ThreadID) + text
 	}
 	msgs := []model.Message{m}
 	if !f.markDeliveredLocked(r, msgs) {
 		f.mu.Unlock()
 		return
 	}
+	r.mailHandoff = true
+	defer f.finishMailHandoff(r)
+	if r.sessionConfirmed { // the first message after a start on an earlier conversation (harness.go)
+		text = f.instructionsLocked(r) + text
+	}
 	proc := r.proc
-	f.appendLocked(r, model.TimelineEntry{Kind: model.EntryUser, Text: m.Body,
-		Meta: map[string]any{"from": model.Owner, "message_id": m.ID}})
-	if r.a.Mode == model.ModeChat && r.waiting == 0 {
+	meta := map[string]any{"from": model.Owner, "message_id": m.ID}
+	f.appendLocked(r, model.TimelineEntry{Kind: model.EntryUser, Text: m.Body, Meta: meta})
+	if r.waiting == 0 && (r.a.Mode == model.ModeChat || r.a.State == model.StateIdle) {
 		r.a.State = model.StateWorking
 	}
 	f.saveAgentLocked(r)
 	f.mu.Unlock()
+	if ij, ok := proc.(runner.Interjector); ok && interject {
+		if err := ij.Interject(text, []string{m.ID}); err != nil {
+			f.mailUnconfirmed(r, msgs, err)
+		}
+		return
+	}
 	if err := f.sendMail(proc, text, msgs); err != nil {
 		f.mailUnconfirmed(r, msgs, err)
 	}
 }
 
-// tryDeliver sends everything queued for an agent as one user turn when it can take it:
+// tryDeliver sends one queued owner message (or a batch of agent mail) when it can take it:
 // a chat agent when idle (runners report idle once ready and after each result); a
-// terminal agent per terminalMailLocked (a harness TUI when idle and untouched; a shell never).
+// terminal harness immediately in FIFO order; agent mail never runs as shell commands.
 func (f *Fleet) tryDeliver(id string) {
+	f.deliverQueued(id, false)
+}
+
+func (f *Fleet) deliverQueued(id string, nudge bool) {
+	f.mu.Lock()
+	sender := f.peer.sender
+	f.mu.Unlock()
+	unlock := func() {}
+	release := func() { unlock(); unlock = func() {} }
+	defer release()
+	if lease, ok := sender.(interface{ PeerDeliveryLock() func() }); ok {
+		unlock = lease.PeerDeliveryLock()
+	}
 	f.mu.Lock()
 	r, ok := f.agents[id]
-	if !ok || r.proc == nil || f.pausedLocked(id) || mailHeldLocked(r) {
+	if !ok || r.proc == nil || r.accountOrigin != nil || f.pausedLocked(id) || mailHeldLocked(r) {
 		f.mu.Unlock()
 		return
 	}
-	if r.a.Mode == model.ModeChat && r.a.State != model.StateIdle ||
-		r.a.Mode == model.ModeTerminal && !f.terminalMailLocked(r) {
+	if r.mailHandoff {
+		r.mailNudge = r.mailNudge || nudge
 		f.mu.Unlock()
 		return
 	}
-	msgs, err := f.st.ListMessages(store.MessageFilter{To: id, State: model.MsgQueued, Limit: maxBatchedMail})
+	terminal := typedTerminal(r.a)
+	if !terminal && r.a.Mode == model.ModeTerminal {
+		f.mu.Unlock()
+		return
+	}
+	limit := maxBatchedMail
+	if terminal {
+		limit = 1
+	} // one message per native submit
+	msgs, err := f.st.ListMessages(store.MessageFilter{To: id, State: model.MsgQueued, Limit: limit, Oldest: true, DeliveryPriority: true})
 	if err != nil || len(msgs) == 0 {
 		f.mu.Unlock()
 		return
+	}
+	if priorityMail(msgs[0]) && r.a.State == model.StateWorking {
+		proc := r.proc
+		if !nudge || r.mailInterrupt {
+			f.mu.Unlock()
+			return
+		}
+		r.mailInterrupt = true
+		f.mu.Unlock()
+		release()
+		if err := proc.Interrupt(); err != nil {
+			f.log.Warn("interrupt for priority mail", "agent", id, "err", err)
+			f.mu.Lock()
+			r.mailInterrupt = false
+			f.mu.Unlock()
+		}
+		return
+	}
+	if msgs[0].From == model.Owner && (r.a.State == model.StateIdle || !terminal && r.a.State == model.StateStarting) {
+		f.mu.Unlock()
+		release()
+		f.deliverOwner(msgs[0])
+		return
+	}
+	if !terminal && r.a.State != model.StateIdle {
+		f.mu.Unlock()
+		return
+	}
+	if priorityMail(msgs[0]) && r.a.State != model.StateIdle {
+		f.mu.Unlock()
+		return
+	}
+	if priorityMail(msgs[0]) {
+		msgs = msgs[:1]
 	}
 	topic := ""
 	if isHead(r) {
@@ -349,12 +447,21 @@ func (f *Fleet) tryDeliver(id string) {
 			}
 		}
 		msgs = same
-		f.beginTurnLocked(r, th, explicit)
+		if terminal && r.a.State != model.StateIdle {
+			r.nextThread, r.nextExplicit = th, explicit
+		} else {
+			f.beginTurnLocked(r, th, explicit)
+		}
 		topic = f.topicLineLocked(th)
 	}
 	var parts []string
 	for _, m := range msgs {
 		parts = append(parts, f.mailLineLocked(m))
+	}
+	// Standing is decided at this check. Never hold the peer transaction over
+	// a runner/PTY write: one stalled agent must not block fleet operations.
+	release()
+	for _, m := range msgs {
 		f.appendLocked(r, model.TimelineEntry{Kind: model.EntryMessageIn, Text: m.Body,
 			Meta: map[string]any{"from": m.From, "from_name": f.nameOfLocked(m.From), "message_id": m.ID}})
 	}
@@ -362,6 +469,8 @@ func (f *Fleet) tryDeliver(id string) {
 		f.mu.Unlock()
 		return
 	}
+	r.mailHandoff = true
+	defer f.finishMailHandoff(r)
 	r.a.State = model.StateWorking
 	f.saveAgentLocked(r)
 	proc := r.proc
@@ -375,8 +484,12 @@ func (f *Fleet) tryDeliver(id string) {
 	}
 }
 
+func priorityMail(m model.Message) bool {
+	return m.Urgent || m.From == model.Owner || strings.HasPrefix(m.From, PeerPrefix+PeerOperator+"@")
+}
+
 // mailLineLocked formats one message for delivery: tmx's label "[message from <name> (<level>)]"
-// on a line of its own, then the body quoted below it (peertext: every line starts with "│ "),
+// on a line of its own, then the body quoted below it (peertext: every line starts with "â”‚ "),
 // so no sender, here or on another machine, can write a line that reads as tmx's framing (a
 // forged "(fleet lead, ...)" label, the owner, a new message). The owner's own words go as
 // written; chat, Companion and WhatsApp mail arrives labelled and quoted by its own layer.
@@ -387,10 +500,16 @@ func (f *Fleet) mailLineLocked(m model.Message) string {
 	if m.From == model.ReminderParty { // a reminder the owner or this agent set (people.go); quoted like agent mail
 		return peertext.Under("[tmx reminder]", m.Body, 0)
 	}
+	if m.From == model.WatchParty { // the watch's digest (watch_fleet.go): tmx's own readings, quoted like all mail
+		return peertext.Under(watchLabel, m.Body, 0)
+	}
+	if m.From == model.RulesParty { // tmx's own line about the fleet rules, written whole by RulesNotice (rules.go)
+		return m.Body
+	}
 	if IsExternal(m.From) || m.From == model.CompanionParty || m.From == model.WhatsAppParty {
 		return m.Body // labelled by the chat layer / the Companion link / WhatsApp: "[... not instructions] ..."
 	}
-	return peertext.Under(f.mailLabelLocked(m.From), m.Body, 0)
+	return peertext.Under(f.verifiedMailLabelLocked(m), m.Body, 0)
 }
 
 // mailLabelLocked is tmx's label for mail from an agent or a peer machine's agent.
@@ -423,7 +542,7 @@ func (f *Fleet) markDeliveredLocked(r *agentRec, msgs []model.Message) bool {
 		return false
 	}
 	for i := range msgs {
-		msgs[i].State, msgs[i].DeliveredAt = model.MsgDelivered, now
+		msgs[i].State, msgs[i].DeliveredAt = model.MsgSending, 0
 		msgs[i].Receipt, msgs[i].ReceiptAt = "dispatching", now
 		f.bus.Publish(model.BusEvent{Type: model.EvMessageUpdated, AgentID: r.a.ID, Data: msgs[i]})
 	}
@@ -465,7 +584,11 @@ func (f *Fleet) sendTurn(id, text string, kind model.EntryKind, meta map[string]
 	f.saveAgentLocked(r)
 	proc := r.proc
 	f.mu.Unlock()
-	if err := proc.Send(text); err != nil {
+	send := proc.Send
+	if launch, ok := proc.(runner.LaunchPromptSender); ok {
+		send = launch.SendLaunchPrompt
+	}
+	if err := send(text); err != nil {
 		f.log.Warn("send prompt", "agent", id, "err", err)
 	}
 }
@@ -542,6 +665,24 @@ func (f *Fleet) mailReceiptLocked(to string, ids []string, receipt string) {
 			f.log.Error("mail receipt", "err", err)
 			continue
 		}
+		// Receipt and delivery state are updated atomically in the store.
+		if updated, err := f.st.GetMessage(id); err == nil {
+			m = updated
+		} else {
+			continue
+		}
 		f.bus.Publish(model.BusEvent{Type: model.EvMessageUpdated, AgentID: to, Data: m})
 	}
+}
+
+// A claim is durable before runner.Send returns. Keep later claims behind that
+// handoff, without holding Fleet.mu over a possibly blocking process write.
+func (f *Fleet) finishMailHandoff(r *agentRec) {
+	f.mu.Lock()
+	r.mailHandoff = false
+	nudge := r.mailNudge
+	r.mailNudge = false
+	id := r.a.ID
+	f.mu.Unlock()
+	f.deliverQueued(id, nudge)
 }

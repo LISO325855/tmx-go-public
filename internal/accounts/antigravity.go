@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -21,6 +22,15 @@ import (
 //     expands slash commands unless --disable-slash-commands;
 //   - a statusline command receives {"quota": {"<bucket>": {"remaining_fraction", "reset_time",
 //     "reset_in_seconds"}}} on stdin, the shape parseAgyUsage looks for first.
+//
+// VERIFIED on a real install (Windows, 17 Nov 2026):
+//   - agy has no `auth` subcommand: `agy auth --help` prints the main usage;
+//   - `agy -p /usage --output-format json` answers {"status":"SUCCESS","response": "..."} whose
+//     response is one TAB-separated line per limit: model group, limit name, "N%", reset time
+//     (RFC 3339), e.g. "Gemini Models<TAB>Weekly Limit Remaining<TAB>100%<TAB>2026-11-24T13:57:20Z";
+//   - its home is <home>/.gemini/ (google_accounts.json, settings.json, state.json), with
+//     antigravity-cli/ beneath it; with no auth command, google_accounts.json is the only cheap
+//     sign that an account is signed in (agySignedIn).
 
 const agyNoQuota = "Antigravity didn't report its quota here. Run /usage in Antigravity to see it."
 
@@ -63,6 +73,86 @@ func (s *scope) agyHasAuth(ctx context.Context, path string) bool {
 	return has
 }
 
+// agyForget drops what was learned about the agy executable (the auth probe and the "print
+// mode gives no quota" latch): after a sign-in or sign-out its answers may be different.
+func (s *Service) agyForget() {
+	s.agyMu.Lock()
+	s.agy = agyProbe{}
+	s.agyMu.Unlock()
+}
+
+// agyHome is agy's home folder for s: the account's (HomeEnv moves HOME and USERPROFILE), else
+// the user's.
+func (s *scope) agyHome() string {
+	for i := len(s.home) - 1; i >= 0; i-- {
+		for _, k := range []string{"USERPROFILE=", "HOME="} {
+			if v, ok := strings.CutPrefix(s.home[i], k); ok && v != "" {
+				return v
+			}
+		}
+	}
+	home, _ := os.UserHomeDir()
+	return home
+}
+
+// agySignedIn: agy keeps the signed-in Google account in <home>/.gemini/google_accounts.json
+// (the file Gemini CLI uses too). Signed in = the file is there and not empty and, where it has
+// an "active" entry, that entry names an account. The card shows that address (agyActiveEmail);
+// nothing else of the file is kept or shown, and nothing is logged.
+func agySignedIn(s *scope) bool {
+	home := s.agyHome()
+	if home == "" {
+		return false
+	}
+	b, err := os.ReadFile(filepath.Join(home, ".gemini", "google_accounts.json"))
+	if err != nil || len(bytes.TrimSpace(b)) == 0 {
+		return false
+	}
+	var f map[string]json.RawMessage
+	if json.Unmarshal(b, &f) != nil {
+		return true // not the shape known from Gemini CLI: present and not empty is all we know
+	}
+	active, has := f["active"]
+	if !has {
+		return len(f) > 0
+	}
+	var email string
+	return json.Unmarshal(active, &email) == nil && email != ""
+}
+
+// agyActiveEmail is the address of the Google account agy is signed in with: the "active"
+// entry of its sign-in file, when that is an e-mail address. It is shown on the account's card
+// like Claude's and Codex's; nothing else of the file is read out, and nothing is logged.
+func agyActiveEmail(s *scope) string {
+	home := s.agyHome()
+	if home == "" {
+		return ""
+	}
+	b, err := os.ReadFile(filepath.Join(home, ".gemini", "google_accounts.json"))
+	if err != nil {
+		return ""
+	}
+	var f struct {
+		Active string `json:"active"`
+	}
+	if json.Unmarshal(b, &f) != nil {
+		return ""
+	}
+	if a := strings.TrimSpace(f.Active); len(a) <= 254 && emailRx.FindString(a) == a {
+		return a
+	}
+	return ""
+}
+
+// agyByFile is the account as far as the sign-in file tells, for an agy that says nothing
+// usable itself.
+func agyByFile(s *scope) result {
+	if !agySignedIn(s) {
+		return result{known: true}
+	}
+	return result{known: true, connected: true, id: Identity{Method: MethodSubscription}, note: agyNoQuota}
+}
+
 func agyLogin(ctx context.Context, s *scope, path string) []string {
 	if s.agyHasAuth(ctx, path) {
 		return []string{"auth", "login"}
@@ -77,7 +167,17 @@ func agyLogout(ctx context.Context, s *scope, path string) []string {
 	return []string{"-p", "/logout"}
 }
 
+// agyCheck is the account's state, with the signed-in Google address from agy's sign-in file
+// where agy itself named none (its status and usage output often do not).
 func agyCheck(ctx context.Context, s *scope, path string) result {
+	res := agyState(ctx, s, path)
+	if res.connected && res.id.Email == "" {
+		res.id.Email = agyActiveEmail(s)
+	}
+	return res
+}
+
+func agyState(ctx context.Context, s *scope, path string) result {
 	var res result
 	authKnown := false
 	if s.agyHasAuth(ctx, path) {
@@ -90,7 +190,7 @@ func agyCheck(ctx context.Context, s *scope, path string) result {
 	}
 	if s.agyProbe(path, nil).usageBroken {
 		if !authKnown {
-			return result{err: "Couldn't tell whether Antigravity is signed in"}
+			return agyByFile(s)
 		}
 		res.note = agyNoQuota
 		return res
@@ -115,7 +215,7 @@ func agyCheck(ctx context.Context, s *scope, path string) result {
 	default:
 		s.agyProbe(path, func(p *agyProbe) { p.usageBroken = true })
 		if !authKnown {
-			return result{err: "Couldn't tell whether Antigravity is signed in"}
+			return agyByFile(s)
 		}
 		res.note = agyNoQuota
 	}
@@ -202,6 +302,9 @@ func parseAgyUsage(out []byte, now time.Time) (limits []Limit, signedOut, ok boo
 		texts = []string{string(out)}
 	}
 	text := ansiRx.ReplaceAllString(strings.Join(texts, "\n"), "")
+	if l := agyTabLimits(text); len(l) > 0 {
+		return l, false, true
+	}
 	for _, line := range strings.Split(text, "\n") {
 		m := agyLineRx.FindStringSubmatch(line)
 		if m == nil {
@@ -229,6 +332,57 @@ func parseAgyUsage(out []byte, now time.Time) (limits []Limit, signedOut, ok boo
 		return limits, false, true
 	}
 	return nil, signedOutRx.MatchString(text), false
+}
+
+var agyTabPercentRx = regexp.MustCompile(`^(\d+(?:\.\d+)?)\s*%$`)
+
+// agyTabLimits reads the real /usage answer: one line per limit, TAB-separated: model group,
+// limit name, "N%", reset time (RFC 3339; may be missing). agy reports what is LEFT ("Weekly
+// Limit Remaining"); a limit name that says "used" is read as used. Lines of another shape are
+// skipped.
+func agyTabLimits(text string) []Limit {
+	var out []Limit
+	seen := map[string]bool{}
+	for _, line := range strings.Split(text, "\n") {
+		f := strings.Split(strings.TrimRight(line, "\r"), "\t")
+		if len(f) < 3 {
+			continue
+		}
+		for i := range f {
+			f[i] = strings.TrimSpace(f[i])
+		}
+		m := agyTabPercentRx.FindStringSubmatch(f[2])
+		if m == nil || f[0] == "" || f[1] == "" {
+			continue
+		}
+		pct, ok := parsePercent(m[1])
+		if !ok {
+			continue
+		}
+		name := f[1]
+		if !strings.Contains(strings.ToLower(name), "used") {
+			pct = clampPercent(100 - pct) // "remaining", or no word: agy's /usage counts down
+		}
+		for _, w := range []string{" Remaining", " remaining", " Used", " used"} {
+			name = strings.TrimSuffix(name, w)
+		}
+		label := name // "Gemini 4 Argon Weekly Limit" already names its group
+		if !strings.HasPrefix(strings.ToLower(name), strings.ToLower(f[0])) {
+			label = f[0] + " · " + name
+		}
+		l := Limit{ID: slug(label), Label: label, UsedPercent: pct}
+		if l.ID == "" || seen[l.ID] {
+			continue
+		}
+		seen[l.ID] = true
+		if len(f) > 3 {
+			if t, err := time.Parse(time.RFC3339Nano, f[3]); err == nil {
+				l.ResetsAt = t.UnixMilli()
+			}
+		}
+		out = append(out, l)
+	}
+	return out
 }
 
 // jsonDocs reads out as one JSON value, or as one per line.

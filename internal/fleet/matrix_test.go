@@ -126,13 +126,23 @@ func TestMatrixAttachDetach(t *testing.T) {
 		t.Fatalf("agent attaching a secret: %v", err)
 	}
 	leak := "token AbCdEf0123456789AbCdEf0123456789xyz"
+	// Nothing is checked or rewritten in a link (17 Nov: no filters and no silent rewrites on
+	// tmx's own records): a value shaped like a token is filed as written, in a reference, a
+	// label or a why.
 	for _, req := range []LinkRequest{
 		{Thread: topic.ID, Axis: "secret", Ref: leak},
-		{Thread: topic.ID, Axis: "secret", Ref: "shop-account", Label: leak},
-		{Thread: topic.ID, Axis: "doc", Ref: "x.md", Why: leak},
+		{Thread: topic.ID, Axis: "secret", Ref: "shop-account-2", Label: leak},
+		{Thread: topic.ID, Axis: "doc", Ref: "x-2.md", Why: leak + ", the certificate password and 2FA: nobody knows where it is held"},
 	} {
-		if _, err := f.AttachLink(OwnerCaller, req); KindOf(err) != KindInvalid {
-			t.Fatalf("secret value %+v: %v", req, err)
+		l, err := f.AttachLink(OwnerCaller, req)
+		if err != nil {
+			t.Fatalf("link %+v: %v", req, err)
+		}
+		if got := l.Ref + l.Label + l.Why; !strings.Contains(got, leak) || strings.Contains(got, "removed by tmx") {
+			t.Fatalf("the link was changed: %+v", l)
+		}
+		if req.Why != "" && !strings.Contains(l.Why, "the certificate password and 2FA: nobody knows where it is held") {
+			t.Fatalf("the words were changed: %q", l.Why)
 		}
 	}
 	if _, err := f.AttachLink(OwnerCaller, LinkRequest{Thread: topic.ID, Axis: "bogus", Ref: "x"}); KindOf(err) != KindInvalid {
@@ -142,11 +152,8 @@ func TestMatrixAttachDetach(t *testing.T) {
 	if err != nil || sec.By != model.Owner {
 		t.Fatalf("owner attaching a secret's name %+v %v", sec, err)
 	}
-	for _, l := range openLinks(t, f, topic.ID) {
-		if strings.Contains(l.Ref+l.Label+l.Why, "AbCdEf0123") {
-			t.Fatalf("a secret value reached the thread: %+v", l)
-		}
-	}
+	// (No check that a token-shaped value is absent from the links: nothing written into a
+	// thread is filtered since 17 Nov; the three links above were filed as written.)
 
 	// Detach: it leaves the open list and stays in the history; an agent can't detach a secret.
 	if _, err := f.DetachLink(me, sec.ID); KindOf(err) != KindForbidden {

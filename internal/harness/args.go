@@ -53,14 +53,17 @@ func TerminalCommand(spec runner.Spec) (Command, error) {
 		// A private server per agent: OPENCODE_CONFIG_CONTENT (model, permission, MCP) is
 		// only read by a server that this process starts; a shared background server would
 		// ignore it. It also means stopping the agent stops its conversation.
-		c.Args = append(c.Args, "--standalone")
+		// No --standalone: opencode 1.19.3 TUI rejects it (exit 1, prints help); its in-process server reads the config env.
 		if spec.SessionID != "" {
-			// opencode accepts an id up front and creates it if it does not exist yet.
+			// -s resumes an existing OpenCode session.
 			c.Args = append(c.Args, "-s", spec.SessionID)
 		}
 		c.Args = append(c.Args, spec.ExtraArgs...)
 		c.Env = append(c.Env, "OPENCODE_DISABLE_AUTOUPDATE=1")
 		cfg := map[string]any{}
+		if spec.SystemPromptFile != "" {
+			cfg["instructions"] = []string{spec.SystemPromptFile}
+		}
 		switch {
 		case bypass(spec):
 			cfg["permission"] = "allow"
@@ -68,8 +71,33 @@ func TerminalCommand(spec runner.Spec) (Command, error) {
 			cfg["permission"] = map[string]any{"edit": "deny", "bash": "deny"}
 		}
 		if spec.Model != "" {
-			// The TUI has no --model flag (only `opencode run` has one); its config does.
+			c.Args = append(c.Args, "-m", spec.Model)
 			cfg["model"] = spec.Model
+		}
+		if spec.Provider == model.FaeProvider {
+			modelID, ok := model.FaeModelName(spec.Model)
+			if !ok || spec.OpenCodeDataDir == "" {
+				return Command{}, fmt.Errorf("invalid Fae OpenCode spec for model %q", spec.Model)
+			}
+			baseURL := spec.OpenCodeBaseURL
+			if baseURL == "" {
+				baseURL = model.FaeBaseURL
+			}
+			context, err := faeContext(baseURL, modelID, spec.FaeRuntimeContextCap)
+			if err != nil {
+				return Command{}, err
+			}
+			c.Env = append(c.Env, "XDG_DATA_HOME="+spec.OpenCodeDataDir)
+			cfg["enabled_providers"] = []string{model.FaeProvider}
+			cfg["small_model"] = spec.Model
+			cfg["provider"] = map[string]any{model.FaeProvider: map[string]any{
+				"name": "Fae", "npm": "@ai-sdk/openai-compatible",
+				"options": map[string]any{"baseURL": baseURL},
+				"models": map[string]any{modelID: map[string]any{
+					"name": modelID, "tool_call": true,
+					"limit": map[string]int{"context": context, "output": min(4096, context-1)},
+				}},
+			}}
 		}
 		if spec.MCP != nil {
 			env := envValues(spec.Env, spec.MCP.EnvKeys)
@@ -78,6 +106,19 @@ func TerminalCommand(spec runner.Spec) (Command, error) {
 				"environment": env, "enabled": true,
 			}}
 		}
+		if len(spec.ProfileMCP) > 0 {
+			servers, _ := cfg["mcp"].(map[string]any)
+			if servers == nil {
+				servers = map[string]any{}
+				cfg["mcp"] = servers
+			}
+			for name, server := range spec.ProfileMCP {
+				if name == "tmxg" {
+					continue
+				}
+				servers[name] = map[string]any{"type": "local", "command": append([]string{server.Command}, server.Args...), "environment": server.Env, "enabled": true}
+			}
+		}
 		if len(cfg) > 0 {
 			b, _ := json.Marshal(cfg)
 			c.Env = append(c.Env, "OPENCODE_CONFIG_CONTENT="+string(b))
@@ -85,6 +126,9 @@ func TerminalCommand(spec runner.Spec) (Command, error) {
 	case model.HarnessPi:
 		// --approve: project trust; pi has no tool-permission prompts at all.
 		c.Args = append(c.Args, "--approve")
+		if spec.SystemPromptFile != "" {
+			c.Args = append(c.Args, "--append-system-prompt", spec.SystemPromptFile)
+		}
 		if spec.SessionID != "" {
 			c.Args = append(c.Args, "--session-id", spec.SessionID)
 		}
@@ -214,6 +258,11 @@ var codexGOOS = runtime.GOOS
 func CodexPolicy(spec runner.Spec) (sandbox, approval string) {
 	plan := spec.PermissionMode == "plan"
 	switch {
+	case spec.AgentMachine && codexGOOS != "windows":
+		if plan {
+			return "read-only", "never"
+		}
+		return "workspace-write", "never"
 	case spec.CodexFullAccess && !plan:
 		return "", "never"
 	case codexGOOS == "windows" && !spec.CodexWindowsSandbox:
@@ -260,15 +309,6 @@ func NewPiSession() string {
 	var b [16]byte
 	_, _ = rand.Read(b[:])
 	return hex.EncodeToString(b[:])
-}
-
-// NewOpenCodeSession returns a fresh opencode conversation id. opencode takes the id at
-// launch ("session to continue, or to create if it does not exist") and requires the
-// "ses" prefix; it accepts any suffix, so tmx can know a new conversation's id up front.
-func NewOpenCodeSession() string {
-	var b [13]byte
-	_, _ = rand.Read(b[:])
-	return "ses_" + hex.EncodeToString(b[:])
 }
 
 // TrustableFolder reports whether tmx may answer a folder-trust dialog for dir on the

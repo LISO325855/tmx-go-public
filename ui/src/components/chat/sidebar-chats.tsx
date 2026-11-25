@@ -1,5 +1,6 @@
 // The sidebar's "Chats" section: Companion first (once it is set up), DMs and groups with other
 // people's tmx, unread badges, and the invite / join / new group actions.
+import { useClassic } from "@/hooks/use-classic";
 import { useMemo } from "react";
 import { Link2, MessagesSquare, Plus, QrCode, Users } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -42,6 +43,7 @@ export function UnreadBadge({ n, className }: { n: number; className?: string })
 }
 
 export function ChatActionsMenu({ children, align = "end" }: { children: React.ReactNode; align?: "start" | "end" }) {
+  const classic = useClassic();
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>{children}</DropdownMenuTrigger>
@@ -49,9 +51,9 @@ export function ChatActionsMenu({ children, align = "end" }: { children: React.R
         <DropdownMenuItem onSelect={() => chatUI.openInvite("dm")}>
           <QrCode /> Invite someone
         </DropdownMenuItem>
-        <DropdownMenuItem onSelect={() => chatUI.openInvite("group")}>
+        {!classic && <DropdownMenuItem onSelect={() => chatUI.openInvite("group")}>
           <Users /> New group…
-        </DropdownMenuItem>
+        </DropdownMenuItem>}
         <DropdownMenuItem onSelect={() => chatUI.openJoin()}>
           <Link2 /> Join with a link…
         </DropdownMenuItem>
@@ -61,9 +63,10 @@ export function ChatActionsMenu({ children, align = "end" }: { children: React.R
 }
 
 export function SidebarChats({ path, onNavigate, open, onToggle }: { path: string; onNavigate?: () => void; open: boolean; onToggle: () => void }) {
+  const classic = useClassic();
   const enabled = useChats((s) => s.enabled);
   const chats = useChats((s) => s.chats);
-  const list = useMemo(() => sortedChats(chats), [chats]);
+  const list = useMemo(() => sortedChats(chats).filter((c) => !classic || c.kind !== "group"), [chats, classic]);
   const activeId = path.startsWith("/chats/") ? decodeURIComponent(path.slice("/chats/".length).split(/[/?]/)[0]) : "";
   const shown = list.slice(0, SHOWN);
   const active = list.find((c) => c.id === activeId);
@@ -85,7 +88,7 @@ export function SidebarChats({ path, onNavigate, open, onToggle }: { path: strin
         </>
       }
       actions={
-        enabled !== false && (
+        enabled === true && (
           <Tooltip>
             <ChatActionsMenu>
               <TooltipTrigger asChild>
@@ -94,13 +97,13 @@ export function SidebarChats({ path, onNavigate, open, onToggle }: { path: strin
                 </Button>
               </TooltipTrigger>
             </ChatActionsMenu>
-            <TooltipContent>Invite someone, start a group, join</TooltipContent>
+            <TooltipContent>{classic ? "Invite someone, join" : "Invite someone, start a group, join"}</TooltipContent>
           </Tooltip>
         )
       }
     >
       <CompanionSidebarItem path={path} onNavigate={onNavigate} />
-      {enabled === false ? (
+      {enabled === null ? null : enabled === false ? (
         <a
           href={href(paths.chats())}
           onClick={onNavigate}

@@ -23,7 +23,8 @@ func init() {
 		"touch": hWriteArgs, "mkdir": hWriteArgs, "md": hWriteArgs, "new-item": hWriteArgs, "tee": hWriteArgs,
 		"tee-object": hWriteArgs, "set-content": hWriteArgs, "add-content": hWriteArgs, "out-file": hWriteArgs,
 		"clear-content": hWriteArgs, "truncate": hWriteArgs,
-		"dd": hDD, "tar": hArchive, "zip": hArchive, "7z": hArchive, "compress-archive": hArchive,
+		"dd": hDD, "tar": hArchive, "zip": hArchive, "7z": hArchive, "compress-archive": hArchive, "unzip": hUnpack, "expand-archive": hUnpack,
+		"bsdtar": hArchive, "gtar": hArchive, "7za": hArchive, "7zr": hArchive,
 		// permissions
 		"chmod": hPerms, "chown": hPerms, "chgrp": hPerms, "chflags": hPerms, "chattr": hPerms, "setfacl": hPerms,
 		"icacls": hACL, "cacls": hACL, "xcacls": hACL, "takeown": hACL, "set-acl": hACL, "subinacl": hACL, "setacl": hACL,
@@ -179,11 +180,12 @@ func shortCluster(opts []string, letters string) bool {
 	return false
 }
 
-func (a *analyzer) read(t target, match string) {
-	if !t.unknown && a.stateSecret(t.p) {
-		a.add(RuleTmxState, "reads tmx's secrets ("+t.shown+")", match)
-	}
-}
+// read: reading is never a finding. Until 17 Nov a read of tmx's secrets, agents, WhatsApp and
+// account folders was blocked (tmx-secrets); the owner removed that rule: "my safety lies in learning
+// to operate in an environment where you're unrestricted". What stays is the block on writes,
+// deletes, moves and permission changes there (write, del, perms), which would break a running
+// node or lock the owner out.
+func (a *analyzer) read(target, string) {}
 
 func (a *analyzer) write(t target, match string) {
 	if t.unknown || t.p == "" || isNullDevice(t.p) || isNullDevice(t.shown) {
@@ -357,9 +359,7 @@ func hCopy(a *analyzer, c *call) {
 		if remote(x) {
 			continue
 		}
-		if t := a.target(x); !t.unknown && a.state != "" && within(a.state+"/secrets", t.p) {
-			a.add(RuleTmxState, "copies tmx's secrets ("+t.shown+")", c.raw)
-		}
+		a.read(a.target(x), c.raw) // a copy out is a read (free)
 	}
 	if dest == nil || remote(*dest) {
 		return
@@ -398,11 +398,278 @@ func hDD(a *analyzer, c *call) {
 	}
 }
 
+// hArchive: what an archive tool READS is free (its sources, the archive it unpacks); what it
+// WRITES is a write like any other: the archive it creates, and the folder it unpacks into
+// (-C, -d, -o, -DestinationPath; without one, the folder it runs in). Without this, unpacking
+// into tmx's state folder would have overwritten config.json, the rules or the secrets although
+// writes there are blocked (review of build6, 18 Nov).
 func hArchive(a *analyzer, c *call) {
-	for _, x := range c.args[1:] {
-		if t := a.target(x); !t.unknown && a.state != "" && within(a.state+"/secrets", t.p) && looksLikePath(x.s) {
-			a.add(RuleTmxState, "archives tmx's secrets ("+t.shown+")", c.raw)
+	a.stateBackstop(c) // first, whatever the options say
+	args := c.args[1:]
+	write := func(x arg) { a.write(a.target(x), c.raw) }
+	unpack := func(x arg) { a.unpackInto(a.target(x), c.raw) }
+	here := func() {
+		if len(c.args) > 0 {
+			x := c.args[0]
+			x.s, x.raw, x.unknown, x.unknownStart, x.glob = ".", ".", false, false, false
+			unpack(x)
 		}
+	}
+	val := func(x arg, prefix string) arg { // the value glued to an option: -oDIR, --directory=DIR
+		x.s, x.raw = strings.TrimPrefix(x.s, prefix), strings.TrimPrefix(x.raw, prefix)
+		return x
+	}
+	switch c.verb {
+	case "tar", "bsdtar", "gtar":
+		extract, create, dirs, files := tarOperands(args)
+		if extract {
+			for _, d := range dirs {
+				unpack(d)
+			}
+			if len(dirs) == 0 {
+				here()
+			}
+		}
+		if create {
+			for _, f := range files {
+				write(f) // the archive that is made
+			}
+		}
+	case "zip":
+		for _, x := range args {
+			if !strings.HasPrefix(x.s, "-") {
+				write(x) // the archive that is made (the first name)
+				break
+			}
+		}
+	case "7z", "7za", "7zr":
+		sub, named := "", false
+		for _, x := range args {
+			switch {
+			case strings.HasPrefix(x.s, "-o") && len(x.s) > 2:
+				unpack(val(x, "-o"))
+				named = true
+			case strings.HasPrefix(x.s, "-"):
+			case sub == "":
+				sub = strings.ToLower(x.s)
+			case sub == "a" || sub == "u":
+				if !named {
+					write(x) // the archive that is made
+					named = true
+				}
+			}
+		}
+		if (sub == "x" || sub == "e") && !named {
+			here()
+		}
+	case "compress-archive":
+		for i, x := range args {
+			if l := strings.ToLower(x.s); strings.HasPrefix(l, "-dest") && i+1 < len(args) {
+				write(args[i+1])
+			}
+		}
+	}
+}
+
+// stateBackstop is THE rule for archive tools and tmx's state folder (tmx-lead, 18 Nov, after
+// three review rounds in which reading a tool's options wrongly hid a write each time): an
+// archive tool (tar, bsdtar, gtar, 7z, 7za, 7zr, zip, unzip, Compress-Archive, Expand-Archive)
+// is refused when ANY word of its command line names a path in tmx's state folder, as a word
+// of its own or attached to an option (-C/path, -o/path, --anything=/path), or when it runs
+// in that folder. There is no reading of modes and no exception for making or listing an
+// archive: what such a tool does with a path cannot be told reliably from its options.
+// Reading tmx's state stays free with the ordinary tools (cat, cp, Get-Content, rg ...).
+func (a *analyzer) stateBackstop(c *call) {
+	if a.state == "" {
+		return
+	}
+	inState := func(t target) bool { return !t.unknown && t.p != "" && (t.p == a.state || within(t.p, a.state)) }
+	if len(c.args) > 0 {
+		here := c.args[0]
+		here.s, here.raw, here.unknown, here.unknownStart, here.glob = ".", ".", false, false, false
+		if t := a.target(here); inState(t) {
+			a.add(RuleTmxState, "writes into tmx's secrets or its own settings (an archive tool run in tmx's state folder, "+t.shown+")", c.raw)
+			return
+		}
+	}
+	for _, x := range c.args[1:] {
+		for _, cand := range pathCandidates(x) {
+			if t := a.target(cand); inState(t) {
+				a.add(RuleTmxState, "writes into tmx's secrets or its own settings (an archive tool with "+t.shown+" on its command line)", c.raw)
+				return
+			}
+		}
+	}
+}
+
+// pathCandidates are the readings of one word as a path: the word itself and, for an option,
+// what stands after its "=", and what begins at its first path character (-C/dir, -oC:\dir,
+// -f~/x).
+func pathCandidates(x arg) []arg {
+	out := []arg{x}
+	if !strings.HasPrefix(x.s, "-") {
+		return out
+	}
+	cut := func(n int) {
+		if n > 0 && n < len(x.s) {
+			y := x
+			y.raw = strings.TrimPrefix(x.raw, x.s[:n])
+			y.s = x.s[n:]
+			out = append(out, y)
+		}
+	}
+	if i := strings.IndexByte(x.s, '='); i >= 0 {
+		cut(i + 1)
+	}
+	if i := strings.IndexAny(x.s, `/\~$`); i > 0 {
+		cut(i)
+		if i >= 2 && x.s[i-1] == ':' { // a drive letter before it: -oC:\dir
+			cut(i - 2)
+		}
+	}
+	return out
+}
+
+// tarOperands reads a tar command line: whether it unpacks or makes an archive, the folders it
+// changes into (-C) and the archive files it names (-f). An option's value may follow as the
+// next word, be attached to the option (-C/dir, -f/file, --directory=/dir, --file=/file) or end
+// a cluster (-xvf/file, -xC/dir); in the old style (tar xvfC a.tar /dir) the values follow the
+// first word in the order of its letters.
+func tarOperands(args []arg) (extract, create bool, dirs, files []arg) {
+	// Short options that take a value besides C and f, in GNU tar (its Short Option Summary):
+	// their value must not be read as flags. -U (--unlink-first) and, in GNU tar, -s
+	// (--same-order) take none and are not here: listed by mistake, they swallowed a following
+	// "-xf" and the unpacking went unseen (review of build6, 18 Nov). As a second guard such an
+	// option never takes a next word that is itself an option (otherValue).
+	const withValue = "bTXKNLVHIgF"
+	rest := func(x arg, n int) arg { // x without its first n bytes
+		if n <= len(x.s) {
+			cut := x.s[:n]
+			x.raw = strings.TrimPrefix(x.raw, cut)
+			x.s = x.s[n:]
+		}
+		return x
+	}
+	i := 0
+	next := func() (arg, bool) {
+		if i+1 < len(args) {
+			i++
+			return args[i], true
+		}
+		return arg{}, false
+	}
+	// otherValue skips the value of an option that is neither -C nor -f: the next word, unless
+	// that word is itself an option (then this tar's option took no value, or the command is
+	// malformed: either way the word is read as options, never lost).
+	otherValue := func() {
+		if i+1 < len(args) && !strings.HasPrefix(args[i+1].s, "-") {
+			i++
+		}
+	}
+	for ; i < len(args); i++ {
+		x := args[i]
+		s := x.s
+		switch {
+		case s == "--extract" || s == "--get":
+			extract = true
+		case s == "--create" || s == "--append" || s == "--update":
+			create = true
+		case s == "--directory":
+			if v, ok := next(); ok {
+				dirs = append(dirs, v)
+			}
+		case strings.HasPrefix(s, "--directory="):
+			dirs = append(dirs, rest(x, len("--directory=")))
+		case s == "--file":
+			if v, ok := next(); ok {
+				files = append(files, v)
+			}
+		case strings.HasPrefix(s, "--file="):
+			files = append(files, rest(x, len("--file=")))
+		case strings.HasPrefix(s, "--"):
+		case strings.HasPrefix(s, "-") && len(s) > 1:
+			for j := 1; j < len(s); j++ {
+				ch := s[j]
+				switch {
+				case ch == 'x':
+					extract = true
+				case ch == 'c' || ch == 'r' || ch == 'u':
+					create = true
+				case ch == 'C' || ch == 'f':
+					v, ok := rest(x, j+1), true
+					if v.s == "" {
+						v, ok = next()
+					}
+					if ok && ch == 'C' {
+						dirs = append(dirs, v)
+					}
+					if ok && ch == 'f' {
+						files = append(files, v)
+					}
+					j = len(s) // the value ended the cluster
+				case strings.IndexByte(withValue, ch) >= 0:
+					if j+1 == len(s) {
+						otherValue()
+					}
+					j = len(s) // its value, attached or the next word, ended the cluster
+				}
+			}
+		case i == 0 && s != "":
+			// the old style: letters without a dash; their values are the next words, in order
+			for j := 0; j < len(s); j++ {
+				ch := s[j]
+				switch {
+				case ch == 'x':
+					extract = true
+				case ch == 'c' || ch == 'r' || ch == 'u':
+					create = true
+				case ch == 'C' || ch == 'f':
+					v, ok := next()
+					if ok && ch == 'C' {
+						dirs = append(dirs, v)
+					}
+					if ok && ch == 'f' {
+						files = append(files, v)
+					}
+				case strings.IndexByte(withValue, ch) >= 0:
+					otherValue()
+				}
+			}
+		}
+	}
+	return extract, create, dirs, files
+}
+
+// hUnpack: unzip and Expand-Archive only unpack: into -d / -DestinationPath, else into the
+// folder they run in.
+func hUnpack(a *analyzer, c *call) {
+	args := c.args[1:]
+	dest := false
+	a.stateBackstop(c) // first, whatever the options say
+	for i, x := range args {
+		l := strings.ToLower(x.s)
+		if (c.verb == "unzip" && x.s == "-d" || c.verb == "expand-archive" && (strings.HasPrefix(l, "-dest") || strings.HasPrefix(l, "-outputpath"))) && i+1 < len(args) {
+			a.unpackInto(a.target(args[i+1]), c.raw)
+			dest = true
+		}
+	}
+	if !dest && len(c.args) > 0 {
+		x := c.args[0]
+		x.s, x.raw, x.unknown, x.unknownStart, x.glob = ".", ".", false, false, false
+		a.unpackInto(a.target(x), c.raw)
+	}
+}
+
+// unpackInto: an archive is unpacked into the folder t. That is a write there, and, unlike one
+// file written, it fills the folders below it: unpacking into tmx's state folder, or into a
+// folder above it, writes its secrets, its settings and its rules.
+func (a *analyzer) unpackInto(t target, match string) {
+	a.write(t, match)
+	if t.unknown || t.p == "" || a.state == "" {
+		return
+	}
+	if t.p == a.state || within(a.state, t.p) {
+		a.add(RuleTmxState, "writes into tmx's secrets or its own settings (unpacking into "+t.shown+")", match)
 	}
 }
 

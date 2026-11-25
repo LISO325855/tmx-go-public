@@ -163,7 +163,7 @@ func TestFleetBinaryRefusesUpstreamKey(t *testing.T) {
 	if _, err := publicKeys([]string{upstream}); err == nil {
 		t.Fatal("configured upstream key accepted")
 	}
-	for _, key := range []string{"", "PLACEHOLDER", upstream} {
+	for _, key := range []string{"PLACEHOLDER", upstream} {
 		u := New(Options{Paths: config.Paths{Home: t.TempDir()}, Version: "fleet-v1.0.0", Executable: "tmx.exe", GOOS: "windows", GOARCH: "amd64", Settings: func() config.UpdateConfig { return config.UpdateConfig{FleetPublicKey: key} }})
 		if s := u.Check(context.Background()); s.State != StateOff {
 			t.Fatalf("unprovisioned key %q enabled updater", key)

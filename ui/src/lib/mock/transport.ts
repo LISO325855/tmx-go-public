@@ -11,6 +11,7 @@ import type {
   Agent,
   Approval,
   BusEvent,
+  ClaudeExtensions,
   Confirmation,
   GuardHold,
   GuardSettings,
@@ -27,14 +28,18 @@ import type {
 } from "../types";
 import { derivePolicy, sortProfiles } from "../profiles";
 import { FALLBACK_HARNESSES } from "../harness";
+import { isClassic, mockUIProfile } from "../ui-profile";
+import { validServerName } from "../claude-extensions";
 import { buildWorld, defaultProfiles, HOME, TimelineBuilder, WORKSPACE, type MockWorld } from "./data";
 import { formatSize, NOTE_HEADER, type Upload } from "../attachments";
 import type { UpdateStatus } from "../update";
 import { MockResources, NOT_MINE } from "./resources";
+import { MockFleetRules } from "./fleet-rules";
 import { MockChats } from "./chats";
 import { MockCompanion } from "./companion";
 import { MockBoard } from "./board";
 import { MockMatrix } from "./matrix";
+import { MockRegistry } from "./registry";
 import { MockScreen } from "./screen";
 import { MockVoice } from "./voice";
 import { MockRecordings } from "./recordings";
@@ -42,6 +47,8 @@ import { MockSummaries } from "./summaries";
 import type { Recording } from "../recording-types";
 import { MockWhatsApp } from "./whatsapp";
 import { MockAccounts } from "./accounts";
+import { MockDevices } from "./devices";
+import { mockToolbox } from "./toolbox";
 import type { MessagePin, MessageSelection } from "../message-pins";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -70,19 +77,29 @@ export class MockTransport implements Transport {
   private companion: MockCompanion;
   private board: MockBoard;
   private matrix: MockMatrix;
+  private registry: MockRegistry;
   private screen: MockScreen;
   private voice: MockVoice;
   private recs: MockRecordings;
   private sums: MockSummaries;
   private wa: MockWhatsApp;
   private accounts: MockAccounts;
+  private devices: MockDevices;
   private messagePins: MessagePin[] = [];
+  /** project id -> repository address, as the owner set it in this mock */
+  private repos = new Map<string, string>();
+  /** ?mock=1&ui=classic: the daemon's classic UI profile (lib/ui-profile.ts) */
+  private uiProfile = mockUIProfile(typeof location === "undefined" ? "" : location.search);
 
   constructor(opts: { scenario: string }) {
     this.scenario = opts.scenario;
     this.w = buildWorld(opts.scenario);
+    // Under classic the daemon starts Claude agents in their own screen (as Python did), so the
+    // mock's Claude agents are there too; Codex stays in chat.
+    if (isClassic(this.uiProfile)) for (const a of this.w.agents.values()) if (a.harness === "claude" && a.mode === "chat") a.mode = "terminal";
     this.board = new MockBoard(this.w, (t, d) => this.emit(t, d));
     this.matrix = new MockMatrix(this.w, (t, d) => this.emit(t, d));
+    this.registry = new MockRegistry(this.w);
     this.voice = new MockVoice((t, d) => this.emit(t, d));
     this.recs = new MockRecordings((t, d) => this.emit(t, d));
     this.sums = new MockSummaries((t, d) => this.emit(t, d));
@@ -91,6 +108,7 @@ export class MockTransport implements Transport {
     this.res = new MockResources(this.w, (t, d, x) => this.emit(t, d, x), (id, p) => this.patchAgent(id, p), opts.scenario);
     this.screen = new MockScreen(this.w, (id, p) => this.patchAgent(id, p), (id, e) => void this.append(id, e));
     this.accounts = new MockAccounts(opts.scenario, (t, d) => this.emit(t, d));
+    this.devices = new MockDevices(opts.scenario, (t, d) => this.emit(t, d));
     if (opts.scenario !== "still") setInterval(() => this.res.step(), 2500);
     this.chats = new MockChats({
       scenario: opts.scenario,
@@ -98,7 +116,7 @@ export class MockTransport implements Transport {
       headId: () => this.w.headId,
       agentName: (id) => this.w.agents.get(id)?.name,
     });
-    if (!["still", "empty", "gate", "gate-wait", "gate-open", "companion-chat", "companion-chat-off", "companion-connect", "companion-missing"].includes(opts.scenario) && !opts.scenario.startsWith("usage")) setTimeout(() => void this.liveScript(), 2500);
+    if (!["still", "empty", "gate", "gate-wait", "gate-open", "companion-chat", "companion-chat-off", "companion-connect", "companion-missing", "onboarding"].includes(opts.scenario) && !opts.scenario.startsWith("usage")) setTimeout(() => void this.liveScript(), 2500);
     if (opts.scenario === "gate-open") this.proofAt = Date.now() - 13 * 60_000;
     this.graceSync();
   }
@@ -117,6 +135,7 @@ export class MockTransport implements Transport {
       policy: this.w.policy,
       profiles: sortProfiles([...this.w.profiles.values()]),
       workspace: this.w.workspace,
+      ui_profile: this.uiProfile || undefined,
     };
   }
 
@@ -377,9 +396,7 @@ export class MockTransport implements Transport {
     }
     if (parts[0] === "safety" && parts[1] === "guard" && method === "PUT") {
       const next = body as GuardSettings;
-      const on = (g: GuardSettings, k: string) => g.enabled && !g.off_for.includes(k);
-      const weaker = (s.guard.enabled && !next.enabled) || (next.enabled && next.off_for.some((k) => on(s.guard, k)));
-      if (weaker) return { reason: "switch the dangerous-command guard off" };
+      if (next.allow_browser_automation && !s.guard.allow_browser_automation) return { reason: "relax agent safety settings" };
     }
     if (parts[0] === "update" && parts[1] !== "check" && method !== "GET") {
       const b = (body ?? {}) as { auto?: boolean; channel?: string; now?: boolean; token?: string };
@@ -462,6 +479,8 @@ export class MockTransport implements Transport {
     return c;
   }
 
+  private fleetRules = new MockFleetRules();
+
   private update: UpdateStatus = {
     current: "v0.1.1", state: "ready", auto: true, channel: "stable", repo: "blackcode-ch/tmx-go", latest: "v0.1.2",
     latest_url: "https://github.com/blackcode-ch/tmx-go/releases/tag/v0.1.2", available: true, waiting: ["api-worker", "ui-worker"],
@@ -515,10 +534,16 @@ export class MockTransport implements Transport {
     };
     const mine = this.res.route(method, parts, q, body);
     if (mine !== NOT_MINE) return mine;
+    const fleetRules = this.fleetRules.route(method, parts, q, body);
+    if (fleetRules !== NOT_MINE) return fleetRules;
     const screen = this.screen.route(method, parts, body);
     if (screen !== NOT_MINE) return screen;
     const acc = this.accounts.route(method, parts, body);
     if (acc !== NOT_MINE) return acc;
+    const dev = this.devices.route(method, parts, body); // config, paired devices, the owner PIN's state
+    if (dev !== NOT_MINE) return dev;
+    const box = mockToolbox(method, parts, q, this.scenario);
+    if (box !== NOT_MINE) return box;
     const sum =this.sums.route(method, parts, body, (rid) => {
       try {
         return this.recs.route("GET", ["recordings", rid], new URLSearchParams(), undefined) as Recording;
@@ -541,6 +566,7 @@ export class MockTransport implements Transport {
     if (res === "voice" || res === "transcribe" || res === "transcripts") return this.voice.route(method, parts, q, body);
     if (res === "board" || res === "threads") return this.board.route(method, parts, body);
     if (res === "matrix") return this.matrix.route(method, parts, q, body);
+    if (res === "registry") return this.registry.route(method, id, q, body);
     if (res === "uploads") {
       const u = this.uploads.get(id) ?? notFound();
       return q.get("data") === "1" ? u : { ...u, data: undefined };
@@ -550,6 +576,7 @@ export class MockTransport implements Transport {
       return this.w.policy;
     }
     if (res === "profiles") return this.profileRoute(method, id, action, body);
+    if (res === "claude") return this.claudeRoute(method, id, body);
     if (res === "messages") return this.w.messages;
     if ((res === "system" && (id === "tools" || id === "warnings")) || (res === "processes" && !id)) return [];
     if (res === "harnesses")
@@ -611,6 +638,34 @@ export class MockTransport implements Transport {
     if (res === "projects") {
       if (!id && method === "POST") return this.createProject(body as CreateProjectBody);
       const p = this.w.projects.get(id) ?? notFound();
+      // the owner sets the project's repository (POST …/section {repo})
+      if (method === "POST" && parts[2] === "section") {
+        const repo = String((body as { repo?: string })?.repo ?? "").trim();
+        if (repo && !/^(https:\/\/[^\s@]+\/[^\s]+\/[^\s]+|git@[^\s:]+:[^\s]+\/[^\s]+)$/.test(repo)) throw new ApiError(400, "the repository address must be https://host/owner/repo or git@host:owner/repo");
+        if (repo) this.repos.set(id, repo);
+        else this.repos.delete(id);
+        return { project_id: id, slug: (p as Project).slug, name: (p as Project).name, status: "", needs: [], links: [], final_output: [], updated_at: Date.now(), updated_by: "owner", repo: repo || undefined };
+      }
+      // the project's shared page (docs/project-sections.md): the first project has one, the others none yet
+      if (method === "GET" && (parts[2] === "section" || parts[2] === "artifacts")) {
+        const first = [...this.w.projects.keys()][0] === id;
+        const members = [...this.w.agents.values()].filter((a) => a.project_id === id);
+        if (parts[2] === "section") {
+          return {
+            project_id: id, slug: (p as Project).slug, name: (p as Project).name, updated_at: first ? Date.now() - 9 * 60_000 : 0, updated_by: first ? (members[0]?.name ?? "") : "",
+            status: first ? "Webhooks verified against Stripe test mode.\nPlan picker in review; payment methods next." : "",
+            needs: first ? [{ text: "Stripe webhooks handled", done: true }, { text: "Plan picker", done: true }, { text: "Payment methods", done: false }, { text: "End-to-end test in Chromium", done: false }] : [],
+            links: first ? [{ title: "Preview", url: "https://staging.billing-portal.dev" }, { title: "Design notes", url: "docs/billing.md" }] : [],
+            final_output: first ? [{ path: "docs/billing.md", what: "How billing works" }] : [],
+            repo: this.repos.get(id) ?? (first ? "https://github.com/example/billing-portal" : undefined),
+          };
+        }
+        return {
+          project_id: id,
+          final_output: first ? [{ path: "docs/billing.md", what: "How billing works", kind: "path" }] : [],
+          contributions: first ? members.slice(0, 2).map((a, i) => ({ project_id: id, agent_id: a.id, agent_name: a.name, status: i ? "Plan picker: in review" : "Coordinating; webhooks done", final_output: [], updated_at: Date.now() - (i + 1) * 12 * 60_000 })) : [],
+        };
+      }
       if (method === "PATCH") {
         Object.assign(p as Project, body as PatchProjectBody, { updated_at: Date.now() });
         this.emit("project.updated", p, { project_id: id });
@@ -647,6 +702,13 @@ export class MockTransport implements Transport {
         void this.reply(id, [b.text.trim(), note].filter(Boolean).join("\n\n"));
         return undefined;
       }
+      if (action === "rename" && method === "POST") {
+        const name = (body as { name: string }).name.trim();
+        if (a.level === "head" || a.desired === "running") throw new ApiError(409, "Stop the agent before renaming it; the head keeps its name.");
+        if (!name || [...this.w.agents.values()].some((other) => other.id !== id && other.name === name)) throw new ApiError(409, "Name is empty or already in use.");
+        this.patchAgent(id, { name });
+        return this.w.agents.get(id);
+      }
       if (action === "stop") {
         this.patchAgent(id, { state: "stopped", desired: "stopped", pid: 0 });
         return undefined;
@@ -671,12 +733,48 @@ export class MockTransport implements Transport {
     return notFound();
   }
 
+  // Claude Code's extensions: a desktop-control user server, a docs server and the playwright plugin.
+  private claudeExt: ClaudeExtensions = {
+    available: true,
+    servers: [
+      { id: "arc-desktop", name: "arc-desktop", source: "user", enabled: true, transport: "stdio", detail: "arc-desktop-mcp" },
+      { id: "docs", name: "docs", source: "user", enabled: true, transport: "http", detail: "docs.example.com" },
+      { id: "plugin:playwright:playwright", name: "playwright", source: "plugin", plugin: "playwright@claude-plugins-official", enabled: true, transport: "stdio", detail: "npx @playwright/mcp@latest" },
+    ],
+    plugins: [
+      { id: "playwright@claude-plugins-official", name: "playwright", version: "1", scope: "user", enabled: true, servers: ["plugin:playwright:playwright"] },
+    ],
+  };
+
+  private claudeRoute(method: string, what: string | undefined, body: unknown): unknown {
+    if (method === "GET" && what === "extensions") return this.claudeExt;
+    if (method === "POST" && what === "plugins") {
+      const id = String((body as { plugin?: string }).plugin ?? "").trim();
+      if (!id || id.startsWith("-")) throw new ApiError(400, `"${id}" is not a plugin name (name or name@marketplace)`);
+      const name = id.split("@")[0];
+      if (!this.claudeExt.plugins?.some((p) => p.id === id)) {
+        this.claudeExt.plugins = [...(this.claudeExt.plugins ?? []), { id, name, version: "1", scope: "user", enabled: true, servers: [] }];
+      }
+      return this.claudeExt;
+    }
+    if (method === "POST" && what === "mcp") {
+      const name = String((body as { name?: string }).name ?? "").trim();
+      if (!validServerName(name)) throw new ApiError(400, `"${name}" is not a server name tmx can add (letters, digits, - and _; not tmx or tmxg)`);
+      this.claudeExt.servers = [
+        { id: name, name, source: "user", enabled: true, transport: "stdio", detail: "added" },
+        ...(this.claudeExt.servers ?? []).filter((x) => x.id !== name),
+      ];
+      return this.claudeExt;
+    }
+    throw new ApiError(404, "Not found.");
+  }
+
   private profileRoute(method: string, slug: string | undefined, action: string | undefined, body: unknown): unknown {
     const ps = this.w.profiles;
     const put = (p: Profile) => {
       const def = defaultProfiles().find((d) => d.slug === p.slug);
       const editable = (x: Profile) =>
-        JSON.stringify([x.name, x.description, x.level, x.instructions, x.model, x.allowed_models, x.permission_mode, x.allowed_tools, x.disallowed_tools, x.read_only, x.can_create_projects, x.can_launch]);
+        JSON.stringify([x.name, x.description, x.level, x.instructions, x.model, x.allowed_models, x.permission_mode, x.allowed_tools, x.disallowed_tools, x.read_only, x.can_create_projects, x.can_launch, x.mcp_servers ?? []]);
       p.built_in = ["head", "lead", "worker"].includes(p.slug);
       p.modified = p.built_in && !!def && editable(def) !== editable(p);
       ps.set(p.slug, p);

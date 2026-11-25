@@ -5,6 +5,7 @@ package screen
 
 import (
 	"fmt"
+	"image/color"
 	"io"
 	"regexp"
 	"strings"
@@ -20,7 +21,8 @@ type Screen struct {
 	mu        sync.Mutex
 	em        *vt.Emulator
 	w, h      int
-	bracketed bool // the program enabled bracketed paste
+	bracketed bool         // the program enabled bracketed paste
+	strs      stringFilter // oscfilter.go
 }
 
 // New returns a cols x rows screen. reply receives what the emulator answers to the
@@ -58,7 +60,7 @@ func (s *Screen) setMode(m ansi.Mode, on bool) {
 func (s *Screen) Write(b []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, _ = s.em.Write(b)
+	_, _ = s.em.Write(s.strs.filter(b))
 }
 
 // Resize changes the screen size.
@@ -109,6 +111,66 @@ func (s *Screen) linesLocked() []string {
 		out[y] = strings.TrimRight(b.String(), " \t ")
 	}
 	return out
+}
+
+// The emulator's cell attributes used here (ultraviolet cell.go: AttrFaint, AttrReverse).
+const (
+	attrFaint   = 1 << 1
+	attrReverse = 1 << 5
+)
+
+// LinesTyped returns the screen's rows twice: as Lines, and with every cell blanked that the
+// program drew as a hint rather than as text: faint, or in a grey foreground, or reversed (the
+// cursor block a TUI draws itself). A TUI shows the placeholder of its input box that way
+// (Claude Code: "❯  Claude Code" after a turn, 17 Nov on hosta-go), and what a person typed
+// in the terminal's own text colour; the plain rows cannot tell the two apart.
+func (s *Screen) LinesTyped() (all, typed []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	all = s.linesLocked()
+	typed = make([]string, s.h)
+	var b strings.Builder
+	for y := 0; y < s.h; y++ {
+		// A reversed letter is the cursor block on a placeholder's first letter only when the
+		// row holds hint text beside it; alone it is the cursor on a person's one-letter draft.
+		hints := false
+		for x := 0; x < s.w && !hints; x++ {
+			c := s.em.CellAt(x, y)
+			hints = c != nil && strings.TrimSpace(c.Content) != "" && hintStyle(c.Style.Attrs&^attrReverse, c.Style.Fg)
+		}
+		b.Reset()
+		for x := 0; x < s.w; x++ {
+			c := s.em.CellAt(x, y)
+			switch {
+			case c == nil:
+				b.WriteByte(' ')
+			case c.Width == 0 && c.Content == "":
+			case c.Content == "" || hintStyle(c.Style.Attrs&^attrReverse, c.Style.Fg):
+				b.WriteByte(' ')
+			case c.Style.Attrs&attrReverse != 0 && (hints || strings.TrimSpace(c.Content) == ""):
+				b.WriteByte(' ')
+			default:
+				b.WriteString(c.Content)
+			}
+		}
+		typed[y] = strings.TrimRight(b.String(), " \t\u00a0")
+	}
+	return all, typed
+}
+
+// hintStyle: faint, reversed, or a mid grey foreground (not the default colour, not black, not
+// white: those are text colours of a light or dark theme).
+func hintStyle(attrs uint8, fg color.Color) bool {
+	if attrs&(attrFaint|attrReverse) != 0 {
+		return true
+	}
+	if fg == nil {
+		return false
+	}
+	r, g, b, _ := fg.RGBA()
+	r, g, b = r>>8, g>>8, b>>8
+	lo, hi := min(r, g, b), max(r, g, b)
+	return hi-lo <= 12 && lo >= 0x40 && hi <= 0xb0
 }
 
 // Classify reads this screen, like Classify, and fills in a menu drawn as one row of

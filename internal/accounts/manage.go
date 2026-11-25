@@ -39,13 +39,7 @@ func (s *Service) AddAccount(h, name string) error {
 		s.mu.Unlock()
 		return errors.New("tmx is stopping")
 	}
-	// After h's other accounts, so the list keeps the harnesses' order.
-	at := len(s.entries)
-	for i, x := range s.entries {
-		if x.def.h == d.h {
-			at = i + 1
-		}
-	}
+	at := s.insertAtLocked(d, name)
 	s.entries = slices.Insert(slices.Clone(s.entries), at, e)
 	s.changedLocked()
 	s.mu.Unlock()
@@ -60,8 +54,8 @@ func (s *Service) RemoveAccount(h, name string) error {
 	if s.o.Profiles == nil {
 		return ErrNoProfiles
 	}
-	if name == "" || name == DefaultName {
-		return ErrIsDefault
+	if name == "" {
+		name = DefaultName // its card is hidden, the harness's sign-in stays (Profiles.Remove)
 	}
 	e := s.entry(h, name)
 	if e == nil {

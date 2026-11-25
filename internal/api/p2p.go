@@ -21,6 +21,7 @@ import (
 func (s *Server) p2pRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/p2p/agent/invite", s.agentOnly(s.agentP2PInvite))
 	mux.HandleFunc("POST /api/p2p/agent/join", s.agentOnly(s.agentP2PJoin))
+	mux.HandleFunc("POST /api/p2p/agent/invite-whatsapp", s.agentOnly(s.agentP2PInviteWA))
 	mux.HandleFunc("GET /api/p2p", s.ownerOnly(s.p2pStatus))
 	mux.HandleFunc("PUT /api/p2p/config", s.ownerOnly(s.putP2PConfig))
 	mux.HandleFunc("POST /api/p2p/restart", s.ownerOnly(s.p2pRestartNow))
@@ -161,7 +162,22 @@ func (s *Server) p2pRestartNow(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotImplemented, "this daemon cannot restart itself")
 		return
 	}
-	if !s.RequireOwner(w, r, "restart the daemon now to apply the peer-to-peer setting", nil) {
+	var req struct {
+		Force bool `json:"force"`
+	}
+	if r.ContentLength != 0 && !decode(w, r, &req) {
+		return
+	}
+	var detail any
+	reason := "restart the daemon now to apply the peer-to-peer setting"
+	if req.Force {
+		detail = req
+		reason += ", interrupting any audio capture"
+	}
+	if !s.RequireOwner(w, r, reason, detail) {
+		return
+	}
+	if !s.reserveAudioRestart(w, req.Force) {
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]any{"restarting": true, "back_in": "about 15 seconds"})

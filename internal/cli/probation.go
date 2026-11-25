@@ -41,7 +41,11 @@ func watchProbation(ctx context.Context, log *slog.Logger, dir, healthURL string
 				log.Error("update probation: cannot confirm", "err", err)
 				return
 			}
-			log.Info("update confirmed healthy", "version", p.To)
+			if p.DesktopSHA256 != "" {
+				log.Info("update: switched to the desktop app", "version", p.To)
+			} else {
+				log.Info("update confirmed healthy", "version", p.To)
+			}
 			return
 		}
 		if now().After(p.Deadline) {

@@ -60,7 +60,8 @@ func DefaultLimits() Limits {
 		MaxRatio: 200, RatioFloor: 1 << 20, NestedCap: 64 << 20, TextScan: 8 << 20,
 		BinaryScan: 64 << 20, TimeoutS: 120, QuarantineMax: 5 << 30, KeepDays: 7,
 		ReleasedKeepH: 24, UploadIdleS: 3600, RescanAfterS: 3600,
-		MaxFileOwn: 4 << 30, MaxFilePerson: 25 << 20,
+		// One item: 4 GB and 25 MB until 17 Nov. QuarantineMax and the free-space reserve still bound the whole.
+		MaxFileOwn: 1 << 40, MaxFilePerson: 1 << 30,
 	}
 }
 

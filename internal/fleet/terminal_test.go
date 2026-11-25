@@ -1,6 +1,7 @@
 package fleet
 
 import (
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -175,16 +176,100 @@ func TestAgentKeysRefusedWhileAMenuWaits(t *testing.T) {
 	}
 }
 
+// An agent launches a shell (the owner, 17 Nov; refused with "only the owner can launch a shell"
+// before). Its start command passes the command guard, the launch is written down, and typing
+// into it stays the owner's alone.
+func TestAgentLaunchesAShell(t *testing.T) {
+	_, f, lc, _, _ := typeTextLead(t)
+	lead := mustAgent(t, f, "alpha-lead")
+
+	sh, err := f.LaunchAgent(lc, LaunchRequest{Name: "pages", Harness: model.HarnessShell, Prompt: "python -m http.server 8484"})
+	if err != nil {
+		t.Fatalf("a lead's shell: %v", err)
+	}
+	if sh.Harness != model.HarnessShell || sh.ParentID != lead.ID || sh.ProjectID != lead.ProjectID || sh.Brief != "python -m http.server 8484" {
+		t.Fatalf("shell: %+v", sh)
+	}
+	entries, _ := f.Timeline(sh.ID, 0, 0)
+	found := false
+	for _, en := range entries {
+		if en.Meta["shell_launch"] == true {
+			found = true
+			if en.Meta["launched_by"] != "alpha-lead" || en.Meta["project"] != "alpha" || en.Meta["command"] != "python -m http.server 8484" ||
+				!strings.Contains(en.Text, "Shell launched by alpha-lead, project alpha") {
+				t.Fatalf("launch record: %+v", en)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("no launch record in %+v", entries)
+	}
+	// The head too.
+	if _, err := f.LaunchAgent(AgentCaller(mustAgent(t, f, "head").ID), LaunchRequest{Name: "head-sh", Harness: model.HarnessShell, Prompt: "echo up"}); err != nil {
+		t.Fatalf("the head's shell: %v", err)
+	}
+	// A start command the guard blocks or would hold for the owner is refused: nothing is launched.
+	// (Administrator rights are held by default, so an elevating start command is refused.)
+	blocked, held := "rm -rf /", "sudo true"
+	if runtime.GOOS == "windows" {
+		blocked, held = `Remove-Item -Recurse -Force C:\Windows`, "Start-Process pwsh -Verb RunAs"
+	}
+	for name, command := range map[string]string{"blocked": blocked, "held": held} {
+		if _, err := f.LaunchAgent(lc, LaunchRequest{Name: "sh-" + name, Harness: model.HarnessShell, Prompt: command}); KindOf(err) != KindForbidden {
+			t.Errorf("a %s start command (%s): %v", name, command, err)
+		}
+		if _, err := f.LaunchAgent(lc, LaunchRequest{Name: "sh2-" + name, Harness: model.HarnessShell, Brief: command, Prompt: "echo ok"}); KindOf(err) != KindForbidden {
+			t.Errorf("a %s stored command (%s): %v", name, command, err)
+		}
+		if _, err := f.Agent("sh-" + name); err == nil {
+			t.Errorf("a shell with a %s command exists", name)
+		}
+	}
+	// A paired machine and Companion have no place in the tree: never.
+	for _, c := range []Caller{PeerCaller("hostb"), CompanionCaller} {
+		if _, err := f.LaunchAgent(c, LaunchRequest{Name: "sh-far", Harness: model.HarnessShell, Prompt: "echo x"}); err == nil {
+			t.Errorf("%+v launched a shell", c)
+		}
+	}
+	// An agent restarting a shell passes the same checks on its stored command: the owner's
+	// shell below the lead, given a command the guard holds, is not the lead's to start.
+	risky, err := f.LaunchAgent(OwnerCaller, LaunchRequest{Name: "risky", Harness: model.HarnessShell, ParentID: lead.ID, Brief: held})
+	if err != nil {
+		t.Fatalf("the owner's shell with any command: %v", err)
+	}
+	if _, err := f.RestartAgent(lc, risky.ID); KindOf(err) != KindForbidden {
+		t.Errorf("a lead restarted a shell whose command needs the owner: %v", err)
+	}
+	if _, err := f.RestartAgent(OwnerCaller, risky.ID); err != nil {
+		t.Errorf("the owner restarting the same shell: %v", err)
+	}
+	if _, err := f.RestartAgent(lc, sh.ID); err != nil {
+		t.Errorf("a lead restarting its own shell: %v", err)
+	}
+	// The owner's shell is recorded too.
+	own, err := f.LaunchAgent(OwnerCaller, LaunchRequest{Name: "own-sh", Harness: model.HarnessShell})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, _ = f.Timeline(own.ID, 0, 0)
+	if len(entries) == 0 || !strings.Contains(entries[0].Text, "Shell launched by the owner") {
+		t.Fatalf("owner's launch record: %+v", entries)
+	}
+}
+
 func TestShellIsTheOwnersAlone(t *testing.T) {
 	e, f, lc, _, _ := typeTextLead(t)
 	lead := mustAgent(t, f, "alpha-lead")
 
-	// An agent cannot launch a shell.
-	if _, err := f.LaunchAgent(lc, LaunchRequest{Name: "sh-agent", Harness: model.HarnessShell}); KindOf(err) != KindForbidden {
-		t.Fatalf("lead launched a shell: %v", err)
+	// An agent's own shell: it launched it, and still cannot type or press keys into it.
+	mine, err := f.LaunchAgent(lc, LaunchRequest{Name: "sh-agent", Harness: model.HarnessShell, Prompt: "echo up"})
+	if err != nil {
+		t.Fatalf("lead's shell: %v", err)
 	}
-	if _, err := f.LaunchAgent(lc, LaunchRequest{Name: "sh-agent2", Harness: model.HarnessShell, Mode: model.ModeTerminal}); KindOf(err) != KindForbidden {
-		t.Fatalf("lead launched a terminal shell: %v", err)
+	e.term.Last(mine.ID).State(model.StateIdle)
+	eventually(t, "lead's shell idle", func() bool { return mustAgent(t, f, "sh-agent").State == model.StateIdle })
+	if err := f.TypeText(lc, "sh-agent", "echo more", true); KindOf(err) != KindForbidden {
+		t.Fatalf("lead typed into its own shell: %v", err)
 	}
 
 	// The owner may, even below the lead; the lead still cannot type or press keys into it.

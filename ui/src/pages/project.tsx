@@ -1,3 +1,4 @@
+import { useClassic } from "@/hooks/use-classic";
 import { useState } from "react";
 import { Archive, ArchiveRestore, Ellipsis, FolderClosed, FolderX, Pause, Play, Plus, Trash2 } from "lucide-react";
 import { toast } from "sonner";
@@ -8,6 +9,8 @@ import { Input } from "@/components/ui/input";
 import { AgentAvatar } from "@/components/agent-avatar";
 import { HarnessBadge, ModelBadge, ProjectStatusBadge } from "@/components/badges";
 import { CopyButton } from "@/components/copy-button";
+import { ProjectShells } from "@/components/classic/project-shells";
+import { ProjectSharedPage } from "@/components/classic/project-status";
 import { NewAgentDialog } from "@/components/new-agent-dialog";
 import { EmptyState, PageBody, PageHeader, PageTitle, Section } from "@/components/page";
 import { nowLine } from "@/components/sidebar";
@@ -123,6 +126,7 @@ async function setStatus(p: Project, status: ProjectStatus) {
 }
 
 export function ProjectPage({ id }: { id: string }) {
+  const classic = useClassic();
   const project = useStore((s) => s.projects[id]);
   const agents = useVisibleAgents();
   const [del, setDel] = useState(false);
@@ -169,7 +173,7 @@ export function ProjectPage({ id }: { id: string }) {
                 Resume
               </Button>
             )}
-            <DropdownMenu>
+            {!classic && <DropdownMenu>
               <DropdownMenuTrigger asChild>
                 <Button variant="ghost" size="icon-sm" aria-label="Project actions" className="text-muted-foreground">
                   <Ellipsis className="size-4" />
@@ -190,7 +194,7 @@ export function ProjectPage({ id }: { id: string }) {
                   <Trash2 /> Delete project…
                 </DropdownMenuItem>
               </DropdownMenuContent>
-            </DropdownMenu>
+            </DropdownMenu>}
           </>
         }
       >
@@ -203,7 +207,7 @@ export function ProjectPage({ id }: { id: string }) {
           <p className={cn("max-w-[70ch] text-[0.875rem] leading-relaxed whitespace-pre-wrap", !project.brief && "text-muted-foreground")}>
             {project.brief || "No brief yet."}
           </p>
-          <dl className="grid grid-cols-2 gap-px overflow-hidden rounded-xl border bg-border sm:grid-cols-4">
+          {!classic && <dl className="grid grid-cols-2 gap-px overflow-hidden rounded-xl border bg-border sm:grid-cols-4">
             {[
               ["Agents", `${all.length}`, `${active} active`],
               ["Turns", `${turns}`, "all agents"],
@@ -216,8 +220,9 @@ export function ProjectPage({ id }: { id: string }) {
                 <dd className="tabular truncate text-2xs text-muted-foreground">{sub}</dd>
               </div>
             ))}
-          </dl>
-          <div className="flex min-w-0 items-center gap-2 rounded-lg border bg-muted/30 py-1 pr-1 pl-3">
+          </dl>}
+          {/* classic: the folder is in "Files and locations" below */}
+          <div className={cn("flex min-w-0 items-center gap-2 rounded-lg border bg-muted/30 py-1 pr-1 pl-3", classic && "hidden")}>
             <FolderClosed className="size-3.5 shrink-0 text-muted-foreground" />
             <Truncate className="flex-1 font-mono text-[0.7812rem] text-foreground/85" title={project.folder}>
               {project.folder}
@@ -226,7 +231,13 @@ export function ProjectPage({ id }: { id: string }) {
           </div>
         </div>
 
-        <Section title="Agents" right={<AgentListFilter />}>
+        {/* classic: the project's shared page, as in Python: where it stands, progress, outputs, each member */}
+        {classic && <ProjectSharedPage project={project} />}
+        {/* classic: what its agents have running on this machine (components/classic/project-shells.tsx) */}
+        <ProjectShells projectId={project.id} />
+
+        {/* classic: the agents are the page's "Team" card (components/classic/project-status.tsx) */}
+        {!classic && <Section title="Agents" right={<AgentListFilter />}>
           {all.length === 0 ? (
             <p className="rounded-xl border bg-card px-4 py-6 text-center text-sm text-muted-foreground">No agents in this project.</p>
           ) : (
@@ -237,9 +248,9 @@ export function ProjectPage({ id }: { id: string }) {
               ))}
             </div>
           )}
-        </Section>
+        </Section>}
       </PageBody>
-      <DeleteProjectDialog project={project} open={del} onOpenChange={setDel} />
+      {!classic && <DeleteProjectDialog project={project} open={del} onOpenChange={setDel} />}
       <NewAgentDialog project={project} open={newAgent} onOpenChange={setNewAgent} />
     </div>
   );

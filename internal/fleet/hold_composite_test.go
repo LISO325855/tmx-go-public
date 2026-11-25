@@ -17,6 +17,11 @@ import (
 func TestCompositeCallIsNotRemembered(t *testing.T) {
 	e := newEnv(t)
 	f := e.started()
+	for _, rule := range []string{guard.RuleWriteOutside, guard.RulePermsOutside} {
+		if _, err := f.SetRuleState(OwnerCaller, rule, guard.Hold); err != nil {
+			t.Fatal(err)
+		}
+	}
 	head := mustAgent(t, f, "head")
 	me := callerFor(t, f, e.chat, head.ID)
 

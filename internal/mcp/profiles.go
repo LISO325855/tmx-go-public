@@ -52,6 +52,10 @@ func (t *Tools) profiles(ctx context.Context, _ *sdk.CallToolRequest, _ noArgs) 
 		}
 		n++
 		fmt.Fprintf(&b, "- %s: %s, a %s on %s", p.Slug, p.Name, p.Level, p.Model)
+		if p.Provider == model.FaeProvider {
+			fmt.Fprintf(&b, ", %s, account %s, provider %s. Pass model to choose from %s",
+				p.Harness, p.Account, p.Provider, strings.Join(p.AllowedModels, ", "))
+		}
 		if p.ReadOnly {
 			b.WriteString(", read-only")
 		}

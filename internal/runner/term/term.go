@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
 	"runtime"
 	"sync"
 	"time"
@@ -24,8 +25,8 @@ import (
 )
 
 const (
-	// EventBuffer is the capacity of Process.Events; the consumer must drain it, or reading
-	// the terminal (and so the program in it) stalls.
+	// EventBuffer is the capacity of Process.Events. On overflow, screen output is
+	// dropped (Replay retains it); control events wait outside the process lock.
 	EventBuffer = 1024
 	// ReplaySize is how much recent output Replay keeps.
 	ReplaySize = 1 << 20
@@ -34,6 +35,7 @@ const (
 	quietAfter               = 2 * time.Second // a shell without output this long = idle
 	exitGrace                = 2 * time.Second // after "exit" / SIGTERM, before escalating
 	killGrace                = 3 * time.Second
+	killedGrace              = 10 * time.Second // how long Stop still waits for a killed process to end
 )
 
 type termRunner struct{}
@@ -126,7 +128,7 @@ func (termRunner) Start(ctx context.Context, spec runner.Spec) (runner.Process, 
 		return nil, err
 	}
 	if guardLease != nil {
-		if err := codexguard.ProbeEffective(ctx, spec.Command, harness.CodexAppServerArgs(spec), envFor(spec, l), spec.Cwd, spec.CodexGuardExecutable); err != nil {
+		if err := codexguard.ProbeEffective(ctx, spec.Command, harness.CodexAppServerArgs(spec), envFor(spec, l), spec.Cwd, spec.CodexGuardExecutable, harness.CodexManagedServers(spec)); err != nil {
 			return nil, err
 		}
 	}
@@ -193,26 +195,142 @@ func (termRunner) Reattach(ctx context.Context, spec runner.Spec) (runner.Proces
 	if err != nil {
 		return nil, "", err
 	}
-	hc, err := host.Dial(spec.HostDir, 0) // the kept output: its recent screen
+	var size terminalSize
+	savedSize := host.LoadState(spec.HostDir, &size) && size.Cols > 0 && size.Rows > 0
+	from := uint64(0)
+	if !savedSize && l.info != nil {
+		from = host.End
+	}
+	hc, err := host.Dial(spec.HostDir, from)
 	if err != nil {
 		return nil, "", err
+	}
+	initialOffset := hc.Start()
+	if hc.Piped() {
+		// The host runs a chat process (pipes), not a terminal: see runner.ErrHostMode.
+		_ = hc.Close()
+		return nil, "", runner.ErrHostMode
 	}
 	sysinfo.RegisterHosted(hc.PID(), hc.HostPID(), hc.HostStart(), l.info == nil)
 	cols, rows := spec.Cols, spec.Rows
 	if cols <= 0 || rows <= 0 {
 		cols, rows = defaultCols, defaultRows
 	}
-	return newProcess(hc, l, spec, nil, cols, rows), hc.Token(), nil
+	if savedSize {
+		cols, rows = size.Cols, size.Rows
+	} else if l.info != nil {
+		// Legacy hosts retain a PTY at an unknown viewer size. Never feed their
+		// old-width replay to state detection. Jiggle first, then reconnect at
+		// End to discard the intermediate-width repaint as well.
+		go func(c *host.Conn) { _, _ = io.Copy(io.Discard, c) }(hc)
+		jiggle := cols - 1
+		if jiggle < 1 {
+			jiggle = cols + 1
+		}
+		if err := hc.Resize(jiggle, rows); err != nil {
+			_ = hc.Close()
+			return nil, "", err
+		}
+		select {
+		case <-ctx.Done():
+			_ = hc.Close()
+			return nil, "", ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
+		_ = hc.Close()
+		hc, err = host.Dial(spec.HostDir, host.End)
+		if err != nil {
+			return nil, "", err
+		}
+		if err := hc.Resize(cols, rows); err != nil {
+			_ = hc.Close()
+			return nil, "", err
+		}
+	}
+	p := newProcess(hc, l, spec, nil, cols, rows)
+	if !savedSize && p.w != nil {
+		if err := p.awaitRepaint(ctx, 20*time.Second); err != nil {
+			p.Detach()
+			go func() {
+				for range p.Events() {
+				}
+			}()
+			host.ClearState(spec.HostDir) // next attempt must also discard legacy output
+			if ctx.Err() != nil {
+				return nil, "", fmt.Errorf("%w: %v", host.ErrHostUnknown, ctx.Err())
+			}
+			repaintErr := fmt.Errorf("%w: %w: %v", host.ErrHostUnknown, runner.ErrHostRepaint, err)
+			if errors.Is(err, runner.ErrHostSilent) && hc.OutputOffset() == initialOffset {
+				repaintErr = errors.Join(repaintErr, runner.ErrHostSilent)
+			}
+			return nil, "", repaintErr
+		}
+	}
+	return p, hc.Token(), nil
+}
+
+// awaitRepaint bounds recovery without consuming events intended for Fleet.
+// A silent legacy host stays live but is reported as unverified, never started
+// a second time and never declared ready from the discarded screen.
+func (p *process) awaitRepaint(ctx context.Context, limit time.Duration) error {
+	deadline := time.NewTimer(limit)
+	defer deadline.Stop()
+	tick := time.NewTicker(25 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		p.mu.Lock()
+		// A recognized prompt with a draft deliberately remains Starting.
+		// Repaint evidence must not depend on readiness to submit mail.
+		observed := !p.w.lastOutput.IsZero()
+		p.mu.Unlock()
+		// ConPTY can emit cursor/old text on resize even if the TUI never
+		// redraws. Require a recognized harness screen, not generic activity.
+		text := p.w.scr.Text()
+		patterns := p.w.info.Patterns
+		recognized := p.w.classify().State.Menu()
+		for _, rx := range []*regexp.Regexp{patterns.AtPrompt, patterns.Working, patterns.Idle, patterns.UsageLimit} {
+			recognized = recognized || (rx != nil && rx.MatchString(text))
+		}
+		if observed && recognized {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-p.done:
+			return errors.New("host disconnected before repaint")
+		case <-deadline.C:
+			p.mu.Lock()
+			silent := p.w.lastOutput.IsZero()
+			p.mu.Unlock()
+			if silent {
+				return runner.ErrHostSilent
+			}
+			return errors.New("no usable screen after resize")
+		case <-tick.C:
+		}
+	}
+}
+
+// A hosted PTY retains the viewer's geometry across daemon restarts. Its
+// emulator must use that geometry before consuming replay (including autowrap).
+type terminalSize struct {
+	Cols int `json:"cols"`
+	Rows int `json:"rows"`
 }
 
 func newProcess(c conduit, l launch, spec runner.Spec, guardLease *codexguard.Lease, cols, rows int) *process {
 	p := &process{
+		agentID:    spec.AgentID,
 		guardLease: guardLease,
 		c:          c,
 		shell:      l.info == nil,
 		events:     make(chan runner.Event, EventBuffer),
 		ring:       newRing(ReplaySize),
 		done:       make(chan struct{}),
+	}
+	if hc, ok := c.(*host.Conn); ok {
+		_ = hc.SaveState(terminalSize{Cols: cols, Rows: rows})
 	}
 	p.setState(model.StateStarting)
 	if l.info == nil {
@@ -245,21 +363,26 @@ func (p *process) Detach() bool {
 }
 
 type process struct {
-	guardLease *codexguard.Lease
-	c          conduit
-	shell      bool
-	ring       *ring
-	w          *watcher // nil for a shell
+	deliveryStages sync.Map // message ID -> mailProgress, readable even during blocked shell writes
+	agentID        string
+	guardLease     *codexguard.Lease
+	c              conduit
+	shell          bool
+	ring           *ring
+	w              *watcher // nil for a shell
 
-	wmu sync.Mutex // serialises writes to the pty
+	resizeMu sync.Mutex // serialize PTY, emulator, and saved geometry changes
+	wmu      sync.Mutex // serialises writes to the pty
 
-	mu       sync.Mutex // guards state, closed and sending on events; never held across a pty write
-	state    model.AgentState
-	closed   bool
-	detached bool // Detach: the program runs on in its host
-	events   chan runner.Event
-	quiet    *time.Timer // shells only
-	turnAt   time.Time   // when the current turn began (working after idle)
+	mu            sync.Mutex // guards state, closed and sending on events; never held across a pty write
+	state         model.AgentState
+	closed        bool
+	detached      bool // Detach: the program runs on in its host
+	events        chan runner.Event
+	pendingEvents []runner.Event // control events waiting for the consumer
+	eventPump     bool           // one ordered sender; also owns channel close while active
+	quiet         *time.Timer    // shells only
+	turnAt        time.Time      // when the current turn began (working after idle)
 
 	done chan struct{}
 }
@@ -302,6 +425,11 @@ func (p *process) Write(b []byte, owner bool) error {
 func (p *process) write(b []byte) error {
 	p.wmu.Lock()
 	defer p.wmu.Unlock()
+	return p.writeLocked(b)
+}
+
+// writeLocked requires wmu.
+func (p *process) writeLocked(b []byte) error {
 	n, err := p.c.Write(b)
 	if err == nil && n != len(b) {
 		err = io.ErrShortWrite
@@ -309,8 +437,7 @@ func (p *process) write(b []byte) error {
 	return err
 }
 
-// Send types text and presses Enter. A harness gets it as a bracketed paste once its input
-// box is ready (earlier sends wait for that), Enter after the harness's submit delay.
+// Send types text and presses Enter through the ordinary terminal input queue.
 func (p *process) Send(text string) error {
 	if p.w != nil {
 		return p.w.send(text)
@@ -318,30 +445,59 @@ func (p *process) Send(text string) error {
 	return p.write([]byte(text + "\r"))
 }
 
+func (p *process) SendLaunchPrompt(text string) error {
+	if p.w != nil && p.w.info.Name == model.HarnessClaude {
+		return p.w.sendMail(mailInput{text: text, launchPrompt: true})
+	}
+	return p.Send(text)
+}
+
 func (p *process) SendMail(text string, ids []string) error {
 	if p.w != nil {
 		return p.w.sendMail(mailInput{text: text, ids: append([]string(nil), ids...)})
 	}
-	err := p.Send(text)
-	p.mu.Lock()
+	p.recordMailStage(p.agentID, ids, "input_lock_wait")
+	p.wmu.Lock()
+	p.recordMailStage(p.agentID, ids, "shell_write")
+	err := p.writeLocked([]byte(text + "\r"))
+	p.wmu.Unlock()
 	stage := "submitted"
 	if err != nil {
 		stage = "unconfirmed"
 	}
+	p.recordMailStage(p.agentID, ids, stage)
+	p.mu.Lock()
 	p.emitLocked(runner.Event{Kind: runner.EvMailDelivery, MessageIDs: ids, Delivery: stage})
 	p.mu.Unlock()
 	// A partial terminal write is uncertain; it must never trigger a blind replay.
 	return nil
 }
 
+// Interject types the owner's words into the screen although the harness is working (watch.go
+// sendMail with now): it queues what is typed for its next step. A shell has no turns: as Send.
+func (p *process) Interject(text string, ids []string) error {
+	if p.w != nil {
+		return p.w.sendMail(mailInput{text: text, ids: append([]string(nil), ids...), now: true})
+	}
+	return p.SendMail(text, ids)
+}
+
 func (p *process) Resize(cols, rows int) error {
 	if cols <= 0 || rows <= 0 {
 		return errors.New("terminal size must be positive")
 	}
+	p.resizeMu.Lock()
+	defer p.resizeMu.Unlock()
 	if p.w != nil {
 		p.w.scr.Resize(cols, rows)
 	}
-	return p.c.Resize(cols, rows)
+	if err := p.c.Resize(cols, rows); err != nil {
+		return err
+	}
+	if hc, ok := p.c.(*host.Conn); ok {
+		return hc.SaveState(terminalSize{Cols: cols, Rows: rows})
+	}
+	return nil
 }
 
 func (p *process) Answer(id string, d runner.Decision) error {
@@ -354,6 +510,8 @@ func (p *process) Answer(id string, d runner.Decision) error {
 // Interrupt: Esc for a harness ("esc to interrupt"), Ctrl-C for a shell.
 func (p *process) Interrupt() error {
 	if p.w != nil {
+		p.w.inputMu.Lock()
+		defer p.w.inputMu.Unlock()
 		return p.write([]byte{0x1b})
 	}
 	return p.write([]byte{0x03})
@@ -380,8 +538,14 @@ func (p *process) Stop(ctx context.Context) error {
 		return nil
 	}
 	p.c.Kill()
-	<-p.done
-	return nil
+	// Never wait without an end: a process that survives the kill (or whose host does not
+	// report its end) must not hang the stop, and with it the API call and the caller.
+	select {
+	case <-p.done:
+		return nil
+	case <-time.After(killedGrace):
+		return errors.New("the process did not end after it was killed")
+	}
 }
 
 // waitDone reports whether the process ended within d (or before ctx expired).
@@ -403,9 +567,53 @@ func (p *process) waitDone(ctx context.Context, d time.Duration) bool {
 	}
 }
 
+// emitLocked never waits for a consumer while holding mu. During reattach,
+// Fleet cannot consume until screen recovery completes. Output is already in
+// Replay; control events (receipts, approvals, state, exit) must remain ordered.
 func (p *process) emitLocked(ev runner.Event) {
-	if !p.closed {
-		p.events <- ev
+	if p.closed {
+		return
+	}
+	if !p.eventPump {
+		select {
+		case p.events <- ev:
+			return
+		default:
+		}
+	}
+	if ev.Kind == runner.EvOutput {
+		return
+	}
+	p.pendingEvents = append(p.pendingEvents, ev)
+	if !p.eventPump {
+		p.eventPump = true
+		go p.flushEvents()
+	}
+}
+
+func (p *process) flushEvents() {
+	for {
+		p.mu.Lock()
+		if len(p.pendingEvents) == 0 {
+			p.eventPump = false
+			if p.closed {
+				close(p.events)
+			}
+			p.mu.Unlock()
+			return
+		}
+		ev := p.pendingEvents[0]
+		p.pendingEvents[0] = runner.Event{}
+		p.pendingEvents = p.pendingEvents[1:]
+		p.mu.Unlock()
+		p.events <- ev // only this goroutine may close the channel while eventPump is true
+	}
+}
+
+func (p *process) closeEventsLocked() {
+	p.closed = true
+	if !p.eventPump {
+		close(p.events)
 	}
 }
 
@@ -454,16 +662,6 @@ func (p *process) read(done chan<- struct{}) {
 
 // wait reaps the process, lets the reader drain, closes the pty and emits EvExit.
 func (p *process) wait(readDone <-chan struct{}) {
-	if p.guardLease != nil {
-		defer func() {
-			p.mu.Lock()
-			detached := p.detached
-			p.mu.Unlock()
-			if !detached { // a hosted Codex still runs with the lease's configuration
-				p.guardLease.Close()
-			}
-		}()
-	}
 	code, err := p.c.Wait()
 	select {
 	case <-readDone:
@@ -477,11 +675,17 @@ func (p *process) wait(readDone <-chan struct{}) {
 	p.mu.Lock()
 	detached := p.detached || errors.Is(err, host.ErrDetached)
 	p.mu.Unlock()
+	if p.guardLease != nil {
+		if detached {
+			p.guardLease.CloseShimPin()
+		} else {
+			p.guardLease.Close()
+		}
+	}
 	if detached {
 		// The program runs on in its host; this daemon only stops watching it.
 		p.mu.Lock()
-		p.closed = true
-		close(p.events)
+		p.closeEventsLocked()
 		p.mu.Unlock()
 		close(p.done)
 		if p.w != nil {
@@ -501,8 +705,7 @@ func (p *process) wait(readDone <-chan struct{}) {
 	}
 	p.mu.Lock()
 	p.emitLocked(ev)
-	p.closed = true
-	close(p.events)
+	p.closeEventsLocked()
 	p.mu.Unlock()
 	close(p.done)
 	if p.w != nil {

@@ -34,15 +34,26 @@ func TestGateAndGuardCommands(t *testing.T) {
 		t.Fatalf("approve: %d %s %s", code, out, errs)
 	}
 
-	if out, _, code := tmx(t, "guard"); code != 0 || !strings.Contains(out, "guard: on") {
+	// The guard has no on/off switch: status lists the rules by state, on|off is refused with
+	// the reason, and nothing was asked of the owner or changed.
+	out, _, code = tmx(t, "guard")
+	if code != 0 || !strings.Contains(out, "guard: on for every agent") ||
+		!strings.Contains(out, "blocked: Disk wipe or format; Delete a root, home or system folder; Permissions on system folders; Boot and system protection\n") ||
+		!strings.Contains(out, "held for you: ") || !strings.Contains(out, "Administrator rights") || !strings.Contains(out, "allowed: ") {
 		t.Fatalf("guard: %d %s", code, out)
 	}
-	out, errs, code = tmx(t, "guard", "off", "--for", "worker")
-	if code != 0 || !strings.Contains(out, "off for worker") || !strings.Contains(errs, "Confirm on this machine with a test prompt: tmx is trying to relax agent safety settings") {
-		t.Fatalf("guard off --for: %d %s %s", code, out, errs)
+	if again, _, code := tmx(t, "guard", "status"); code != 0 || again != out {
+		t.Fatalf("guard status: %d %s", code, again)
 	}
-	if out, _, code := tmx(t, "guard", "on", "--for", "worker"); code != 0 || strings.Contains(out, "off for") {
-		t.Fatalf("guard on --for: %d %s", code, out)
+	prompts := len(d.GateAuth.Prompts())
+	for _, args := range [][]string{{"guard", "off"}, {"guard", "on"}, {"guard", "off", "--for", "worker"}} {
+		out, errs, code := tmx(t, args...)
+		if code != 2 || out != "" || !strings.Contains(errs, "no on/off switch") {
+			t.Fatalf("%v: %d %q %q", args, code, out, errs)
+		}
+	}
+	if len(d.GateAuth.Prompts()) != prompts {
+		t.Fatal("a removed guard command asked the owner for a proof")
 	}
 	d.GateAuth.SetAnswer(func(context.Context, string) error { return context.Canceled })
 	if _, errs, code := tmx(t, "gate", "off"); code != 1 || !strings.Contains(errs, "not confirmed") {

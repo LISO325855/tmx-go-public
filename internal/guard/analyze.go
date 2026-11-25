@@ -17,6 +17,7 @@ type analyzer struct {
 	ctx                         Context
 	fold                        bool // case-insensitive file system
 	home, own, workspace, state string
+	accountHome                 string // ctx.AccountHome when it is an account home in the state folder, else ""
 	temp                        []string
 	cwd                         string
 	dirs                        []string // pushd stack
@@ -33,6 +34,14 @@ func newAnalyzer(ctx Context) *analyzer {
 	a.own = a.norm(ctx.Own, "")
 	a.workspace = a.norm(ctx.Workspace, "")
 	a.state = a.norm(ctx.StateDir, "")
+	if h := a.norm(ctx.AccountHome, ""); a.state != "" && h != "" {
+		// exactly <state>/ai-accounts/homes/<harness>/<account>: nothing wider counts
+		if rest, ok := strings.CutPrefix(h, a.state+"/ai-accounts/homes/"); ok {
+			if parts := strings.Split(rest, "/"); len(parts) == 2 && parts[0] != "" && parts[1] != "" && parts[0] != ".." && parts[1] != ".." {
+				a.accountHome = h
+			}
+		}
+	}
 	temps := append([]string{}, ctx.Temp...)
 	if ctx.OS != "windows" {
 		temps = append(temps, "/tmp", "/private/tmp", "/var/tmp", "/private/var/tmp", "/var/folders", "/private/var/folders")

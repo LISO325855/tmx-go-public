@@ -74,7 +74,8 @@ type fixture struct {
 func newFixture(t *testing.T, mod func(*Options), harnesses ...model.Harness) fixture {
 	t.Helper()
 	fx := fixture{f: accountstest.Install(t, t.TempDir(), harnesses...), ev: &events{}, codexHome: t.TempDir()}
-	o := Options{Dir: t.TempDir(), LookPath: fx.f.LookPath, Publish: fx.ev.publish, Every: -1,
+	// These fake harness fixtures explicitly exercise caller-supplied account homes.
+	o := Options{AllowUserLogins: true, Dir: t.TempDir(), LookPath: fx.f.LookPath, Publish: fx.ev.publish, Every: -1,
 		CheckTimeout: 5 * time.Second, UsageTimeout: 5 * time.Second, StopGrace: 500 * time.Millisecond,
 		Env: []string{"CODEX_HOME=" + fx.codexHome, "CLAUDE_CONFIG_DIR=" + t.TempDir(), "GEMINI_CLI_HOME=" + t.TempDir()}}
 	if mod != nil {
@@ -586,5 +587,66 @@ func TestClaudeLoginHoldsTheStartQueue(t *testing.T) {
 	}
 	if blocked() {
 		t.Fatal("the queue is stuck behind a stopped sign-in")
+	}
+}
+
+// agy without an auth command (the real one) whose /usage cannot be read: the account is told
+// from its sign-in file, not reported as "Couldn't tell", and a sign-in that happens later is
+// seen although print mode was already marked as giving no quota.
+func TestAntigravitySignedInByFile(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	fx := newFixture(t, nil, Antigravity)
+	fx.f.Remove("agy-has-auth")
+	fx.f.Set("agy-usage.txt", `{"status":"SUCCESS","response":"Sure! Usage is a word."}`)
+
+	a := fx.refresh(t, "antigravity")
+	if a.Connected || a.Error != "" || !a.Installed {
+		t.Fatalf("no sign-in file: %+v", a)
+	}
+	accounts := filepath.Join(home, ".gemini", "google_accounts.json")
+	if err := os.MkdirAll(filepath.Dir(accounts), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(accounts, []byte(`{"active":"someone@example.com","old":[]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if a = fx.refresh(t, "antigravity"); !a.Connected || a.Error != "" || a.LimitsNote != agyNoQuota || a.Account.Method != MethodSubscription || a.Account.Email != "someone@example.com" {
+		t.Fatalf("signed in by file: %+v", a)
+	}
+	// Signed out again, as Gemini CLI's /signout leaves the file.
+	if err := os.WriteFile(accounts, []byte(`{"active":null,"old":["someone@example.com"]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if a = fx.refresh(t, "antigravity"); a.Connected || a.Error != "" {
+		t.Fatalf("signed out by file: %+v", a)
+	}
+	// agySignedIn itself: an account's own home wins over the user's.
+	other := t.TempDir()
+	sc := &scope{Service: fx.s, home: HomeEnv(Antigravity, other)}
+	if agySignedIn(sc) {
+		t.Fatal("an empty account home reads as signed in")
+	}
+	if err := os.MkdirAll(filepath.Join(other, ".gemini"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(other, ".gemini", "google_accounts.json"), []byte(`{"active":"x@example.com"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !agySignedIn(sc) {
+		t.Fatal("the account home's sign-in file is not seen")
+	}
+	// The real /usage format gives limits once the latch is dropped (a sign-in or sign-out does that).
+	if err := os.WriteFile(accounts, []byte(`{"active":"someone@example.com"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fx.f.Set("agy-usage.txt", `{"status":"SUCCESS","response":"Gemini Models\tWeekly Limit Remaining\t40%\t2026-11-24T13:57:20Z\n"}`)
+	if a = fx.refresh(t, "antigravity"); len(a.Limits) != 0 {
+		t.Fatalf("the latch was expected to hold until a sign-in or sign-out: %+v", a)
+	}
+	fx.s.agyForget()
+	if a = fx.refresh(t, "antigravity"); !a.Connected || len(a.Limits) != 1 || a.Limits[0].UsedPercent != 60 {
+		t.Fatalf("after the latch was dropped: %+v", a)
 	}
 }

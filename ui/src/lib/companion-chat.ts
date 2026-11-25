@@ -20,6 +20,7 @@ export interface CompanionEntry {
   agent_name?: string;
   text: string;
   state?: EntryState;
+  status_note?: string;
   task_id?: string;
   /** Unix ms */
   at: number;
@@ -142,7 +143,7 @@ function statusOf(e: unknown): number {
 export interface CompanionChatDeps {
   store: StoreApi<ConvState>;
   fetch: () => Promise<CompanionConversation>;
-  post: (text: string, replyTo?: string) => Promise<SentTask | null | undefined>;
+  post: (text: string, replyTo?: string, signal?: AbortSignal) => Promise<SentTask | null | undefined>;
   /** where the seen mark is kept (localStorage); may throw or be missing */
   storage?: () => KV | null | undefined;
   debounceMs?: number;
@@ -202,12 +203,13 @@ export function createCompanionChat(d: CompanionChatDeps) {
 
   /** Sends the owner's message, or an answer to the question of task replyTo. Throws on failure
    * (the composer keeps the text and shows the error). */
-  async function send(text: string, replyTo?: string): Promise<SentTask | null | undefined> {
+  async function send(text: string, replyTo?: string, signal?: AbortSignal): Promise<SentTask | null | undefined> {
     const body = text.trim();
     if (!body) throw new Error("Write something first.");
     let task: SentTask | null | undefined;
     try {
-      task = await d.post(body, replyTo || undefined);
+      task = await d.post(body, replyTo || undefined, signal);
+      signal?.throwIfAborted();
     } catch (e) {
       if (statusOf(e) === 409) void load(); // the question was answered meanwhile: the list shows it
       throw e;

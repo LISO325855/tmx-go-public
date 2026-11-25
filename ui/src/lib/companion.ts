@@ -36,6 +36,8 @@ export type CompanionTaskState =
   | "sending"
   | "working"
   | "input_required"
+  | "unknown"
+  | "ended_without_report"
   | "completed"
   | "failed"
   | "canceled"
@@ -58,6 +60,7 @@ export interface CompanionTask {
   state: CompanionTaskState;
   remote_id?: string;
   question?: string;
+  queue_released?: boolean;
   result?: string;
   error?: string;
   attempts: number;
@@ -130,7 +133,7 @@ export interface CompanionApprovalInput {
   question?: string;
 }
 
-export const DONE: CompanionTaskState[] = ["denied", "completed", "failed", "canceled", "refused", "unconfirmed"];
+export const DONE: CompanionTaskState[] = ["denied", "completed", "failed", "canceled", "refused", "unconfirmed", "ended_without_report"];
 export const isDone = (s: CompanionTaskState) => DONE.includes(s);
 
 export const TASK_STATE_LABEL: Record<CompanionTaskState, string> = {
@@ -140,6 +143,8 @@ export const TASK_STATE_LABEL: Record<CompanionTaskState, string> = {
   sending: "Sending",
   working: "Working",
   input_required: "Asks you",
+  unknown: "Unknown",
+  ended_without_report: "Ended without report",
   completed: "Completed",
   failed: "Failed",
   canceled: "Cancelled",
@@ -216,15 +221,15 @@ export const companionChat = createCompanionChat({
   store: useCompanionChat,
   fetch: () => transport().request<CompanionConversation>("GET", `/api/companion/conversation?limit=${CONVERSATION_LIMIT}`),
   // A message that reads like money, accounts or outward actions asks the owner gate (when it is on).
-  post: (text, replyTo) =>
+  post: (text, replyTo, signal) =>
     ownerAction((c) =>
-      transport().request<CompanionTask>("POST", withConfirmation("/api/companion/messages", c), { text, ...(replyTo ? { reply_to: replyTo } : {}) }),
+      transport().request<CompanionTask>("POST", withConfirmation("/api/companion/messages", c), { text, ...(replyTo ? { reply_to: replyTo } : {}) }, signal),
     ),
   storage: localStore,
 });
 
 /** The owner writes to Companion; replyTo (a task id) answers Companion's question on it. */
-export const sendCompanionMessage = (text: string, replyTo?: string) => companionChat.send(text, replyTo);
+export const sendCompanionMessage = (text: string, replyTo?: string, signal?: AbortSignal) => companionChat.send(text, replyTo, signal);
 
 window.addEventListener("storage", (e) => {
   if (e.key === SEEN_KEY) companionChat.syncSeen();
@@ -255,6 +260,10 @@ async function loadStatusQuietly() {
 
 onBusEvent((ev: BusEvent) => {
   if (ev.type === "snapshot") {
+    if (useStore.getState().conn !== "open") {
+      useCompanion.setState({ status: null });
+      useCompanionChat.setState({ loaded: false, available: null, error: "" });
+    }
     void loadCompanionTasks();
     void loadStatusQuietly();
   }

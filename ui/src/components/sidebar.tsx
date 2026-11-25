@@ -1,7 +1,10 @@
+import { agentPinKey } from "@/lib/agent-pins";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ChevronRight, CircleDot, FolderClosed, Inbox, LayoutGrid, ListTree, Moon, Plus, Search, Settings, Sun } from "lucide-react";
 import { SquareTerminal } from "lucide-react"; // an agent in its own screen (harness-screen.tsx)
-import { Briefcase, Gauge, Handshake, ListChecks, Users } from "lucide-react";
+import { ConnectPhoneButton } from "@/components/connect-phone"; // the phone in the top bar
+import { Boxes, Briefcase, Gauge, Handshake, ListChecks, Users } from "lucide-react";
+import { Activity, Network } from "lucide-react"; // Team status and the Watchdog page (pages/team.tsx, pages/watchdog.tsx)
 import { UsageDot } from "./accounts/usage-bits";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -14,7 +17,7 @@ import { pendingApprovals, projectTree, useStore } from "@/lib/store";
 import { toggleTheme, useTheme } from "@/lib/theme";
 import { summarizeTool } from "@/lib/tools";
 import type { Agent, AgentState, Project, TimelineEntry } from "@/lib/types";
-import { MOD, ui } from "@/lib/ui";
+import { MOD, ui, useUI } from "@/lib/ui";
 import { cn } from "@/lib/utils";
 import { ModelBadge } from "./badges";
 import { harnessLabel } from "@/lib/harness";
@@ -26,8 +29,10 @@ import { SidebarChats } from "./chat/sidebar-chats";
 import { SidebarWhatsApp } from "./whatsapp/sidebar-wa";
 import { ConnectionDot, ReconnectingPill } from "./connection";
 import { StateDot } from "./state";
-import { Truncate } from "./truncate";
 import { BrandMark } from "@/components/brand-mark";
+import { useClassic } from "@/hooks/use-classic";
+import { ClassicAgentRow, ClassicSearchBox, StoppedAgentsLine } from "@/components/classic/agent-list";
+import { emptyProjectsLine, filterProjectAgents, isBusyState, projectListed, projectOpen, projectsModeAction, savedProjectsMode, saveProjectsMode, type ProjectsMode } from "@/lib/classic-agents";
 
 /** What an agent is doing now, from its latest meaningful timeline entry. */
 export function nowLine(entries: TimelineEntry[] | undefined, agent: Agent): string {
@@ -103,6 +108,9 @@ function AgentRow({
   onNavigate?: () => void;
   guide?: boolean;
 }) {
+  // Classic: the row the Python way (components/classic/agent-list.tsx).
+  const classic = useClassic();
+  if (classic) return <ClassicAgentRow agent={agent} depth={depth} active={active} onNavigate={onNavigate} />;
   return (
     <a
       href={href(paths.agent(agent.id))}
@@ -155,6 +163,7 @@ function ProjectItem({
   collapsed,
   onToggle,
   onNavigate,
+  query = "",
 }: {
   project: Project;
   agents: Record<string, Agent>;
@@ -162,9 +171,18 @@ function ProjectItem({
   collapsed: boolean;
   onToggle: () => void;
   onNavigate?: () => void;
+  /** classic: the search box above the list; "" = everything */
+  query?: string;
 }) {
-  const { lead, workers } = projectTree(agents, project);
+  const machine = useStore((s) => s.machine);
+  const tree = projectTree(agents, project);
+  // the search box narrows a project to its matching agents, and hides one with none
+  const found = filterProjectAgents(tree.lead ? [tree.lead, ...tree.workers] : tree.workers, query, project.name, machine);
+  const lead = tree.lead && found.agents.includes(tree.lead) ? tree.lead : null;
+  const workers = tree.workers.filter((w) => found.agents.includes(w));
   const all = lead ? [lead, ...workers] : workers;
+  if (!found.show) return null;
+  if (query.trim()) collapsed = false; // what was searched for is shown
   const agg = aggregate(all);
   const active = path === paths.project(project.id);
   const inactive = project.status !== "active";
@@ -224,17 +242,18 @@ function ProjectItem({
 }
 
 function HeadCard({ path, onNavigate }: { path: string; onNavigate?: () => void }) {
+  const classic = useClassic();
   const head = useStore((s) => (s.headId ? s.agents[s.headId] : undefined));
   const entries = useStore((s) => (s.headId ? s.timelines[s.headId]?.entries : undefined));
   const profiles = useStore((s) => s.profiles);
   useNow(20_000);
   if (!head) {
     return (
-      <div className="rounded-lg border border-dashed px-3 py-2.5 text-xs text-muted-foreground">No head agent on this machine yet.</div>
+      <div className="flex h-[3.75rem] items-center truncate rounded-lg border border-dashed px-3 text-xs text-muted-foreground">{classic ? "No Architect on this machine yet." : "No head agent on this machine yet."}</div>
     );
   }
   const active = path.startsWith(paths.agent(head.id));
-  const label = agentLabel(head, profiles);
+  const label = classic ? "Architect" : agentLabel(head, profiles);
   const now = head.state === "working" || head.state === "waiting" ? nowLine(entries, head) : "";
   return (
     <a
@@ -242,7 +261,9 @@ function HeadCard({ path, onNavigate }: { path: string; onNavigate?: () => void 
       onClick={onNavigate}
       aria-current={active ? "page" : undefined}
       className={cn(
-        "block rounded-lg border bg-card px-2.5 py-2 outline-none transition-colors duration-150 hover:border-border-strong focus-visible:ring-2 focus-visible:ring-ring",
+        // A fixed height (the owner, 17 Nov 15:58: the card grew and shrank with its status text, so the
+        // whole sidebar jumped): the name on one line, the status on ONE line, cut with an ellipsis.
+        "block h-[3.75rem] overflow-hidden rounded-lg border bg-card px-2.5 py-2 outline-none transition-colors duration-150 hover:border-border-strong focus-visible:ring-2 focus-visible:ring-ring",
         active && "border-border-strong bg-sidebar-accent/60",
         head.state === "paused" && "border-state-waiting/60",
       )}
@@ -252,40 +273,70 @@ function HeadCard({ path, onNavigate }: { path: string; onNavigate?: () => void 
           {(label.match(/[\p{L}\p{N}]/u)?.[0] ?? "H").toUpperCase()}
         </span>
         <span className="truncate text-[0.8125rem] font-medium">{label}</span>
-        <ModelBadge agent={head} className="ml-auto" />
+        {!classic && <ModelBadge agent={head} className="ml-auto" />}
       </div>
-      <div className="mt-1.5 flex items-center gap-1.5 pl-7 text-2xs text-muted-foreground">
+      <div className="mt-1.5 flex h-4 min-w-0 items-center gap-1.5 overflow-hidden pl-7 text-2xs whitespace-nowrap text-muted-foreground" data-head-status title={now || undefined}>
         <StateDot state={head.state} />
-        <span>{STATE_LABEL[head.state]}</span>
+        <span className="shrink-0">{STATE_LABEL[head.state]}</span>
         {head.last_activity_at > 0 && (
           <>
-            <span className="text-subtle-foreground">·</span>
-            <span className="tabular truncate text-subtle-foreground">{relativeTime(head.last_activity_at)}</span>
+            <span className="shrink-0 text-subtle-foreground">·</span>
+            <span className="tabular shrink-0 text-subtle-foreground">{relativeTime(head.last_activity_at)}</span>
+          </>
+        )}
+        {/* what it is doing: on the same line, taking what room is left, never a line of its own */}
+        {now && (
+          <>
+            <span className="shrink-0 text-subtle-foreground">·</span>
+            <span className="min-w-0 flex-1 truncate text-subtle-foreground">{now}</span>
           </>
         )}
       </div>
-      {now && <Truncate className="mt-1 pl-7 text-2xs text-subtle-foreground">{now}</Truncate>}
     </a>
   );
 }
 
 export function SidebarContent({ onNavigate, desktopMac }: { onNavigate?: () => void; desktopMac?: boolean }) {
+  const classic = useClassic();
   const path = usePath();
   const machine = useStore((s) => s.machine);
   const version = useStore((s) => s.version);
   const updateState = useUpdate((s) => s.status?.state);
   const projects = useStore((s) => s.projects);
   const agents = useVisibleAgents();
+  const allAgents = useStore((s) => s.agents);
+  const agentPins = useUI((s) => s.agentPins);
   const approvals = useStore((s) => s.approvals);
   const pending = pendingApprovals(approvals).length;
   const recording = !!useLiveRecording().rec;
   const { resolved } = useTheme();
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>(readCollapsed);
+  const [query, setQuery] = useState(""); // classic: the search box above the agent list
+  const pinned = Object.values(allAgents).filter((a) => agentPins.includes(agentPinKey(machine, a.id)) && !a.shelved_at && (!query.trim() || a.name.toLowerCase().includes(query.trim().toLowerCase())));
+  // Classic (the owner, 17 Nov 19:03: ~40 projects were a mess): the list is collapsed, a project
+  // opens by itself only while one of its agents is busy; one toggle; empty projects are put away.
+  const [projectsMode, setProjectsMode] = useState<ProjectsMode>(savedProjectsMode);
+  const [opened, setOpened] = useState<Record<string, boolean>>({}); // the chevrons, until the mode is switched
+  const [showEmpty, setShowEmpty] = useState(false);
 
   const sorted = useMemo(() => {
     const order = { active: 0, paused: 1, archived: 2 } as const;
     return Object.values(projects).sort((a, b) => order[a.status] - order[b.status] || a.name.localeCompare(b.name));
   }, [projects]);
+  const listing = useMemo(() => {
+    const searching = !!query.trim();
+    const rows = sorted.map((p) => {
+      const members = Object.values(agents).filter((a) => a.project_id === p.id);
+      const current = path === paths.project(p.id) || members.some((a) => path.startsWith(paths.agent(a.id)));
+      return {
+        p,
+        members: members.length,
+        listed: projectListed({ members: members.length, current, showEmpty, searching }),
+        open: projectOpen({ mode: projectsMode, busy: members.some((a) => isBusyState(a.state)), current, searching, override: opened[p.id] }),
+      };
+    });
+    return { rows, empty: rows.filter((r) => r.members === 0).length };
+  }, [sorted, agents, path, query, projectsMode, opened, showEmpty]);
 
   const toggle = (id: string) =>
     setCollapsed((c) => {
@@ -302,7 +353,7 @@ export function SidebarContent({ onNavigate, desktopMac }: { onNavigate?: () => 
     <div className="flex h-full min-h-0 flex-col">
       <div className={cn("drag-region flex h-[3.25rem] shrink-0 items-center gap-2 pr-2", desktopMac ? "pl-[5.875rem]" : "pl-4")}>
         <BrandMark />
-        <span className="min-w-0 truncate text-[0.8125rem] font-semibold tracking-tight">{machine || "tmx"}</span>
+        <span className="min-w-0 truncate text-[0.8125rem] font-semibold tracking-tight">{classic ? "Tiamatrix" : machine || "tmx"}</span>
         <ConnectionDot />
         <ReconnectingPill />
         <Tooltip>
@@ -313,21 +364,30 @@ export function SidebarContent({ onNavigate, desktopMac }: { onNavigate?: () => 
           </TooltipTrigger>
           <TooltipContent>Search · {MOD}K</TooltipContent>
         </Tooltip>
+        <ConnectPhoneButton />
       </div>
 
       <div className="shrink-0 px-2">
         <HeadCard path={path} onNavigate={onNavigate} />
+        {classic && <ClassicSearchBox value={query} onChange={setQuery} />}
       </div>
 
       {/* Below the head, everything scrolls as one: the main links, Chats, WhatsApp, Projects. */}
       <div className="scroll-thin mt-3 min-h-0 flex-1 overflow-y-auto pb-3" data-sidebar-scroll>
+        {pinned.length > 0 && <section aria-label="Pinned agents" className="mb-3 px-2">
+          <h2 className="px-2 text-xs text-muted-foreground">Pinned</h2>
+          {pinned.map((agent) => <AgentRow key={agent.id} agent={agent} depth={1} active={path.startsWith(paths.agent(agent.id))} onNavigate={onNavigate} />)}
+        </section>}
         <nav className="flex flex-col gap-px px-2" aria-label="Main">
-          <NavItem to={paths.overview()} icon={LayoutGrid} label="Home" active={path === "/"} onNavigate={onNavigate} />
+          {/* classic: on a computer this opens the Architect's conversation (App.tsx), Python's "Workspace" */}
+          <NavItem to={paths.overview()} icon={LayoutGrid} label={classic ? "Workspace" : "Home"} active={path === "/"} onNavigate={onNavigate} />
+          {/* classic: Python's "Projects" tab, a card per project (pages/classic-projects.tsx) */}
+          {classic && <NavItem to={paths.projects()} icon={FolderClosed} label="Projects" active={path === paths.projects()} onNavigate={onNavigate} />}
           <NavItem to={paths.matrix()} icon={ListTree} label="Matrix" active={path === paths.matrix()} onNavigate={onNavigate} />
           <NavItem
             to={paths.inbox()}
             icon={Inbox}
-            label="Needs you"
+            label={classic ? "Your turn" : "Needs you"}
             active={path === paths.inbox()}
             onNavigate={onNavigate}
             right={
@@ -346,11 +406,18 @@ export function SidebarContent({ onNavigate, desktopMac }: { onNavigate?: () => 
             onNavigate={onNavigate}
             right={recording ? <span className="size-2 animate-pulse rounded-full bg-state-error" aria-label="Recording" /> : undefined}
           />
-          <NavItem to={paths.people()} icon={Users} label="People" active={path === paths.people()} onNavigate={onNavigate} />
-          <NavItem to={paths.clients()} icon={Briefcase} label="Clients" active={path === paths.clients()} onNavigate={onNavigate} />
-          <NavItem to={paths.promises()} icon={Handshake} label="Promises" active={path === paths.promises()} onNavigate={onNavigate} />
-          <NavItem to={paths.usage()} icon={Gauge} label="Usage" active={path === paths.usage()} onNavigate={onNavigate} right={<UsageDot />} />
-          <NavItem to={paths.features()} icon={ListChecks} label="Features" active={path === paths.features()} onNavigate={onNavigate} />
+          {/* classic: one People entry (the page has the tabs Team | Clients & partners, as in Python) */}
+          <NavItem to={paths.people()} icon={Users} label="People" active={path === paths.people() || (classic && path === paths.clients())} onNavigate={onNavigate} />
+          {!classic && <NavItem to={paths.clients()} icon={Briefcase} label="Clients" active={path === paths.clients()} onNavigate={onNavigate} />}
+          {/* classic: no Promises entry (the owner, 17 Nov 18:55: "completely replaced by matrix") */}
+          {!classic && <NavItem to={paths.promises()} icon={Handshake} label="Promises" active={path === paths.promises()} onNavigate={onNavigate} />}
+          <NavItem to={paths.shells()} icon={SquareTerminal} label="Shells" active={path === paths.shells()} onNavigate={onNavigate} />
+          <NavItem to={paths.resources()} icon={Boxes} label="Resources" active={path.startsWith(paths.resources())} onNavigate={onNavigate} />
+          <NavItem to={paths.usage()} icon={Gauge} label={classic ? "Usage and accounts" : "Usage"} active={path === paths.usage()} onNavigate={onNavigate} right={<UsageDot />} />
+          {/* team status (each person's computers) and this machine's watchdog: both profiles */}
+          <NavItem to={paths.team()} icon={Network} label="Team" active={path === paths.team()} onNavigate={onNavigate} />
+          <NavItem to={paths.watchdog()} icon={Activity} label="Watchdog" active={path.startsWith(paths.watchdog())} onNavigate={onNavigate} />
+          {!classic && <NavItem to={paths.features()} icon={ListChecks} label="Features" active={path === paths.features()} onNavigate={onNavigate} />}
         </nav>
 
         <SidebarChats path={path} onNavigate={onNavigate} open={!collapsed[CHATS_SECTION]} onToggle={() => toggle(CHATS_SECTION)} />
@@ -358,43 +425,87 @@ export function SidebarContent({ onNavigate, desktopMac }: { onNavigate?: () => 
 
         <div className="mt-5 flex items-center px-4 pr-2">
           <span className="text-2xs font-medium tracking-wide text-subtle-foreground uppercase">Projects</span>
-          <span className="ml-3"><AgentListFilter /></span>
+          {classic && (
+            <button
+              type="button"
+              className="ml-3 rounded text-2xs text-subtle-foreground underline-offset-2 outline-none hover:text-foreground hover:underline focus-visible:ring-2 focus-visible:ring-ring"
+              data-projects-mode={projectsMode}
+              onClick={() => {
+                const next: ProjectsMode = projectsMode === "active" ? "collapsed" : "active";
+                saveProjectsMode(next);
+                setProjectsMode(next);
+                setOpened({}); // the toggle speaks for every project again
+              }}
+            >
+              {projectsModeAction(projectsMode)}
+            </button>
+          )}
+          {!classic && (
+            <span className="ml-3">
+              <AgentListFilter />
+            </span>
+          )}
           <Tooltip>
             <TooltipTrigger asChild>
-              <Button variant="ghost" size="icon-xs" className="ml-auto text-muted-foreground" aria-label="New project" onClick={() => ui.openNewProject(true)}>
+              {/* classic: Python's "+ Agent" (the project is a field of that form, which also leads to New project) */}
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                className="ml-auto text-muted-foreground"
+                aria-label={classic ? "New agent" : "New project"}
+                onClick={() => (classic ? ui.openNewAgent(true) : ui.openNewProject(true))}
+              >
                 <Plus />
               </Button>
             </TooltipTrigger>
-            <TooltipContent>New project · C</TooltipContent>
+            <TooltipContent>{classic ? "New agent" : "New project · C"}</TooltipContent>
           </Tooltip>
         </div>
         <div className="mt-1 px-2">
           <div className="flex flex-col gap-0.5">
-            {sorted.map((p) => (
-              <ProjectItem
-                key={p.id}
-                project={p}
-                agents={agents}
-                path={path}
-                collapsed={collapsed[p.id] ?? p.status === "archived"}
-                onToggle={() => toggle(p.id)}
-                onNavigate={onNavigate}
-              />
-            ))}
+            {!classic &&
+              sorted.map((p) => (
+                <ProjectItem key={p.id} project={p} agents={agents} path={path} collapsed={collapsed[p.id] ?? p.status === "archived"} onToggle={() => toggle(p.id)} onNavigate={onNavigate} />
+              ))}
+            {classic &&
+              listing.rows
+                .filter((r) => r.listed)
+                .map((r) => (
+                  <ProjectItem
+                    key={r.p.id}
+                    project={r.p}
+                    agents={agents}
+                    path={path}
+                    collapsed={!r.open}
+                    onToggle={() => setOpened((o) => ({ ...o, [r.p.id]: !r.open }))}
+                    onNavigate={onNavigate}
+                    query={query}
+                  />
+                ))}
           </div>
+          {classic && emptyProjectsLine(listing.empty, showEmpty) && !query.trim() && (
+            <p className="mt-2 px-2 text-2xs text-subtle-foreground" data-empty-projects>
+              <button type="button" className="underline-offset-2 outline-none hover:text-foreground hover:underline focus-visible:ring-2 focus-visible:ring-ring" onClick={() => setShowEmpty((v) => !v)}>
+                {emptyProjectsLine(listing.empty, showEmpty)}
+              </button>
+            </p>
+          )}
+          {classic && <StoppedAgentsLine />}
           <button
             type="button"
-            onClick={() => ui.openNewProject(true)}
+            onClick={() => (classic ? ui.openNewAgent(true) : ui.openNewProject(true))}
             className="mt-1 flex h-7 w-full items-center gap-2 rounded-md px-2 text-[0.8125rem] text-muted-foreground outline-none hover:bg-sidebar-accent/70 hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
           >
             <Plus className="size-4" />
-            New project
+            {classic ? "Agent" : "New project"}
           </button>
         </div>
       </div>
 
-      <div className="flex shrink-0 items-center gap-1 border-t border-sidebar-border px-2 py-2">
-        <div className="min-w-0 flex-1">
+      {/* Classic (the owner, 17 Nov): in the narrow sidebar the version number squeezed "Settings" out of
+          its row. Settings has the row to itself; the version is small and muted on a line of its own. */}
+      <div className={cn("flex shrink-0 gap-1 border-t border-sidebar-border px-2 py-2", classic ? "flex-col" : "items-center")} data-sidebar-footer>
+        <div className={cn("min-w-0", !classic && "flex-1")}>
           <NavItem to={paths.settings()} icon={Settings} label="Settings" active={path.startsWith(paths.settings())} onNavigate={onNavigate} />
         </div>
         {version && (
@@ -402,20 +513,24 @@ export function SidebarContent({ onNavigate, desktopMac }: { onNavigate?: () => 
             href={href(paths.settings()) + "?section=updates"}
             onClick={onNavigate}
             title={updateState && ["available", "downloading", "ready", "installing"].includes(updateState) ? "A new release is on its way" : "Updates"}
-            className="tabular flex items-center gap-1 rounded px-1 font-mono text-2xs text-subtle-foreground outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+            className={cn(
+              "tabular flex items-center gap-1 rounded font-mono text-subtle-foreground outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring",
+              classic ? "min-w-0 self-start truncate px-2 text-[0.625rem] leading-4" : "px-1 text-2xs",
+            )}
+            data-sidebar-version
           >
             {version}
             <UpdateDot state={updateState} />
           </a>
         )}
-        <Tooltip>
+        {!classic && <Tooltip>
           <TooltipTrigger asChild>
             <Button variant="ghost" size="icon-sm" className="text-muted-foreground" aria-label="Toggle theme" onClick={toggleTheme}>
               {resolved === "dark" ? <Sun className="size-4" /> : <Moon className="size-4" />}
             </Button>
           </TooltipTrigger>
           <TooltipContent>{resolved === "dark" ? "Light theme" : "Dark theme"}</TooltipContent>
-        </Tooltip>
+        </Tooltip>}
       </div>
     </div>
   );
@@ -424,6 +539,7 @@ export function SidebarContent({ onNavigate, desktopMac }: { onNavigate?: () => 
 const WIDTH_KEY = "tmx.sidebar.width";
 
 export function Sidebar({ desktopMac }: { desktopMac?: boolean }) {
+  const classic = useClassic();
   const [width, setWidth] = useState(() => {
     try {
       const v = Number(localStorage.getItem(WIDTH_KEY));
@@ -462,9 +578,10 @@ export function Sidebar({ desktopMac }: { desktopMac?: boolean }) {
   }, [width]);
 
   return (
-    <aside className="relative hidden h-full shrink-0 border-r border-sidebar-border bg-sidebar md:block" style={{ width }}>
+    <aside className="relative hidden h-full shrink-0 border-r border-sidebar-border bg-sidebar md:block" style={{ width: classic ? 248 : width }}>
+      {/* Classic keeps Python's fixed sidebar width. The full UI retains its saved width. */}
       <SidebarContent desktopMac={desktopMac} />
-      <div
+      {!classic && <div
         role="separator"
         aria-orientation="vertical"
         aria-label="Resize sidebar"
@@ -481,7 +598,7 @@ export function Sidebar({ desktopMac }: { desktopMac?: boolean }) {
         }}
         onDoubleClick={() => setWidth(260)}
         className="absolute top-0 -right-[3px] bottom-0 z-10 w-[0.375rem] cursor-col-resize outline-none after:absolute after:inset-y-0 after:left-[2px] after:w-[2px] after:bg-transparent after:transition-colors after:duration-150 hover:after:bg-border-strong focus-visible:after:bg-ring"
-      />
+      />}
     </aside>
   );
 }

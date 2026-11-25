@@ -138,21 +138,3 @@ func TestQRCodes(t *testing.T) {
 		t.Fatalf("text:\n%s", txt)
 	}
 }
-
-func TestWindow(t *testing.T) {
-	var w window
-	t0 := time.Now()
-	if ok, _ := w.take(t0, WindowMax); !ok {
-		t.Fatal("full window refused")
-	}
-	ok, wait := w.take(t0.Add(time.Minute), 1)
-	if ok || wait < Window-time.Minute-time.Second || wait > Window {
-		t.Fatalf("over: %v %v", ok, wait)
-	}
-	if ok, _ := w.take(t0.Add(Window+time.Millisecond), 1); !ok {
-		t.Fatal("not freed")
-	}
-	if ok, _ := w.take(t0, WindowMax+1); ok {
-		t.Fatal("more than the window at once")
-	}
-}

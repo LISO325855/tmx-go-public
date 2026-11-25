@@ -606,6 +606,15 @@ CREATE TABLE promises (id TEXT PRIMARY KEY, person_key TEXT NOT NULL, status TEX
 CREATE INDEX promises_person ON promises(person_key, status);
 CREATE TABLE reminders (id TEXT PRIMARY KEY, fire_at INTEGER NOT NULL, target TEXT NOT NULL, text TEXT NOT NULL, promise_id TEXT NOT NULL DEFAULT '', state TEXT NOT NULL CHECK(state IN ('pending','fired','cancelled')), attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT NOT NULL DEFAULT '', fired_at INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL);
 CREATE INDEX reminders_due ON reminders(state, fire_at);`,
+	// The harness account an agent runs as (internal/accounts). It was kept in memory only, so
+	// after a daemon restart an agent launched with an account started in the default account's
+	// home, where its conversation is not (hosta-go, 17 Nov).
+	`ALTER TABLE agents ADD COLUMN account TEXT NOT NULL DEFAULT '';`,
+	// Retained media lookup/expiry must not scan the message archive per file.
+	`CREATE INDEX wa_messages_media_file ON wa_messages(media_file);`,
+	// A fleet-lead label needs durable receipt provenance, not a sender-name claim.
+	`ALTER TABLE peer_messages ADD COLUMN verified_sender TEXT NOT NULL DEFAULT '';`,
+	`ALTER TABLE peer_messages ADD COLUMN verified_generation TEXT NOT NULL DEFAULT '';`,
 }
 
 func (s *Store) migrate() error {
@@ -636,5 +645,56 @@ func (s *Store) migrate() error {
 			return err
 		}
 	}
-	return nil
+	if err := s.ensureThreadBoard(); err != nil {
+		return err
+	}
+	if err := s.ensureMailPriority(); err != nil {
+		return err
+	}
+	return s.ensureReportTracking()
+}
+
+// The previous installer can roll back only the binary. Keep this additive
+// column compatible with older builds, which use explicit message column lists.
+func (s *Store) ensureMailPriority() error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var found bool
+	if err := tx.QueryRow("SELECT EXISTS (SELECT 1 FROM pragma_table_info('messages') WHERE name='urgent')").Scan(&found); err != nil {
+		return err
+	}
+	if !found {
+		if _, err := tx.Exec("ALTER TABLE messages ADD COLUMN urgent INTEGER NOT NULL DEFAULT 0"); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// These columns are additive so an older binary can still read the summary rows.
+func (s *Store) ensureReportTracking() error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, col := range []struct{ name, definition string }{
+		{"deadline_at", "INTEGER NOT NULL DEFAULT 0"},
+		{"awaiting_worker", "INTEGER NOT NULL DEFAULT 0"},
+		{"made_here", "TEXT NOT NULL DEFAULT ''"},
+	} {
+		var found bool
+		if err := tx.QueryRow("SELECT EXISTS (SELECT 1 FROM pragma_table_info('recording_summaries') WHERE name = ?)", col.name).Scan(&found); err != nil {
+			return err
+		}
+		if !found {
+			if _, err := tx.Exec("ALTER TABLE recording_summaries ADD COLUMN " + col.name + " " + col.definition); err != nil {
+				return err
+			}
+		}
+	}
+	return tx.Commit()
 }

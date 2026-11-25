@@ -208,6 +208,10 @@ func (t *Tools) waSend(ctx context.Context, _ *sdk.CallToolRequest, in waSendArg
 	id := ""
 	if res.Message != nil {
 		id = res.Message.ID
+		if res.Message.Status == model.WaPending {
+			return text(fmt.Sprintf("Queued for %q (%s), message %s. whatsapp_read shows whether it was sent or failed.",
+				peertext.Field(res.Chat.Name), res.Chat.JID, id)), nil, nil
+		}
 	}
 	return text(fmt.Sprintf("Sent to %q (%s) without asking, because the owner allows agents to write there (message %s). "+
 		"whatsapp_read shows when it is delivered and read.", peertext.Field(res.Chat.Name), res.Chat.JID, id)), nil, nil

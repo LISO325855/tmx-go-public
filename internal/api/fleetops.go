@@ -126,6 +126,9 @@ func (s *Server) fleetOpsRestart(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotImplemented, "this daemon cannot restart itself")
 		return
 	}
+	if !s.reserveRestart(w, r) {
+		return
+	}
 	c, _ := caller(r)
 	s.log.Warn("daemon restart requested by an agent", "agent", c.AgentID)
 	writeJSON(w, http.StatusAccepted, map[string]any{"restarting": true, "back_in": "about 15 seconds"})

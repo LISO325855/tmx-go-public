@@ -58,7 +58,7 @@ func (s *Server) trustedProxy(r *http.Request) bool {
 	if len(proto) != 1 || proto[0] != "https" {
 		return false
 	}
-	for _, host := range s.trustedHosts {
+	for _, host := range s.TrustedHosts() {
 		if config.ValidTrustedHost(host) && config.ValidTrustedHost(r.Host) && config.NormalizeTrustedHost(r.Host) == config.NormalizeTrustedHost(host) {
 			return true
 		}
@@ -70,8 +70,20 @@ func (s *Server) trustedProxy(r *http.Request) bool {
 // /api/health).
 func (s *Server) guard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		remote := !localHost(r.Host)
-		if remote && !s.trustedProxy(r) {
+		lan := viaLAN(r) // phonelan.go: it arrived on a network address (the same Wi-Fi fallback)
+		remote := lan || !localHost(r.Host)
+		if lan {
+			// Only while the fallback is on, only with the exact address as Host, and never
+			// with a token: those are for this machine and would cross the network in clear.
+			if !s.lanRequest(r) {
+				writeError(w, http.StatusForbidden, "this daemon answers only on 127.0.0.1")
+				return
+			}
+			if r.Header.Get("Authorization") != "" || peerHeaderRoute(r) {
+				writeError(w, http.StatusForbidden, "tokens are not accepted over the local network")
+				return
+			}
+		} else if remote && !s.trustedProxy(r) {
 			writeError(w, http.StatusForbidden, "this daemon answers only on 127.0.0.1")
 			return
 		}
@@ -84,6 +96,11 @@ func (s *Server) guard(next http.Handler) http.Handler {
 		// Navigations and same-origin GET/HEAD fetches may omit Origin. Writes
 		// and websocket upgrades must carry the exact trusted HTTPS origin.
 		needsOrigin := remote && (r.Method != http.MethodGet && r.Method != http.MethodHead || r.Header.Get("Upgrade") != "")
+		// A joining machine's daemon is not a browser and has no Origin to send (machinejoin.go).
+		// That one route does without it here and refuses every request that carries one itself.
+		if publicJoinRoute(r) {
+			needsOrigin = false
+		}
 		if len(origins) > 1 || needsOrigin && origin == "" {
 			writeError(w, http.StatusForbidden, "origin not allowed")
 			return
@@ -92,6 +109,9 @@ func (s *Server) guard(next http.Handler) http.Handler {
 			allowed := s.allowedOrigin(origin)
 			if remote {
 				allowed = origin == "https://"+config.NormalizeTrustedHost(r.Host)
+			}
+			if lan {
+				allowed = origin == "http://"+r.Host
 			}
 			if !allowed {
 				writeError(w, http.StatusForbidden, "origin not allowed")
@@ -109,7 +129,7 @@ func (s *Server) guard(next http.Handler) http.Handler {
 				return
 			}
 		}
-		if !strings.HasPrefix(r.URL.Path, "/api/") || r.URL.Path == "/api/health" || publicPairRoute(r) {
+		if !strings.HasPrefix(r.URL.Path, "/api/") || r.URL.Path == "/api/health" || publicPairRoute(r) || publicJoinRoute(r) || slotRecoveryRoute(r) {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -117,12 +137,19 @@ func (s *Server) guard(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		c, ok := s.authenticate(r)
+		var c fleet.Caller
+		ok := false
+		if !lan { // no token of any kind over the local network
+			c, ok = s.authenticate(r)
+		}
 		if !ok && strings.TrimSpace(r.Header.Get("Authorization")) == "" {
 			if ctx, cleanup, valid := s.deviceSession(r); valid {
 				defer cleanup()
 				r = r.WithContext(ctx)
 				c, ok = fleet.OwnerCaller, true
+				if !s.guardLock(w, r) { // phonelock.go: a locked phone gets 423
+					return
+				}
 			}
 		}
 		if !ok {

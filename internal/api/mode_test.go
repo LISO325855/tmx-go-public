@@ -16,9 +16,10 @@ func TestModeRoute(t *testing.T) {
 	if s := owner.do("POST", "/api/agents", map[string]string{"name": "w1", "project_id": workerProject(t, d)}, &w); s != 201 {
 		t.Fatalf("launch: %d", s)
 	}
-	head := client{t: t, base: d.URL, token: d.AgentToken(t, "head")}
-	if s := head.do("POST", "/api/agents/w1/mode", map[string]string{"mode": "terminal"}, nil); s != 403 {
-		t.Fatalf("an agent switched a mode: %d", s)
+	// A worker switches no mode, not even its own; the head and a project's lead do (17 Nov).
+	worker := client{t: t, base: d.URL, token: d.AgentToken(t, "w1")}
+	if s := worker.do("POST", "/api/agents/w1/mode", map[string]string{"mode": "terminal"}, nil); s != 403 {
+		t.Fatalf("a worker switched a mode: %d", s)
 	}
 	if s := owner.do("POST", "/api/agents/w1/mode", map[string]string{"mode": "screen"}, nil); s != 400 {
 		t.Fatalf("unknown mode: %d", s)

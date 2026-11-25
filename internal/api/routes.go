@@ -21,6 +21,7 @@ func (s *Server) routes(mux *http.ServeMux) {
 	s.processRoutes(mux)
 	s.jobRoutes(mux)
 	mux.HandleFunc("GET /api/health", s.health)
+	mux.HandleFunc("GET /api/watch", s.ownerOnly(s.watch)) // the watch board (fleet/watch.go)
 	mux.HandleFunc("GET /api/peers", s.ownerOnly(s.peerStatus))
 	mux.HandleFunc("POST /api/peers/{name}/rotate", s.ownerOnly(s.peerRotate))
 	mux.HandleFunc("GET /api/snapshot", s.snapshot)
@@ -36,12 +37,12 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/projects/{id}/import", s.importProject)
 	mux.HandleFunc("POST /api/projects/{id}/members", s.addProjectMember)
 	mux.HandleFunc("POST /api/projects/{id}/feedback", s.ownerOnly(s.projectFeedback))
-	mux.HandleFunc("PATCH /api/projects/{id}", s.ownerOnly(s.patchProject))
-	mux.HandleFunc("DELETE /api/projects/{id}", s.ownerOnly(s.deleteProject))
+	mux.HandleFunc("PATCH /api/projects/{id}", s.patchProject) // owner; the head may assign the lead (fleet.UpdateProject)
+	mux.HandleFunc("DELETE /api/projects/{id}", s.managers(s.deleteProject))
 
 	mux.HandleFunc("POST /api/agents", s.launch)
 	mux.HandleFunc("GET /api/agents/{id}", s.getAgent)
-	mux.HandleFunc("DELETE /api/agents/{id}", s.ownerOnly(s.removeAgent))
+	mux.HandleFunc("DELETE /api/agents/{id}", s.managers(s.removeAgent))
 	mux.HandleFunc("POST /api/agents/{id}/start", s.start) // resources.go: force / no_wait
 	mux.HandleFunc("POST /api/agents/{id}/stop", s.act((*fleet.Fleet).StopAgent))
 	mux.HandleFunc("POST /api/agents/{id}/done", s.act((*fleet.Fleet).MarkDone))
@@ -49,6 +50,8 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/agents/{id}/interrupt", s.act((*fleet.Fleet).InterruptAgent))
 	mux.HandleFunc("POST /api/agents/{id}/send", s.ownerOnly(s.send))
 	mux.HandleFunc("POST /api/agents/{id}/uploads", s.ownerOnly(s.upload)) // uploads.go
+	mux.HandleFunc("POST /api/agents/{id}/mail", s.send)
+	mux.HandleFunc("POST /api/agents/{id}/mail-uploads", s.upload)
 	mux.HandleFunc("GET /api/uploads/{id}", s.ownerOnly(s.getUpload))
 	mux.HandleFunc("GET /api/agents/{id}/timeline", s.timeline)
 	mux.HandleFunc("GET /api/agents/{id}/terminal", s.terminal)
@@ -60,12 +63,16 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/approvals", s.ask)
 	mux.HandleFunc("POST /api/approvals/{id}", s.ownerOnly(s.decide))
 	mux.HandleFunc("POST /api/approvals/{id}/seen", s.ownerOnly(s.seenApproval))
+	mux.HandleFunc("GET /api/approvals/mine", s.agentOnly(s.ownCards))
+	mux.HandleFunc("POST /api/approvals/close", s.closeCards)                   // owner or head: fleet.CloseOwnerCards
+	mux.HandleFunc("GET /api/debug/goroutines", s.ownerOnly(s.debugGoroutines)) // debug.go
+	mux.HandleFunc("POST /api/approvals/{id}/withdraw", s.agentOnly(s.withdrawOwnCard))
 
 	mux.HandleFunc("GET /api/messages", s.listMessages)
 	mux.HandleFunc("POST /api/messages", s.postMessage)
 
-	mux.HandleFunc("GET /api/policy", s.ownerOnly(s.getPolicy))
-	mux.HandleFunc("PUT /api/policy", s.ownerOnly(s.putPolicy))
+	mux.HandleFunc("GET /api/policy", s.managers(s.getPolicy))
+	mux.HandleFunc("PUT /api/policy", s.managers(s.putPolicy))
 
 	mux.HandleFunc("GET /api/config", s.ownerOnly(s.getConfig))
 	mux.HandleFunc("PUT /api/config", s.ownerOnly(s.putConfig))
@@ -73,12 +80,18 @@ func (s *Server) routes(mux *http.ServeMux) {
 
 	mux.HandleFunc("GET /api/events", s.events)
 	s.resourceRoutes(mux)
+	s.toolboxRoutes(mux) // toolbox.go: the Resources section
+	s.historyRoutes(mux) // reshistory.go
+	s.teamStatusRoutes(mux)
+	s.machineJoinRoutes(mux)
+	s.fleetLeadRoutes(mux)
 	s.safetyRoutes(mux)
 	s.gatePINRoutes(mux) // gatepin.go (#187)
 	s.chatRoutes(mux)
 	s.chatBoardRoutes(mux) // chatboards.go
 	s.p2pRoutes(mux)
 	s.updateRoutes(mux) // update.go
+	s.rulesRoutes(mux)  // rules.go
 	s.boardRoutes(mux)  // board.go
 	s.matrixRoutes(mux) // matrix.go
 	s.companionRoutes(mux)
@@ -88,6 +101,7 @@ func (s *Server) routes(mux *http.ServeMux) {
 	s.summaryRoutes(mux)   // summaries.go
 	s.whatsappRoutes(mux)  // whatsapp.go
 	s.accountRoutes(mux)   // accounts.go
+	s.claudeExtRoutes(mux) // claudeext.go
 	s.fleetHostRoutes(mux) // fleethosts.go
 
 	mux.HandleFunc("GET /api/harnesses", s.harnesses)
@@ -101,6 +115,19 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.Handle("/", uiHandler())
 }
 
+// managers wraps a handler that the owner and this machine's agents may call; the fleet decides
+// which agent (the head node-wide, a lead inside its own project: fleet/manage.go). A paired
+// machine, a device without the owner's session and Companion are refused here.
+func (s *Server) managers(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if c, _ := caller(r); !c.Owner && (c.AgentID == "" || c != fleet.AgentCaller(c.AgentID)) {
+			writeError(w, http.StatusForbidden, "only the owner, the head or a project's lead can do this")
+			return
+		}
+		h(w, r)
+	}
+}
+
 // ownerOnly wraps a handler that only the owner may call.
 func (s *Server) ownerOnly(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -112,7 +139,13 @@ func (s *Server) ownerOnly(h http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// watch is GET /api/watch: what the watch sees now and when the head was last told.
+func (s *Server) watch(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.f.Watch())
+}
+
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	// host and commit as the Python daemons answer them: a peer checks host against its name for
 	// the machine, and doctor compares commit.
 	v := map[string]any{"ok": true, "version": s.f.Version(), "machine": s.f.Machine(),
@@ -146,12 +179,36 @@ func (s *Server) snapshot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	c, _ := caller(r)
-	writeJSON(w, http.StatusOK, agentSnapshot(c, snap)) // whatsapp.go
+	writeJSON(w, http.StatusOK, withoutShelved(r, agentSnapshot(c, snap))) // whatsapp.go
+}
+
+// withoutShelved: with ?shelved=0 the snapshot leaves shelved agents out and says how many
+// (the dashboard: a fleet with hundreds of shelved agents made every snapshot half a megabyte,
+// and the dashboard hides them unless "Show all" is on). Without the parameter nothing changes:
+// the CLI, the agents' tools and older pages get every agent as before. Events about a shelved
+// agent still arrive, so one that is started appears by itself.
+func withoutShelved(r *http.Request, snap model.Snapshot) model.Snapshot {
+	if r.URL.Query().Get("shelved") != "0" {
+		return snap
+	}
+	kept, n := make([]model.Agent, 0, len(snap.Agents)), 0
+	for _, a := range snap.Agents {
+		if a.ShelvedAt != 0 {
+			n++
+			continue
+		}
+		kept = append(kept, a)
+	}
+	snap.Agents, snap.ShelvedOmitted = kept, &n
+	return snap
 }
 
 func (s *Server) shutdown(w http.ResponseWriter, r *http.Request) {
 	if s.stop == nil {
 		writeError(w, http.StatusNotImplemented, "this server cannot be shut down over the API")
+		return
+	}
+	if !s.reserveRestart(w, r) {
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]bool{"ok": true})
@@ -205,10 +262,10 @@ func (s *Server) patchProject(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) deleteProject(w http.ResponseWriter, r *http.Request) {
-	if !s.gateDeleteProject(w, r, r.PathValue("id")) {
+	c, _ := caller(r)
+	if c.Owner && !s.gateDeleteProject(w, r, r.PathValue("id")) {
 		return
 	}
-	c, _ := caller(r)
 	if err := s.f.DeleteProject(c, r.PathValue("id")); err != nil {
 		writeErr(w, err)
 		return
@@ -225,6 +282,13 @@ func (s *Server) launch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	c, _ := caller(r)
+	if req.ConversationID != "" && c.Peer != "" && relayedForOther(r) {
+		// A paired machine stands like the owner for agent operations whatever it relays for
+		// (servePeer). Handing an existing conversation to a new agent is different: only the
+		// machine itself or its operator may ask for it, never one of its agents or a device.
+		writeError(w, http.StatusForbidden, "a paired machine may launch into an existing conversation only for itself or its operator, not relayed for an agent or a device")
+		return
+	}
 	a, err := s.f.LaunchAgent(c, req)
 	if err != nil {
 		writeErr(w, err)
@@ -321,6 +385,10 @@ func (s *Server) sendKeys(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) send(w http.ResponseWriter, r *http.Request) {
+	c, ok := sessionMailCaller(w, r)
+	if !ok {
+		return
+	}
 	var req struct {
 		RetryID string   `json:"retry_id"`
 		Text    string   `json:"text"`
@@ -337,12 +405,21 @@ func (s *Server) send(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, err)
 			return
 		}
-		if text, err = s.attach(a.ID, text, req.Uploads); err != nil {
+		if text, err = s.attach(a.ID, c.AgentID, text, req.Uploads); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 	}
-	m, err := s.f.SendMessage(fleet.OwnerCaller, fleet.SendRequest{To: r.PathValue("id"), Body: text, ThreadID: req.Thread, RetryID: req.RetryID})
+	to := r.PathValue("id")
+	if !c.Owner {
+		a, err := s.f.Agent(to)
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		to = a.ID
+	}
+	m, err := s.f.SendMessage(c, fleet.SendRequest{To: to, Body: text, ThreadID: req.Thread, RetryID: req.RetryID})
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -390,6 +467,62 @@ func (s *Server) ask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, ap)
+}
+
+// closeCards retires owner cards without an answer (owner or head): no decision, no mail.
+func (s *Server) closeCards(w http.ResponseWriter, r *http.Request) {
+	var req fleet.CloseCardsRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	c, _ := caller(r)
+	out, err := s.f.CloseOwnerCards(c, req)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// agentApproval is an approval as an agent may see its own: without Input. A message waiting
+// for the owner's Allow keeps there the chat it goes to (chat_jid: a phone number), which the
+// agent never names or learns (person_message names a person, not a number).
+func agentApproval(ap model.Approval) model.Approval {
+	if ap.Kind == model.ApprovalWhatsApp {
+		ap.Input = nil
+	}
+	return ap
+}
+
+// ownCards: an agent's own owner cards that still wait for the owner.
+func (s *Server) ownCards(w http.ResponseWriter, r *http.Request) {
+	c, _ := caller(r)
+	list, err := s.f.OwnCards(c)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	for i := range list {
+		list[i] = agentApproval(list[i])
+	}
+	writeJSON(w, http.StatusOK, list)
+}
+
+// withdrawOwnCard: an agent takes back one of its own owner cards the owner has not answered.
+func (s *Server) withdrawOwnCard(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Reason string `json:"reason"`
+	}
+	if r.ContentLength != 0 && !decode(w, r, &req) {
+		return
+	}
+	c, _ := caller(r)
+	ap, err := s.f.WithdrawOwnCard(c, r.PathValue("id"), req.Reason)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, agentApproval(ap))
 }
 
 func (s *Server) decide(w http.ResponseWriter, r *http.Request) {
@@ -450,10 +583,10 @@ func (s *Server) putPolicy(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &p) {
 		return
 	}
-	if !s.gatePolicy(w, r, p) {
+	c, _ := caller(r)
+	if c.Owner && !s.gatePolicy(w, r, p) {
 		return
 	}
-	c, _ := caller(r)
 	out, err := s.f.SetPolicy(c, p)
 	if err != nil {
 		writeErr(w, err)

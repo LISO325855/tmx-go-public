@@ -233,10 +233,72 @@ func PinStopTree(pid int, expectedStart int64) (func() error, error) {
 	}, nil
 }
 
+// RegisteredRoot is the identity (PID and start time) recorded for a child this daemon
+// started (RegisterChild, RegisterHosted). ok is false for any other PID.
+func RegisteredRoot(pid int) (Proc, bool) {
+	children.Lock()
+	defer children.Unlock()
+	c, ok := children.roots[pid]
+	return c.proc, ok && c.proc.Start > 0
+}
+
 // RegisteredTree is a read-only snapshot anchored to a child this daemon started.
 func RegisteredTree(pid int) ([]Proc, error) {
 	tree, _, err := registeredTreeFor(pid, false)
 	return tree, err
+}
+
+// exactProtected is ProtectedProcess for KillExact: recovery services, the desktop and tmx
+// itself stay untouchable, but an interpreter (python) may be ended when the caller proves
+// the very process by PID and start time: agents' script workers are mostly interpreters.
+func exactProtected(name string) bool {
+	base := strings.ToLower(filepath.Base(strings.ReplaceAll(name, `\`, "/")))
+	base = strings.TrimSuffix(base, ".exe")
+	if base == "python" || base == "pythonw" {
+		return false
+	}
+	return ProtectedProcess(name) || hostImage(name)
+}
+
+// KillExact ends ONE process, identified by its PID together with its start time: a reused
+// PID is a different process and is refused (ErrNotChild). It is never a kill by name, and
+// never a tree: children of the process are left alone. The daemon, its ancestors, session
+// hosts and protected programs are refused (ErrProtected). A process that is already gone
+// is not an error. The caller decides whose process it is; this only proves which one.
+func KillExact(p Proc) error {
+	if p.PID <= 0 || p.Start <= 0 {
+		return ErrNotChild
+	}
+	rows, err := Procs()
+	if err != nil {
+		return err
+	}
+	cur, ok := find(rows, p.PID)
+	if !ok {
+		return nil
+	}
+	if cur.Start != p.Start {
+		return ErrNotChild
+	}
+	if exactProtected(cur.Name) {
+		return ErrProtected
+	}
+	for pid, hops := os.Getpid(), 0; pid > 0 && hops < 64; hops++ { // never the daemon or what it runs under
+		if pid == p.PID {
+			return ErrProtected
+		}
+		me, ok := find(rows, pid)
+		if !ok || me.PPID == pid {
+			break
+		}
+		pid = me.PPID
+	}
+	h, err := openIdentity(cur)
+	if err != nil {
+		return err
+	}
+	defer h.close()
+	return h.kill()
 }
 
 // KillStarted is for an explicit Stop/cancellation. The original exec handle

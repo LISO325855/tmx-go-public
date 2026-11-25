@@ -24,6 +24,29 @@ const (
 	waBo   = "41792222222@s.whatsapp.net"
 )
 
+func TestWhatsAppDownloadOwnerOnly(t *testing.T) {
+	d := apitest.New(t)
+	d.EnableWhatsApp(t)
+	d.LinkWhatsApp(t)
+	waSeed(d)
+	owner := client{t: t, base: d.URL, token: d.OwnerToken}
+	head := client{t: t, base: d.URL, token: d.AgentToken(t, "head")}
+	path := "/api/whatsapp/media/" + url.PathEscape(waAnna) + "/A2/download"
+	if status := head.do("POST", path, nil, nil); status != http.StatusForbidden {
+		t.Fatalf("agent download: %d", status)
+	}
+	var out struct {
+		Path string
+		Size int64
+	}
+	if status := owner.do("POST", path, nil, &out); status != http.StatusOK || out.Path == "" || out.Size != 5 {
+		t.Fatalf("owner download: %d %+v", status, out)
+	}
+	if status := owner.do("POST", "/api/whatsapp/media/"+url.PathEscape(waAnna)+"/missing/download", nil, nil); status != http.StatusNotFound {
+		t.Fatalf("missing: %d", status)
+	}
+}
+
 func waSeed(d *apitest.Daemon) {
 	t0 := time.Now().Add(-time.Hour).UnixMilli()
 	photo := whatsapp.Incoming{Msg: model.WaMessage{ID: "A2", ChatJID: waAnna, SenderJID: waAnna, At: t0 + 2, Type: model.WaImage,
@@ -39,6 +62,11 @@ func waSeed(d *apitest.Daemon) {
 		},
 		Progress: 100,
 	})
+	// The owner opened both chats to the head (per-chat access, whatsapp/access.go).
+	access := map[string]model.WaChatAccess{"head": {Read: []string{waAnna, waBo}}}
+	if _, err := d.WhatsApp.SetSettings(whatsapp.SettingsPatch{ChatAccess: &access}); err != nil {
+		panic(err)
+	}
 }
 
 // socket reads bus events of one caller.

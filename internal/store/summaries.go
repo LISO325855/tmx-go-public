@@ -13,18 +13,20 @@ import (
 // JSON arrays. The recording's row and files are the recorder's; this is only what Claude wrote.
 
 const summaryCols = `recording_id, state, model, summary, key_points, decisions, action_items, chapters, transcripts,
-	frames, parts, note, error, requested, created_at, started_at, finished_at, updated_at`
+	frames, parts, note, error, requested, created_at, started_at, finished_at, updated_at, deadline_at, awaiting_worker, made_here`
 
 func scanSummary(r scanner) (model.RecordingSummary, error) {
 	var x model.RecordingSummary
 	var kp, dec, act, ch string
-	var req int
+	var req, awaiting int
 	err := r.Scan(&x.RecordingID, &x.State, &x.Model, &x.Summary, &kp, &dec, &act, &ch, &x.Transcripts,
-		&x.Frames, &x.Parts, &x.Note, &x.Error, &req, &x.CreatedAt, &x.StartedAt, &x.FinishedAt, &x.UpdatedAt)
+		&x.Frames, &x.Parts, &x.Note, &x.Error, &req, &x.CreatedAt, &x.StartedAt, &x.FinishedAt, &x.UpdatedAt, &x.DeadlineAt,
+		&awaiting, &x.MadeHere)
 	if err != nil {
 		return x, err
 	}
 	x.Requested = req != 0
+	x.AwaitingWorker = awaiting != 0
 	_ = json.Unmarshal([]byte(kp), &x.KeyPoints)
 	_ = json.Unmarshal([]byte(dec), &x.Decisions)
 	_ = json.Unmarshal([]byte(act), &x.ActionItems)
@@ -60,15 +62,16 @@ func jsonText(v any) string {
 // PutSummary inserts or replaces a recording's summary.
 func (s *Store) PutSummary(x model.RecordingSummary) error {
 	FillSummaryLists(&x)
-	_, err := s.db.Exec(`INSERT INTO recording_summaries (`+summaryCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+	_, err := s.db.Exec(`INSERT INTO recording_summaries (`+summaryCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(recording_id) DO UPDATE SET state = excluded.state, model = excluded.model, summary = excluded.summary,
 		key_points = excluded.key_points, decisions = excluded.decisions, action_items = excluded.action_items,
 		chapters = excluded.chapters, transcripts = excluded.transcripts, frames = excluded.frames, parts = excluded.parts,
 		note = excluded.note, error = excluded.error, requested = excluded.requested, started_at = excluded.started_at,
-		finished_at = excluded.finished_at, updated_at = excluded.updated_at`,
+		finished_at = excluded.finished_at, updated_at = excluded.updated_at, deadline_at = excluded.deadline_at,
+		awaiting_worker = excluded.awaiting_worker, made_here = excluded.made_here`,
 		x.RecordingID, string(x.State), x.Model, x.Summary, jsonText(x.KeyPoints), jsonText(x.Decisions), jsonText(x.ActionItems),
 		jsonText(x.Chapters), x.Transcripts, x.Frames, x.Parts, x.Note, x.Error, boolInt(x.Requested), x.CreatedAt, x.StartedAt,
-		x.FinishedAt, x.UpdatedAt)
+		x.FinishedAt, x.UpdatedAt, x.DeadlineAt, boolInt(x.AwaitingWorker), x.MadeHere)
 	return err
 }
 

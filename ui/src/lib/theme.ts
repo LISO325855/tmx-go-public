@@ -1,6 +1,7 @@
 // Theme: system (default), light or dark. The class on <html> is set before first paint by the
 // inline script in index.html; this keeps it in sync afterwards.
 import { useSyncExternalStore } from "react";
+import { pageBackground } from "./install-colors";
 
 export type ThemePref = "system" | "light" | "dark";
 const KEY = "tmx.theme";
@@ -27,6 +28,10 @@ function apply() {
   const dark = resolved() === "dark";
   document.documentElement.classList.toggle("dark", dark);
   document.documentElement.style.colorScheme = dark ? "dark" : "light";
+  // The browser's bar and the first-paint colour follow the theme in force, also one chosen here
+  // against the system's (index.html sets the same before the first paint).
+  document.documentElement.style.backgroundColor = pageBackground(dark);
+  document.querySelectorAll('meta[name="theme-color"]').forEach((m) => m.setAttribute("content", pageBackground(dark)));
   listeners.forEach((l) => l());
 }
 

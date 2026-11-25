@@ -9,7 +9,9 @@ import (
 	"github.com/blackcode-ch/tmx-go/internal/model"
 )
 
-func TestCompanionSendTotalBudget(t *testing.T) {
+// Companion's messages to agents have no budget per ten minutes (17 Nov); a retry still gets
+// its first receipt back.
+func TestCompanionSendHasNoBudget(t *testing.T) {
 	e := newUnguardedEnv(t)
 	f := e.started()
 	project := workerProject(t, f)
@@ -32,8 +34,8 @@ func TestCompanionSendTotalBudget(t *testing.T) {
 			first = m
 		}
 	}
-	if _, err := f.CompanionSend(SendRequest{To: "second", Body: "over budget"}); KindOf(err) != KindTooMany {
-		t.Fatalf("total budget: %v", err)
+	if _, err := f.CompanionSend(SendRequest{To: "second", Body: "beyond the former budget"}); err != nil {
+		t.Fatalf("beyond the former budget: %v", err)
 	}
 	if m, err := f.CompanionSend(SendRequest{To: "first", Body: "hello", RetryID: "0"}); err != nil || m.ID != first.ID {
 		t.Fatalf("receipt at budget: %+v %v", m, err)

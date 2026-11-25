@@ -16,8 +16,9 @@ func TestProjectSectionTool(t *testing.T) {
 	if !strings.Contains(out, "Ready") || !strings.Contains(out, "Guide") {
 		t.Fatal(out)
 	}
-	if _, bad := call(t, lead, "announce_set", map[string]any{"project": "daily-report", "status": "1\n2\n3\n4"}); !bad {
-		t.Fatal("accepted fourth line")
+	// A status takes any number of lines (three at most until 17 Nov).
+	if out := mustOK(t, lead, "announce_set", map[string]any{"project": "daily-report", "status": "1\n2\n3\n4"}); !strings.Contains(out, "4") {
+		t.Fatal(out)
 	}
 	// Earlier names (private build) are the same tool.
 	for _, old := range LegacyToolNames["announce_set"] {

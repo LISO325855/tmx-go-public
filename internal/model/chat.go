@@ -171,6 +171,7 @@ const (
 	EvChatMessage    = "chat.message"    // data: ChatMessage (new or changed state)
 	EvChatUpdated    = "chat.updated"    // data: Chat
 	EvChatRemoved    = "chat.removed"    // data: {id}
+	EvTeamUpdated    = "team.updated"    // data: {chat_id}: a group's team status changed (chat/team.go)
 	EvContactUpdated = "contact.updated" // data: Contact
 	EvContactRemoved = "contact.removed" // data: {peer_id}
 )

@@ -15,6 +15,8 @@ func (s *Server) matrixRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /api/matrix/links/{id}", s.matrixDetach)
 	mux.HandleFunc("POST /api/matrix/threads", s.matrixNew)              // owner, head, a lead under its project
 	mux.HandleFunc("POST /api/matrix/threads/{id}/state", s.matrixState) // owner, head, the thread's owner or project lead
+	// the owner acting on a Board row (matrix_owner.go)
+	mux.HandleFunc("POST /api/matrix/threads/{id}/owner", s.ownerOnly(s.matrixOwnerAct))
 	mux.HandleFunc("GET /api/matrix/mine", gzipped(s.matrixMine))
 	mux.HandleFunc("GET /api/matrix/pivot", gzipped(s.matrixPivot)) // ?axis=
 }

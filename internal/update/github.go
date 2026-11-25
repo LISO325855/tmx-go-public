@@ -8,6 +8,8 @@ import (
 	"io"
 	"net/http"
 	"strings"
+
+	"github.com/blackcode-ch/tmx-go/internal/config"
 )
 
 // GitHub releases are filtered to the fleet namespace before version comparison.
@@ -104,8 +106,10 @@ func (u *Updater) findRelease(ctx context.Context, repo, channel, want string) (
 		}
 		for _, r := range releases {
 			v, ok := ParseVersion(r.TagName)
-			// An rc tag is a prerelease whatever its release says: stable never installs one.
-			if !ok || r.Draft || ((r.Prerelease || v.Prerelease()) && channel != "latest") {
+			// Public numbered fleet builds use GitHub's prerelease flag for distribution.
+			// Stable accepts those builds, but still excludes release candidates.
+			publicBuild := repo == config.PublicUpdateRepo && v.Ahead > 0 && !v.Prerelease()
+			if !ok || r.Draft || ((v.Prerelease() || (r.Prerelease && !publicBuild)) && channel != "latest") {
 				continue
 			}
 			if want != "" && r.TagName != want {

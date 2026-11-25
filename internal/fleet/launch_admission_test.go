@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/blackcode-ch/tmx-go/internal/guard"
 	"github.com/blackcode-ch/tmx-go/internal/model"
 	"github.com/blackcode-ch/tmx-go/internal/runner"
 )
@@ -32,13 +33,11 @@ func TestOwnerShellSurvivesAgentAdmissionFailure(t *testing.T) {
 			if e.term.Last(sh.ID).Spec.SettingsPath != "" {
 				t.Fatal("agent guard installed on owner shell")
 			}
-			for _, enabled := range []bool{false, true} {
-				f.mu.Lock()
-				f.safetyLocked().settings.Enabled = enabled
-				f.mu.Unlock()
-				if _, err := f.RestartAgent(OwnerCaller, sh.ID); err != nil {
-					t.Fatalf("owner shell restart guard=%v: %v", enabled, err)
-				}
+			if _, err := f.RestartAgent(OwnerCaller, sh.ID); err != nil {
+				t.Fatalf("owner shell restart: %v", err)
+			}
+			if guardWarnings(t, f, sh.ID) != 0 {
+				t.Fatal("the owner's shell got a guard warning")
 			}
 			if _, err := f.LaunchAgent(AgentCaller(head.ID), LaunchRequest{Name: "agent-shell", Harness: model.HarnessShell}); KindOf(err) != KindForbidden {
 				t.Fatalf("agent launched shell: %v", err)
@@ -134,7 +133,7 @@ func TestLaunchAdmissionEntryPoints(t *testing.T) {
 						return
 					case "spawn":
 						f.mu.Lock()
-						_, err = f.specLocked(r)
+						_, err = f.specLocked(r, extServers{})
 						f.mu.Unlock()
 					}
 					f.mu.Lock()
@@ -161,26 +160,67 @@ func TestLaunchAdmissionEntryPoints(t *testing.T) {
 	}
 }
 
-func TestGuardUnsupportedHarnessFailsClosed(t *testing.T) {
-	e := newEnv(t)
-	f := e.fleet()
-	for _, h := range []model.Harness{model.HarnessCodex, model.HarnessOpenCode, model.HarnessPi} {
-		t.Run(string(h), func(t *testing.T) {
-			r := &agentRec{a: model.Agent{Harness: h, Level: model.LevelWorker, Cwd: t.TempDir()}}
-			f.mu.Lock()
-			defer f.mu.Unlock()
-			var spec runner.Spec
-			err := f.guardSpecLocked(r, &spec)
-			if h == model.HarnessCodex && launchGOOS == "windows" {
-				if err != nil || spec.CodexGuardHome == "" || spec.CodexGuardExecutable == "" {
-					t.Fatalf("missing required runner preparation: %v", err)
+// Agents always start (the owner, 17 Nov): a harness the guard has no adapter for is not refused.
+// It starts with an error row in its timeline; Codex on Windows gets its parity shims instead.
+func TestUnguardedHarnessStartsWithWarning(t *testing.T) {
+	old := launchGOOS
+	t.Cleanup(func() { launchGOOS = old })
+	for _, goos := range []string{"windows", "linux", "darwin"} {
+		for _, h := range []model.Harness{model.HarnessCodex, model.HarnessOpenCode, model.HarnessPi, "agy"} {
+			t.Run(goos+"/"+string(h), func(t *testing.T) {
+				launchGOOS = goos
+				e := newEnv(t)
+				f := e.fleet()
+				f.mu.Lock()
+				defer f.mu.Unlock()
+				if err := f.launchAdmissionLocked(model.Agent{Harness: h, Level: model.LevelWorker, Cwd: t.TempDir()}); err != nil {
+					t.Fatalf("launch refused: %v", err)
 				}
-				return
-			}
-			if err == nil {
-				t.Fatal("unsupported guard admitted")
-			}
-		})
+				r := &agentRec{a: model.Agent{ID: "ag-" + string(h), Name: "w-" + string(h), Harness: h, Level: model.LevelWorker, Cwd: t.TempDir()}}
+				f.agents[r.a.ID] = r
+				var spec runner.Spec
+				if err := f.guardSpecLocked(r, &spec); err != nil {
+					t.Fatalf("guard setup refused the launch: %v", err)
+				}
+				rows, _ := f.st.Timeline(r.a.ID, 0, 10)
+				if h == model.HarnessCodex && goos == "windows" {
+					if spec.CodexGuardHome == "" || spec.CodexGuardExecutable == "" || len(rows) != 0 {
+						t.Fatalf("Codex parity guard not prepared (or warned anyway): %+v, %d rows", spec, len(rows))
+					}
+					return
+				}
+				if spec.CodexGuardHome != "" || spec.SettingsPath != "" {
+					t.Fatalf("a guard was installed for %s on %s", h, goos)
+				}
+				if len(rows) != 1 || rows[0].Kind != model.EntryError || !rows[0].IsError || rows[0].Meta["guard_warning"] == nil ||
+					!strings.Contains(rows[0].Text, "runs without the command guard") {
+					t.Fatalf("no guard warning in the timeline: %+v", rows)
+				}
+			})
+		}
+	}
+}
+
+// The same through the public launch path: the agent runs, its timeline carries the warning.
+func TestUnguardedHarnessLaunches(t *testing.T) {
+	e := newUnguardedEnv(t)
+	f := e.started()
+	proj := workerProject(t, f)
+	w, err := f.LaunchAgent(OwnerCaller, LaunchRequest{ProjectID: proj, Name: "cx", Harness: model.HarnessCodex})
+	if err != nil {
+		t.Fatalf("codex launch refused: %v", err)
+	}
+	if e.chat.Last(w.ID) == nil && e.term.Last(w.ID) == nil {
+		t.Fatal("no process was started")
+	}
+	if a := mustAgent(t, f, "cx"); a.State == model.StateError || a.Error != "" {
+		t.Fatalf("started in error: %+v", a)
+	}
+	if n := guardWarnings(t, f, w.ID); n != 1 {
+		t.Fatalf("%d guard warnings, want 1", n)
+	}
+	if text := lastGuardWarning(t, f, w.ID); !strings.Contains(text, "Codex") {
+		t.Fatalf("warning: %q", text)
 	}
 }
 
@@ -215,43 +255,63 @@ func TestAutomaticRestorationAfterAdmissionChanges(t *testing.T) {
 	}
 }
 
-func TestWindowsLaunchPolicyCannotBeOptedOut(t *testing.T) {
+// No setting, and no leftover of the removed master switch, decides whether an agent starts:
+// on Windows every harness is admitted, guarded or not.
+func TestWindowsLaunchNeedsNoMasterSwitch(t *testing.T) {
 	old := launchGOOS
 	launchGOOS = "windows"
 	t.Cleanup(func() { launchGOOS = old })
 	e := newEnv(t)
-	f := e.fleet()
-	for _, enabled := range []bool{true, false} {
-		f.safetyLocked().settings.Enabled = enabled
+	off := false
+	for name, g := range map[string]*guard.Settings{
+		"fresh install":          nil,
+		"defaults":               {},
+		"legacy switch off":      {LegacyEnabled: &off},
+		"legacy off for workers": {LegacyOffFor: []string{"worker"}, DefaultsVersion: 1},
+	} {
+		e.guard = g
+		f := e.fleet()
 		for _, h := range []model.Harness{model.HarnessClaude, model.HarnessCodex, model.HarnessOpenCode, model.HarnessPi} {
 			a := model.Agent{Harness: h, Level: model.LevelWorker, Cwd: t.TempDir()}
+			f.mu.Lock()
 			err := f.launchAdmissionLocked(a)
-			want := enabled && (h == model.HarnessClaude || h == model.HarnessCodex)
-			if (err == nil) != want {
-				t.Fatalf("harness=%s guard=%v: %v", h, enabled, err)
+			warn := f.guardWarningLocked(a)
+			f.mu.Unlock()
+			if err != nil {
+				t.Fatalf("%s: harness %s refused: %v", name, h, err)
+			}
+			guarded := h == model.HarnessClaude || h == model.HarnessCodex
+			if (warn == nil) != guarded {
+				t.Fatalf("%s: harness %s guarded=%v, warning %+v", name, h, guarded, warn)
 			}
 		}
 	}
 }
 
-func TestWindowsCodexParityRefusesUnprotectedModes(t *testing.T) {
+// Codex on Windows is guarded only in the modes its parity shims cover; the others start too,
+// each with a warning that says which mode it is.
+func TestWindowsCodexUnprotectedModesWarn(t *testing.T) {
 	old := launchGOOS
 	launchGOOS = "windows"
 	t.Cleanup(func() { launchGOOS = old })
 	e := newEnv(t)
 	f := e.fleet()
-	for _, a := range []model.Agent{
-		{Harness: model.HarnessCodex, Level: model.LevelWorker, Cwd: t.TempDir(), CodexFullAccess: true},
-		{Harness: model.HarnessCodex, Level: model.LevelWorker, Cwd: t.TempDir(), Profile: "reviewer"},
-		{Harness: "agy", Level: model.LevelWorker, Cwd: t.TempDir()},
-		{Harness: "antigravity", Level: model.LevelWorker, Cwd: t.TempDir()},
-	} {
-		if err := f.launchAdmissionLocked(a); err == nil {
-			t.Fatalf("unguarded launch admitted: harness %s profile %s full %v", a.Harness, a.Profile, a.CodexFullAccess)
+	check := func(a model.Agent, want string) {
+		t.Helper()
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if err := f.launchAdmissionLocked(a); err != nil {
+			t.Fatalf("launch refused: harness %s profile %s full %v: %v", a.Harness, a.Profile, a.CodexFullAccess, err)
+		}
+		warn := f.guardWarningLocked(a)
+		if warn == nil || warn.Reason != guardWarnHarness || !strings.Contains(warn.Text, want) {
+			t.Fatalf("harness %s profile %s full %v: warning %+v, want %q", a.Harness, a.Profile, a.CodexFullAccess, warn, want)
 		}
 	}
+	check(model.Agent{Harness: model.HarnessCodex, Level: model.LevelWorker, Cwd: t.TempDir(), CodexFullAccess: true}, "full-access")
+	check(model.Agent{Harness: model.HarnessCodex, Level: model.LevelWorker, Cwd: t.TempDir(), Profile: "reviewer"}, "read-only")
+	check(model.Agent{Harness: "agy", Level: model.LevelWorker, Cwd: t.TempDir()}, "agy")
+	check(model.Agent{Harness: "antigravity", Level: model.LevelWorker, Cwd: t.TempDir()}, "antigravity")
 	f.opts.Executable = ""
-	if err := f.launchAdmissionLocked(model.Agent{Harness: model.HarnessCodex, Level: model.LevelWorker, Cwd: t.TempDir()}); err == nil {
-		t.Fatal("missing shim executable admitted")
-	}
+	check(model.Agent{Harness: model.HarnessCodex, Level: model.LevelWorker, Cwd: t.TempDir()}, "could not be set up")
 }

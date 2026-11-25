@@ -74,7 +74,14 @@ export const matrixApi = {
   },
   pivot: (axis: LinkAxis) => t().request<PivotRow[]>("GET", `/api/matrix/pivot?axis=${enc(axis)}`),
   create: (b: NewThreadBody) => t().request<Thread>("POST", "/api/matrix/threads", b),
-  setState: (id: string, b: { status?: string; lifecycle?: string; why?: string }) =>
+  /** the owner acting on a Board row: an event of his, owner mail to the thread's agent, and the
+   *  status the act implies (park = paused, not_relevant = archived); internal/fleet/matrix_owner.go */
+  ownerAct: (id: string, b: { act: string; note?: string }) =>
+    t().request<{ thread: Thread; mailed_to?: string; mail_error?: string }>("POST", `/api/matrix/threads/${enc(id)}/owner`, b),
+  /** the owner's priority order, the top first (the Board's order; agents work top-first) */
+  setOrder: (ids: string[]) => t().request<void>("PUT", "/api/board/order", { ids }),
+  /** pct (0-100, with why = where it stands) and blocker (what it waits for; "" clears it): the Board's fields */
+  setState: (id: string, b: { status?: string; lifecycle?: string; why?: string; pct?: number; blocker?: string }) =>
     t().request<Thread>("POST", `/api/matrix/threads/${enc(id)}/state`, b),
   attach: (b: { thread: string; axis: LinkAxis; ref: string; role?: string; label?: string; why?: string }) =>
     t().request<ThreadLink>("POST", "/api/matrix/links", b),

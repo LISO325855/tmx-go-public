@@ -10,9 +10,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/blackcode-ch/tmx-go/internal/claudeext"
 	"github.com/blackcode-ch/tmx-go/internal/config"
 	"github.com/blackcode-ch/tmx-go/internal/guard"
 	"github.com/blackcode-ch/tmx-go/internal/model"
+	"github.com/blackcode-ch/tmx-go/internal/rules"
 	"github.com/blackcode-ch/tmx-go/internal/runner"
 	"github.com/blackcode-ch/tmx-go/internal/runner/fake"
 	"github.com/blackcode-ch/tmx-go/internal/store"
@@ -34,21 +36,34 @@ type env struct {
 	bypass    *bool            // Options.AgentBypass (nil = the default, on)
 	teammates []model.Teammate // Options.Teammates (nil = none)
 	accounts  AccountHomes
+	ext       *claudeext.Service // Options.ClaudeExt (nil = none)
 	// hostExe and termRunner: session hosts (hosting_test.go); nil/"" = none, e.term.
 	hostExe    string
 	termRunner runner.Runner
 	chatRunner runner.Runner
+	uiProfile  string         // Options.UIProfile ("" = the default dashboard)
+	rules      *rules.Service // Options.Rules (nil = no rules source)
 }
 
-// Explicit owner opt-out for tests of harness behavior unrelated to the guard.
-// Production defaults and admission tests continue to use the enabled guard.
+// For tests of harness behavior unrelated to the guard: off Windows no harness but Claude has
+// a guard adapter, so these agents start unguarded (with the timeline warning). There is no
+// switch to turn the guard off.
 func newUnguardedEnv(t *testing.T) *env {
 	old := launchGOOS
 	launchGOOS = "linux" // fake runner: test harness semantics, not Windows host capability
 	t.Cleanup(func() { launchGOOS = old })
-	e := newEnv(t)
-	e.guard = &guard.Settings{Enabled: false}
-	return e
+	return newEnv(t)
+}
+
+// holdRules sets guard rules to Held for me, as the owner would in Settings: no rule is held
+// by default (defaults version 2), so a test of the hold flow chooses it first.
+func holdRules(t *testing.T, f *Fleet, rules ...string) {
+	t.Helper()
+	for _, r := range rules {
+		if _, err := f.SetRuleState(OwnerCaller, r, guard.Hold); err != nil {
+			t.Fatalf("hold %s: %v", r, err)
+		}
+	}
 }
 
 func newEnv(t *testing.T) *env {
@@ -87,6 +102,9 @@ func (e *env) fleet() *Fleet {
 		AgentBypass: e.bypass,
 		Teammates:   e.teammates,
 		Accounts:    e.accounts,
+		ClaudeExt:   e.ext,
+		UIProfile:   e.uiProfile,
+		Rules:       e.rules,
 	})
 	if err != nil {
 		e.t.Fatal(err)
@@ -350,7 +368,7 @@ func TestLaunchPolicy(t *testing.T) {
 	if w.Level != model.LevelWorker || w.Model != sonnet || w.ParentID != lead.ID || w.ProjectID != p.ID || w.Cwd != p.Folder {
 		t.Fatalf("worker: %+v", w)
 	}
-	if s := e.chat.Last(w.ID).Sent(); len(s) != 1 || s[0] != "do it" {
+	if s := e.chat.Last(w.ID).Sent(); len(s) != 1 || s[0] != "[message from alpha-lead (lead)]\n│ do it" {
 		t.Fatalf("worker prompt: %q", s)
 	}
 	cases := []struct {
@@ -419,8 +437,19 @@ func TestActPermissions(t *testing.T) {
 	if err != nil || a.State != model.StateStarting || a.Desired != "running" {
 		t.Fatalf("restart: %+v %v", a, err)
 	}
-	if err := f.RemoveAgent(lc, "w1"); KindOf(err) != KindForbidden {
-		t.Fatal("lead removed an agent")
+	// Removing an agent: a worker nobody, a lead not the head, a lead an agent of its own
+	// project (17 Nov: it was the owner's alone).
+	if err := f.RemoveAgent(wc, "alpha-lead"); KindOf(err) != KindForbidden {
+		t.Fatalf("a worker removed its lead: %v", err)
+	}
+	if err := f.RemoveAgent(lc, "head"); KindOf(err) != KindForbidden {
+		t.Fatalf("a lead removed the head: %v", err)
+	}
+	if err := f.RemoveAgent(lc, "alpha-lead"); KindOf(err) != KindForbidden {
+		t.Fatalf("a lead removed itself: %v", err)
+	}
+	if err := f.RemoveAgent(lc, "w1"); err != nil {
+		t.Fatalf("a lead removing a worker of its own project: %v", err)
 	}
 	if err := f.RemoveAgent(OwnerCaller, "head"); KindOf(err) != KindForbidden {
 		t.Fatal("head removed")
@@ -593,17 +622,22 @@ func TestMailBatchingAtIdle(t *testing.T) {
 func TestOwnerMailImmediateAndQueuedWhenStopped(t *testing.T) {
 	e := newEnv(t)
 	f := e.started()
+	// Both immediate and restart/queued paths must keep monitor state out of owner mail.
+	f.watch.board.report(model.WatchItem{Key: "test", Status: "low", Text: "watch problem"})
+	f.SetFleetState(func() FleetStateBlock {
+		return FleetStateBlock{From: "hosta", At: time.Now().UnixMilli(), Lines: []string{"hosta: sample"}}
+	})
+
 	head := mustAgent(t, f, "head")
 	hp := e.chat.Last(head.ID)
 	hp.State(model.StateWorking)
 	waitState(t, f, "head", model.StateWorking)
 	m, err := f.SendOwner("head", "hello", "")
-	if err != nil || m.State != model.MsgDelivered {
+	if err != nil || m.State != model.MsgQueued || hp.Interrupts() != 1 {
 		t.Fatalf("%+v %v", m, err)
 	}
-	if s := hp.Sent(); len(s) != 1 || s[0] != "hello" {
-		t.Fatalf("owner text: %q", s)
-	}
+	hp.State(model.StateIdle)
+	eventually(t, "owner turn after interrupt", func() bool { return lastSent(hp) == "hello" })
 	f.StopAgent(OwnerCaller, "head")
 	m2, _ := f.SendOwner("head", "while stopped", "")
 	if m2.State != model.MsgQueued {
@@ -617,7 +651,7 @@ func TestOwnerMailImmediateAndQueuedWhenStopped(t *testing.T) {
 	np.State(model.StateIdle) // ready (claude answered initialize)
 	eventually(t, "queued owner mail on start", func() bool {
 		s := np.Sent()
-		return len(s) == 1 && s[0] == "[message from owner] while stopped"
+		return len(s) == 1 && s[0] == "while stopped"
 	})
 }
 
@@ -640,8 +674,9 @@ func TestMailLimits(t *testing.T) {
 			t.Fatalf("msg %d: %v", i, err)
 		}
 	}
-	if _, err := f.SendMessage(hc, SendRequest{To: "alpha-lead", Body: "x"}); KindOf(err) != KindTooMany {
-		t.Fatalf("rate limit: %v", err)
+	// No rate and no queue limit (17 Nov): one more, to a busy receiver with all of them waiting.
+	if _, err := f.SendMessage(hc, SendRequest{To: "alpha-lead", Body: "x"}); err != nil {
+		t.Fatalf("a message beyond the former limits was refused: %v", err)
 	}
 }
 
@@ -695,8 +730,9 @@ func TestDeleteProjectKeepsFolder(t *testing.T) {
 	f := e.started()
 	p, _ := f.CreateProject(OwnerCaller, ProjectRequest{Name: "alpha"})
 	f.LaunchAgent(OwnerCaller, LaunchRequest{Name: "w1", ProjectID: p.ID})
-	if err := f.DeleteProject(callerFor(t, f, e.chat, mustAgent(t, f, "head").ID), p.ID); KindOf(err) != KindForbidden {
-		t.Fatal("head deleted a project")
+	// Deleting a project: the owner or the head (17 Nov), not its lead (it would remove itself).
+	if err := f.DeleteProject(AgentCaller(mustAgent(t, f, "alpha-lead").ID), p.ID); KindOf(err) != KindForbidden {
+		t.Fatalf("a lead deleted its project: %v", err)
 	}
 	if err := f.DeleteProject(OwnerCaller, "alpha"); err != nil {
 		t.Fatal(err)
@@ -845,5 +881,52 @@ func TestSlugify(t *testing.T) {
 	}
 	if got := Slugify(strings.Repeat("a", 60)); len(got) != maxSlug {
 		t.Errorf("long slug %d", len(got))
+	}
+}
+
+type shutdownStalledProcess struct {
+	runner.Process
+	release <-chan struct{}
+	entered chan<- struct{}
+}
+
+func (p shutdownStalledProcess) Stop(ctx context.Context) error {
+	close(p.entered)
+	<-p.release
+	return p.Process.Stop(ctx)
+}
+
+func TestFleetCloseHonorsDeadlineWithBlockedRunner(t *testing.T) {
+	e := newEnv(t)
+	f := e.started()
+	id := f.HeadID()
+	release, entered := make(chan struct{}), make(chan struct{})
+	defer func() {
+		close(release)
+		select {
+		case <-entered:
+		case <-time.After(time.Second):
+		}
+		f.wg.Wait()
+	}()
+	f.mu.Lock()
+	r := f.agents[id]
+	if r == nil || r.proc == nil {
+		f.mu.Unlock()
+		t.Fatal("fixture head has no running process")
+	}
+	r.proc = shutdownStalledProcess{Process: r.proc, release: release, entered: entered}
+	f.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+	defer cancel()
+	err := f.Close(ctx)
+	if err != context.DeadlineExceeded {
+		t.Fatalf("close = %v, want deadline", err)
+	}
+	select {
+	case <-entered:
+	default:
+		t.Fatal("shutdown did not attempt to stop the runner")
 	}
 }

@@ -3,7 +3,6 @@ package fleet
 import (
 	"runtime"
 
-	"github.com/blackcode-ch/tmx-go/internal/agentpolicy"
 	"github.com/blackcode-ch/tmx-go/internal/harness"
 	"github.com/blackcode-ch/tmx-go/internal/model"
 )
@@ -14,8 +13,10 @@ var launchGOOS = runtime.GOOS
 // launchAdmissionLocked is shared by creation, adoption, restart, resume, and
 // the final spawn path. Keep it free of filesystem/store/process mutations.
 func (f *Fleet) launchAdmissionLocked(a model.Agent) error {
-	// Shell registration and control are owner-only. It is the owner's terminal,
-	// not an agent, and must remain usable to recover from agent policy failures.
+	// A shell is exempt here: the owner's terminal must remain usable to recover from agent
+	// policy failures. A shell an agent launches or starts is admitted where the agent acts
+	// (agentShellAdmissionLocked): this function is also the daemon's own start path, which
+	// cannot tell whose shell it is.
 	if a.Harness == model.HarnessShell {
 		return nil
 	}
@@ -25,32 +26,57 @@ func (f *Fleet) launchAdmissionLocked(a model.Agent) error {
 	if err := harness.ValidateLaunchCwd(a.Cwd); err != nil {
 		return errf(KindForbidden, "%s", err)
 	}
-	if err := agentpolicy.CheckLaunch(agentpolicy.LaunchPolicy{GOOS: launchGOOS, Harness: string(a.Harness), CodexParityGuard: f.codexParityEligibleLocked(a)}); err != nil {
-		return errf(KindForbidden, "%s", err)
-	}
-	return f.guardAdmissionLocked(a)
+	// The command guard never refuses a launch (the owner, 17 Nov): an agent the guard cannot
+	// check starts with a warning in its timeline (guardWarningLocked, written by
+	// guardSpecLocked). What refuses here is the machine's own safety: an elevated daemon and
+	// an unsafe working folder.
+	return nil
 }
 
-func (f *Fleet) guardAdmissionLocked(a model.Agent) error {
+// guardWarning says why the command guard does not check an agent.
+type guardWarning struct {
+	Reason string `json:"reason"`          // guardWarnHarness | guardWarnHooksDisabled
+	Where  string `json:"where,omitempty"` // the settings file that sets disableAllHooks
+	Text   string `json:"-"`
+}
+
+// Reasons of a guardWarning.
+const (
+	guardWarnHarness       = "harness"        // no guard adapter for this harness (or this mode of it)
+	guardWarnHooksDisabled = "hooks_disabled" // a Claude settings file switches every hook off
+)
+
+// guardWarningLocked reports whether a would run without the command guard, and why (nil = the
+// guard checks it). It reads settings files and changes nothing; the launch goes ahead either way.
+func (f *Fleet) guardWarningLocked(a model.Agent) *guardWarning {
 	if a.Harness == model.HarnessShell {
-		return nil
-	}
-	if !f.safetyLocked().settings.On(string(a.Level), a.Profile) {
-		if launchGOOS == "windows" {
-			return errf(KindForbidden, "Windows launches require an enabled command guard")
-		}
-		return nil
+		return nil // the owner's terminal, not an agent
 	}
 	if a.Harness != model.HarnessClaude {
 		if f.codexParityEligibleLocked(a) {
 			return nil
 		}
-		return errf(KindForbidden, "the command guard has no enforced adapter for %s", a.Harness)
+		why := "tmx has no command guard for the " + string(a.Harness) + " harness"
+		if a.Harness == model.HarnessCodex {
+			switch {
+			case launchGOOS != "windows":
+				why = "tmx's command guard for Codex exists on Windows only"
+			case a.CodexFullAccess:
+				why = "tmx's command guard for Codex does not cover full-access mode"
+			case f.profileForLocked(a).ReadOnly:
+				why = "tmx's command guard for Codex does not cover a read-only profile"
+			default:
+				why = "tmx's command guard for Codex could not be set up (the tmx executable is unknown)"
+			}
+		}
+		return &guardWarning{Reason: guardWarnHarness,
+			Text: "This agent runs without the command guard: " + why + ". Nothing it runs is checked, blocked or held for you."}
 	}
 	// o4 / tmx-lead, 3 Nov: also the Claude config folders the launch uses (the daemon's own
 	// CLAUDE_CONFIG_DIR; per-account folders join via claudeConfigDirsLocked).
 	if where := hooksDisabledIn(a.Cwd, f.claudeConfigDirsLocked(a)...); where != "" {
-		return errf(KindForbidden, "the command guard is disabled in %s (disableAllHooks); remove that setting, then launch again", where)
+		return &guardWarning{Reason: guardWarnHooksDisabled, Where: where,
+			Text: "This agent runs without the command guard: " + where + " sets disableAllHooks, which switches off every Claude Code hook, the guard's included. Nothing it runs is checked, blocked or held for you; Claude's own permission prompts stay on. Remove that setting, then restart the agent."}
 	}
 	return nil
 }

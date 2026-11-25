@@ -161,10 +161,6 @@ func (s *Server) p2pSendFile(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 413, "file-size-limit: refused; send a smaller non-sensitive document")
 		return
 	}
-	if err := p2pContentRule(data); err != nil {
-		writeError(w, 403, err.Error())
-		return
-	}
 	m, err := s.chats.SendFile(c, ch.ID, name, in.Caption, data)
 	s.reply(w, 201, m, err)
 }

@@ -13,6 +13,18 @@ export interface WaSettings {
   allowed_chats: string[];
   /** chats (JIDs) whose new messages reach the head as a short mail (framed as data) */
   notify_head_chats: string[];
+  /** profiles whose agents may use WhatsApp at all (default ["head"]) */
+  agent_profiles?: string[];
+  /** per profile slug (or "agent:<name>"): the chats its agents may read, and may ask to write to */
+  chat_access?: Record<string, WaChatAccess>;
+  /** chats the head may not read; it reads every other chat */
+  private_chats?: string[];
+}
+
+/** One profile's or agent's chats: read (list, read and ask to write) and send (ask to write only). */
+export interface WaChatAccess {
+  read: string[];
+  send: string[];
 }
 
 /** GET /api/whatsapp and the "whatsapp.status" event. */

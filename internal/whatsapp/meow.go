@@ -379,7 +379,7 @@ func optional(s string) *string {
 	return proto.String(s)
 }
 
-func (w *Meow) Download(ctx context.Context, r MediaRef, f *os.File) error {
+func (w *Meow) Download(ctx context.Context, r MediaRef, f DownloadFile) error {
 	cli := w.client()
 	if cli == nil {
 		return errors.New("not connected")

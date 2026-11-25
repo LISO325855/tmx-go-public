@@ -125,6 +125,22 @@ func fakeCodex() {
 				r := await2(next, "e1")
 				msg("elicitation " + fmt.Sprint(r["action"]))
 				done("completed", "")
+			case strings.HasPrefix(text, "toolcall "):
+				// codex asking to approve an MCP tool call: of the named server, marked at the top
+				// ("top"), inside the request ("inner") or not at all ("plain")
+				f := strings.Fields(text)
+				params := map[string]any{"threadId": thread, "serverName": f[1], "mode": "form", "message": "Allow tmxg to run matrix?"}
+				meta := map[string]any{"codex_approval_kind": "mcp_tool_call"}
+				switch f[2] {
+				case "top":
+					params["_meta"] = meta
+				case "inner":
+					params["request"] = map[string]any{"_meta": meta}
+				}
+				send(map[string]any{"id": "e2", "method": "mcpServer/elicitation/request", "params": params})
+				r := await2(next, "e2")
+				msg("toolcall " + fmt.Sprint(r["action"]))
+				done("completed", "")
 			case text == "wait":
 				for m := next(); m != nil; m = next() {
 					if m["method"] == "turn/interrupt" {

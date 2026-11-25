@@ -70,6 +70,11 @@ type Disk struct {
 	Name    string
 	IOTime  time.Duration // integral of requests in flight over time (Δ/Δwall = average queue depth)
 	Written uint64        // bytes written
+	// For the Watchdog page (resource control does not use them). HasOps says Writes and Busy
+	// were read: a system that does not report them leaves it false, which is not zero.
+	Writes uint64        // write requests completed (Δ/Δwall = write operations per second)
+	Busy   time.Duration // time the disk was not idle (Δ/Δwall = the share of time it was busy)
+	HasOps bool
 }
 
 // Tree returns only descendants with a proven parent chain and creation-time ordering.

@@ -144,19 +144,35 @@ func TestOwnerGateOnGuardedActions(t *testing.T) {
 		t.Fatalf("bypass with proof: %d", s)
 	}
 
-	// Switching the guard off needs a proof; on again does not.
-	s, conf = call(t, owner, "PUT", "/api/safety/guard", guard.Settings{Enabled: false}, nil)
+	// The guard has no switch. Allowing browser automation needs a proof; taking it back does not.
+	s, conf = call(t, owner, "PUT", "/api/safety/guard", guard.Settings{AllowBrowserAutomation: true}, nil)
 	if s != http.StatusPreconditionRequired {
-		t.Fatalf("guard off without proof: %d", s)
+		t.Fatalf("browser automation without proof: %d", s)
 	}
-	if s, _ := call(t, confirmed(t, owner, conf), "PUT", "/api/safety/guard", guard.Settings{Enabled: false}, nil); s != 0 {
-		t.Fatalf("guard off with proof: %d", s)
+	if s, _ := call(t, confirmed(t, owner, conf), "PUT", "/api/safety/guard", guard.Settings{AllowBrowserAutomation: true}, nil); s != 0 {
+		t.Fatalf("browser automation with proof: %d", s)
 	}
-	if s, _ := call(t, owner, "PUT", "/api/safety/guard", guard.Settings{Enabled: true}, nil); s != 0 {
-		t.Fatalf("guard on: %d", s)
+	if s, _ := call(t, owner, "PUT", "/api/safety/guard", guard.Settings{}, nil); s != 0 {
+		t.Fatalf("browser automation off again: %d", s)
+	}
+	// What an older client still sends as the master switch is ignored: no proof is asked (it
+	// weakens nothing), nothing is stored, and the answer carries no switch.
+	var raw map[string]any
+	if s, _ := call(t, owner, "PUT", "/api/safety/guard", map[string]any{"enabled": false, "off_for": []string{"worker"}}, &raw); s != 0 {
+		t.Fatalf("legacy switch PUT: %d", s)
+	}
+	if _, ok := raw["enabled"]; ok || raw["off_for"] != nil {
+		t.Fatalf("the answer still carries the switch: %v", raw)
+	}
+	raw = nil
+	if s, _ := call(t, owner, "GET", "/api/safety", nil, &raw); s != 0 || raw["levels"] != nil {
+		t.Fatalf("safety still lists levels to switch the guard for: %d %v", s, raw["levels"])
+	}
+	if g, _ := raw["guard"].(map[string]any); g == nil || g["enabled"] != nil || g["off_for"] != nil || g["defaults_version"] != float64(guard.DefaultsVersion) {
+		t.Fatalf("guard settings: %v", raw["guard"])
 	}
 	var info api.SafetyInfo
-	if s, _ := call(t, owner, "GET", "/api/safety", nil, &info); s != 0 || !info.Guard.Enabled || len(info.Rules) < 10 || !info.Gate.Enabled {
+	if s, _ := call(t, owner, "GET", "/api/safety", nil, &info); s != 0 || info.Guard.AllowBrowserAutomation || len(info.Rules) < 10 || !info.Gate.Enabled {
 		t.Fatalf("safety: %d %+v", s, info)
 	}
 

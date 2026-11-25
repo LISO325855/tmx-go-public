@@ -12,6 +12,8 @@ import (
 	"github.com/blackcode-ch/tmx-go/internal/config"
 	"github.com/blackcode-ch/tmx-go/internal/model"
 	"github.com/blackcode-ch/tmx-go/internal/recworker"
+	"github.com/blackcode-ch/tmx-go/internal/store"
+	"github.com/blackcode-ch/tmx-go/internal/summarize"
 )
 
 // waitWorker waits for the recorder to launch a recording's report worker and returns its agent.
@@ -29,6 +31,50 @@ func waitWorker(t *testing.T, d *apitest.Daemon, w *recworker.Service, id string
 	}
 	t.Fatal("Stop launched no report worker")
 	return model.Agent{}
+}
+
+func TestLaunchedReportWorkerSurvivesRestartBeforeTrigger(t *testing.T) {
+	d := apitest.New(t)
+	on := true
+	d.SetSummaries(config.SummaryConfig{Auto: &on})
+	url, worker := d.WithRecWorker(t, recworker.Options{Every: time.Hour})
+	owner := client{t: t, base: url, token: d.OwnerToken}
+	recording := stoppedRecording(t, d, owner)
+	waitWorker(t, d, worker, recording.ID)
+
+	before, err := d.Summaries.Get(recording.ID)
+	if err != nil || !before.AwaitingWorker || before.DeadlineAt == 0 {
+		t.Fatalf("worker launched without its durable deadline: %+v, %v", before, err)
+	}
+	d.Summaries.Close()
+	db, err := store.Open((config.Paths{Home: d.Home}).DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	restarted := summarize.New(summarize.Options{
+		Store: db, Recordings: d.Recorder,
+		Now: func() time.Time { return time.UnixMilli(before.DeadlineAt + 1) },
+	})
+	if err := restarted.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Close()
+	for until := time.Now().Add(5 * time.Second); time.Now().Before(until); {
+		got, err := restarted.Get(recording.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.State == model.SummaryFailed {
+			if got.DeadlineAt != before.DeadlineAt || !strings.Contains(got.Error, "final deadline") ||
+				!strings.Contains(got.Note, "Made by the daemon: the daemon restarted") {
+				t.Fatalf("unexpected report after restart: %+v", got)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("restarted service never resolved the reserved report")
 }
 
 // The whole path on a real daemon (fleet, launch policy, profiles, routes; the harness is the fake runner): Stop

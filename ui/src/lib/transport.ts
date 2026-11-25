@@ -61,7 +61,7 @@ export interface Transport {
   readonly token: string;
   readonly desktop: boolean;
   readonly platform: string;
-  request<T = unknown>(method: string, path: string, body?: unknown): Promise<T>;
+  request<T = unknown>(method: string, path: string, body?: unknown, signal?: AbortSignal): Promise<T>;
   openEvents(h: EventHandlers): EventStream;
   /** path: a terminal socket (agentTerminalPath, loginTerminalPath) */
   openTerminal(path: string, cols: number, rows: number, h: TerminalHandlers): TerminalSession;
@@ -77,6 +77,13 @@ export class ApiError extends Error {
     this.status = status;
     this.data = data;
   }
+}
+
+// The daemon answers 423 to a paired phone that is locked (internal/api/phonelock.go).
+let lockedHook: (() => void) | null = null;
+/** Called whenever a request is refused because this phone is locked. */
+export function onDeviceLocked(fn: () => void) {
+  lockedHook = fn;
 }
 
 function errorFromBody(status: number, text: string): ApiError {
@@ -128,11 +135,13 @@ export class HttpTransport implements Transport {
     this.platform = opts.platform ?? guessPlatform();
   }
 
-  async request<T>(method: string, path: string, body?: unknown): Promise<T> {
+  async request<T>(method: string, path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
     let res: Response;
     try {
       res = await fetch(this.apiBase + path, {
         method,
+        signal,
+        ...(path === "/api/health" ? { cache: "no-store" as const } : {}),
         headers: {
           ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}),
           "X-Tmx-UI-Session": this.gateSession.nonce,
@@ -142,9 +151,12 @@ export class HttpTransport implements Transport {
         body: body !== undefined ? JSON.stringify(body) : undefined,
       });
     } catch {
+      signal?.throwIfAborted();
       throw new ApiError(0, "The daemon is not reachable.");
     }
     const text = await res.text();
+    signal?.throwIfAborted();
+    if (res.status === 423) lockedHook?.(); // the phone lock (lib/phone-lock.ts)
     if (!res.ok) throw errorFromBody(res.status, text);
     this.gateSession.receive(path, text);
     return parseJSON<T>(text);
@@ -169,7 +181,7 @@ export class HttpTransport implements Transport {
 
   openEvents(h: EventHandlers): EventStream {
     let closed = false;
-    const ws = this.socket("/api/events");
+    const ws = this.socket("/api/events", { shelved: 0 }); // the opening snapshot without shelved agents (store.ts loads them for "Show all")
     ws.onopen = () => !closed && h.onOpen();
     ws.onmessage = (m) => {
       if (closed || typeof m.data !== "string") return;
@@ -214,6 +226,7 @@ export class HttpTransport implements Transport {
 
 interface WailsApp {
   Config(): Promise<{ url: string; token: string; platform: string }>;
+  RestartDaemon?(): Promise<void>;
   Request(method: string, path: string, body: string): Promise<string>;
   RequestWithSession?(method: string, path: string, body: string, session: string, grace: string): Promise<string>;
   StartEvents(): Promise<void>;
@@ -221,6 +234,8 @@ interface WailsApp {
   TerminalOpen(agentId: string, cols: number, rows: number): Promise<string>;
   /** Any terminal socket by path, e.g. a sign-in's (newer builds; older ones relay agents' only). */
   TerminalOpenPath?(path: string, cols: number, rows: number): Promise<string>;
+  TerminalOpenPathDeferred?(path: string, cols: number, rows: number): Promise<string>;
+  TerminalStartRelay?(handle: string): Promise<void>;
   TerminalSend(handle: string, frame: string): Promise<void>;
   TerminalClose(handle: string): Promise<void>;
   OpenURL(url: string): Promise<void>;
@@ -231,6 +246,7 @@ interface WailsApp {
 
 interface WailsRuntime {
   EventsOn(name: string, cb: (...data: unknown[]) => void): () => void;
+  ClipboardGetText?(): Promise<string>;
 }
 
 declare global {
@@ -242,6 +258,13 @@ declare global {
 
 function wailsApp(): WailsApp | undefined {
   return window.go?.desktop?.App;
+}
+
+/** The desktop can start its own node even when the daemon's HTTP API is down. */
+export function daemonRestartAction(): (() => Promise<void>) | undefined {
+  const app = wailsApp();
+  const restart = app?.RestartDaemon;
+  return restart && (() => restart.call(app));
 }
 
 /** In the desktop app on Windows, lets the daemon's confirmation dialog come to the front. */
@@ -324,9 +347,12 @@ export class BridgeTransport implements Transport {
     let closed = false;
     const offs: (() => void)[] = [];
     const agentId = agentOfTerminalPath(path);
+    const deferred = agentId === null && !!this.app.TerminalOpenPathDeferred && !!this.app.TerminalStartRelay;
     const open =
       agentId !== null
         ? this.app.TerminalOpen(agentId, cols, rows)
+        : deferred
+          ? this.app.TerminalOpenPathDeferred!(path, cols, rows)
         : this.app.TerminalOpenPath
           ? this.app.TerminalOpenPath(path, cols, rows)
           : Promise.reject(new Error("this desktop build relays agents' terminals only"));
@@ -337,6 +363,7 @@ export class BridgeTransport implements Transport {
         offs.push(this.rt.EventsOn("tmx:term:" + hd, (d) => h.onData(b64ToBytes(String(d)))));
         offs.push(this.rt.EventsOn("tmx:term-closed:" + hd, () => h.onClose()));
         h.onOpen();
+        if (deferred) return this.app.TerminalStartRelay!(hd);
       })
       .catch(() => h.onClose());
     const send = (o: unknown) => handle && void this.app.TerminalSend(handle, JSON.stringify(o));
@@ -432,9 +459,9 @@ export async function createTransport(): Promise<Transport> {
     const cfg = await app.Config();
     const http = new HttpTransport({ baseURL: cfg.url, token: cfg.token, desktop: true, platform: cfg.platform });
     if (await reachable(http)) return http;
-    const bridge = new BridgeTransport(app, window.runtime, cfg);
-    if (await reachable(bridge)) return bridge;
-    return http; // daemon not up yet; the connection manager keeps retrying
+    // Keep the bridge when the node is down. It can reconnect after a local start, including
+    // on webviews that cannot reach the daemon directly.
+    return new BridgeTransport(app, window.runtime, cfg);
   }
 
   const token = takeBrowserToken();

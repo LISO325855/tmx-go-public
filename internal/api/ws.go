@@ -48,13 +48,13 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return err
 		}
-		b, _ := json.Marshal(model.BusEvent{Type: model.EvSnapshot, Data: agentSnapshot(c, snap), At: model.Now()})
+		b, _ := json.Marshal(model.BusEvent{Type: model.EvSnapshot, Data: withoutShelved(r, agentSnapshot(c, snap)), At: model.Now()})
 		return writeFrame(ctx, conn, websocket.MessageText, b)
 	}
 	if err := sendSnapshot(); err != nil {
 		return
 	}
-	ping := time.NewTicker(30 * time.Second)
+	ping := time.NewTicker(10 * time.Second)
 	defer ping.Stop()
 	for {
 		select {
@@ -66,6 +66,12 @@ func (s *Server) events(w http.ResponseWriter, r *http.Request) {
 			err := conn.Ping(pctx)
 			cancel()
 			if err != nil {
+				return
+			}
+			// Browser JavaScript cannot observe WebSocket control pings. Send an
+			// application heartbeat too, so a half-open stream cannot look live forever.
+			beat, _ := json.Marshal(model.BusEvent{Type: "heartbeat", At: model.Now()})
+			if writeFrame(ctx, conn, websocket.MessageText, beat) != nil {
 				return
 			}
 		case ev := <-sub.C():

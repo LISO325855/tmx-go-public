@@ -21,7 +21,7 @@ const (
 	// TTL is how long a lease lives without a renewal.
 	TTL = 30 * time.Second
 	// MaxPerHolder bounds the leases (held and waiting) one agent or the owner may have.
-	MaxPerHolder = 16
+	MaxPerHolder = 1600 // a ceiling on memory (16 until 17 Nov)
 	sweepEvery   = 2 * time.Second
 	maxCommand   = 300
 )
@@ -30,6 +30,7 @@ var (
 	ErrNotFound    = errors.New("no such slot lease; it expired or was released")
 	ErrForbidden   = errors.New("this slot lease belongs to someone else")
 	ErrUnknownKind = errors.New("unknown slot kind")
+	ErrClosed      = errors.New("the daemon is shutting down and has released its slots")
 	ErrTooMany     = errors.New("too many slot leases for one holder")
 )
 
@@ -86,16 +87,19 @@ type Options struct {
 
 // Manager is the daemon's set of slots.
 type Manager struct {
-	opts    Options
-	mu      sync.Mutex
-	sizes   map[string]int
-	leases  map[string]*lease
-	waiting map[string][]string // kind → lease IDs in arrival order
+	opts           Options
+	mu             sync.Mutex
+	sizes          map[string]int
+	leases         map[string]*lease
+	endedRecovered map[string]struct{}
+	closed         bool
+	waiting        map[string][]string // kind → lease IDs in arrival order
 }
 
 type lease struct {
 	Lease
-	granted chan struct{}
+	granted   chan struct{}
+	recovered bool
 }
 
 // New creates a Manager with sizes per kind (kinds with no size do not exist).
@@ -103,7 +107,7 @@ func New(o Options) *Manager {
 	if o.Now == nil {
 		o.Now = time.Now
 	}
-	m := &Manager{opts: o, leases: map[string]*lease{}, waiting: map[string][]string{}}
+	m := &Manager{opts: o, leases: map[string]*lease{}, waiting: map[string][]string{}, endedRecovered: map[string]struct{}{}}
 	m.sizes = map[string]int{}
 	for k, v := range o.Sizes {
 		m.sizes[k] = v
@@ -141,6 +145,10 @@ func (m *Manager) Acquire(kind string, h Holder, command string, pid int) (Lease
 		command = command[:maxCommand] + "…"
 	}
 	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return Lease{}, ErrClosed
+	}
 	if _, ok := m.sizes[kind]; !ok {
 		m.mu.Unlock()
 		return Lease{}, fmt.Errorf("%w %q (known: %s)", ErrUnknownKind, kind, strings.Join(m.kindsLocked(), ", "))
@@ -171,8 +179,45 @@ func (m *Manager) Acquire(kind string, h Holder, command string, pid int) (Lease
 	return out, nil
 }
 
-// Wait renews the lease and blocks until it is held, ctx ends or max passed; it returns
-// the lease as it is then.
+// Recover renews an authenticated lease or restores it from an earlier boot.
+// A running job is already consuming capacity. A waiter enters the normal queue.
+func (m *Manager) Recover(previous Lease, earlierBoot bool) (Lease, error) {
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return Lease{}, ErrClosed
+	}
+	if current := m.leases[previous.ID]; current != nil {
+		if current.PID != previous.PID || current.AgentID != previous.AgentID {
+			m.mu.Unlock()
+			return Lease{}, ErrForbidden
+		}
+		current.ExpiresAt = m.opts.Now().Add(TTL).UnixMilli()
+		out := m.leaseLocked(current)
+		m.mu.Unlock()
+		return out, nil
+	}
+	if _, ended := m.endedRecovered[previous.ID]; !earlierBoot || ended {
+		m.mu.Unlock()
+		return Lease{}, ErrNotFound
+	}
+	previous.ExpiresAt = m.opts.Now().Add(TTL).UnixMilli()
+	granted := make(chan struct{})
+	l := &lease{Lease: previous, granted: granted, recovered: true}
+	m.leases[previous.ID] = l
+	if previous.State == Held {
+		close(granted)
+	} else {
+		m.waiting[previous.Kind] = append(m.waiting[previous.Kind], previous.ID)
+		m.promoteLocked()
+	}
+	out := m.leaseLocked(l)
+	m.mu.Unlock()
+	m.changed()
+	return out, nil
+}
+
+// Wait renews the lease and returns its state after grant, cancellation or timeout.
 func (m *Manager) Wait(ctx context.Context, id string, h Holder, max time.Duration) (Lease, error) {
 	l, state, err := m.renew(id, h)
 	if err != nil {
@@ -189,6 +234,9 @@ func (m *Manager) Wait(ctx context.Context, id string, h Holder, max time.Durati
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.closed {
+		return Lease{}, ErrClosed
+	}
 	if _, ok := m.leases[id]; !ok {
 		return Lease{}, ErrNotFound
 	}
@@ -203,6 +251,9 @@ func (m *Manager) Renew(id string, h Holder) (Lease, error) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.leases[id] != l {
+		return Lease{}, ErrNotFound
+	}
 	return m.leaseLocked(l), nil
 }
 
@@ -210,6 +261,9 @@ func (m *Manager) Renew(id string, h Holder) (Lease, error) {
 func (m *Manager) renew(id string, h Holder) (*lease, string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.closed {
+		return nil, "", ErrClosed
+	}
 	l, ok := m.leases[id]
 	if !ok {
 		return nil, "", ErrNotFound
@@ -238,6 +292,25 @@ func (m *Manager) Release(id string, h Holder) error {
 	m.mu.Unlock()
 	m.changed()
 	return nil
+}
+
+// Close ends every lease and wakes queued waiters, without signalling any command.
+func (m *Manager) Close() {
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return
+	}
+	m.closed = true
+	for _, l := range m.leases {
+		if l.State == Waiting {
+			close(l.granted)
+		}
+	}
+	clear(m.leases)
+	clear(m.waiting)
+	m.mu.Unlock()
+	m.changed()
 }
 
 // View lists every kind and lease.
@@ -284,6 +357,9 @@ func (m *Manager) Sweep() {
 }
 
 func (m *Manager) dropLocked(l *lease) {
+	if l.recovered {
+		m.endedRecovered[l.ID] = struct{}{}
+	}
 	delete(m.leases, l.ID)
 	q := m.waiting[l.Kind]
 	for i, id := range q {

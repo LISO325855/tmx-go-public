@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -41,6 +42,13 @@ type ownerDevice struct {
 	Created  time.Time `json:"created"`
 	Expires  time.Time `json:"expires"`
 	Hash     string    `json:"session_hash,omitempty"`
+
+	// Kind is "phone" (a phone or tablet: it locks, phonelock.go) or "computer", from the
+	// browser that paired; "" = paired before this was kept, set at its next request.
+	Kind string     `json:"kind,omitempty"`
+	Lock deviceLock `json:"lock,omitzero"` // phonelock.go: its fingerprint passkeys
+	// LAN: paired over the same Wi-Fi fallback (phonelan.go); gone when that is switched off.
+	LAN bool `json:"lan,omitempty"`
 }
 type deviceState struct {
 	UserID  []byte        `json:"user_id"`
@@ -125,22 +133,67 @@ func cookieValue(r *http.Request, name string) string {
 func setDeviceCookie(w http.ResponseWriter, name, value string, age int) {
 	http.SetCookie(w, &http.Cookie{Name: name, Value: value, Path: "/", Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode, MaxAge: age})
 }
-func (d *deviceStore) find(r *http.Request) (int, bool) {
-	tok := cookieValue(r, deviceCookie)
-	if tok == "" {
-		return 0, false
+
+// sessionCookieName is the device session cookie for the address a request came through. A
+// cookie belongs to a host name, never to a port, and one machine often serves several tmx
+// installs on ports of the same ts.net name: with one shared name, pairing at one install
+// signed the phone out of the others. So an address with a port has its own cookie name; the
+// plain name stays for port 443 and is still read everywhere (sessions paired before this).
+func sessionCookieName(r *http.Request) string {
+	if viaLAN(r) { // plain http: no __Host- prefix, a name of its own (phonelan.go)
+		_, port, _ := strings.Cut(requestHost(r), ":")
+		return lanCookie + "-" + port
 	}
-	hash := deviceHash(tok)
-	for i, v := range d.state.Devices {
-		if v.Hash == hash && v.Host == requestHost(r) && d.now().Before(v.Expires) {
-			return i, true
+	if _, port, ok := strings.Cut(requestHost(r), ":"); ok && port != "" {
+		return deviceCookie + "-" + port
+	}
+	return deviceCookie
+}
+
+// sessionTokens are the device session tokens a request carries, this address's own first.
+func sessionTokens(r *http.Request) []string {
+	var out []string
+	names := []string{sessionCookieName(r), deviceCookie}
+	if viaLAN(r) {
+		names = names[:1]
+	}
+	for _, name := range names {
+		if v := cookieValue(r, name); v != "" && !slices.Contains(out, v) {
+			out = append(out, v)
 		}
 	}
-	return 0, false
+	return out
+}
+
+// setSessionCookie gives the browser its device session for this address.
+func (s *Server) setSessionCookie(w http.ResponseWriter, r *http.Request, value string, age int) {
+	if viaLAN(r) { // no https on the local network: the cookie cannot be Secure
+		http.SetCookie(w, &http.Cookie{Name: sessionCookieName(r), Value: value, Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode, MaxAge: age})
+		return
+	}
+	setDeviceCookie(w, sessionCookieName(r), value, age)
+}
+
+func (d *deviceStore) find(r *http.Request) (int, bool) {
+	i, _, ok := d.findToken(r)
+	return i, ok
+}
+
+// findToken also answers which of the request's tokens is the device's.
+func (d *deviceStore) findToken(r *http.Request) (int, string, bool) {
+	for _, tok := range sessionTokens(r) {
+		hash := deviceHash(tok)
+		for i, v := range d.state.Devices {
+			if v.Hash == hash && v.Host == requestHost(r) && v.LAN == viaLAN(r) && d.now().Before(v.Expires) {
+				return i, tok, true
+			}
+		}
+	}
+	return 0, "", false
 }
 func (s *Server) deviceSession(r *http.Request) (context.Context, func(), bool) {
 	d := s.devices
-	if d == nil || !s.trustedProxy(r) {
+	if d == nil || !(s.trustedProxy(r) || s.lanRequest(r)) {
 		return nil, nil, false
 	}
 	d.mu.Lock()
@@ -152,9 +205,18 @@ func (s *Server) deviceSession(r *http.Request) (context.Context, func(), bool) 
 	if !ok {
 		return nil, nil, false
 	}
+	if d.state.Devices[i].Kind == "" { // paired before kinds were kept: what it is now
+		before := d.before()
+		d.state.Devices[i].Kind = deviceKind(r)
+		_ = d.save(before) // not saved: asked again at the next request
+	}
 	v := d.state.Devices[i]
 	ctx, cancel := context.WithDeadline(r.Context(), v.Expires)
 	ctx = context.WithValue(ctx, deviceSessionContext{}, v.Expires)
+	ctx = context.WithValue(ctx, deviceIDContext{}, v.ID) // phonelock.go
+	if v.Kind == kindPhone && !v.Recovery {
+		ctx = context.WithValue(ctx, lockableContext{}, true)
+	}
 	if v.Recovery {
 		ctx = context.WithValue(ctx, recoverySessionContext{}, v.ID)
 	}
@@ -229,6 +291,10 @@ func (s *Server) deviceRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/pair/start", s.startPair)
 	mux.HandleFunc("POST /api/pair/claim", s.claimPair)
 	mux.HandleFunc("POST /api/pair/pin", s.pairWithPIN) // ownerpin.go
+	mux.HandleFunc("POST /api/pair/scan", s.scanPair)   // phonecode.go: the QR's code + the owner PIN
+	mux.HandleFunc("POST /api/pair/scan/check", s.checkScan)
+	s.phoneRoutes(mux)     // phone.go: Connect a phone
+	s.phoneLockRoutes(mux) // phonelock.go
 	mux.HandleFunc("POST /api/devices/approve", s.ownerOnly(s.approvePair))
 	mux.HandleFunc("GET /api/devices", s.ownerOnly(s.listDevices))
 	mux.HandleFunc("DELETE /api/devices/{id}", s.ownerOnly(s.revokeDevice))
@@ -239,7 +305,8 @@ func publicPairRoute(r *http.Request) bool {
 	if r.Method == "POST" && (r.URL.Path == "/api/pair/bootstrap/exchange" || r.URL.Path == "/api/pair/bootstrap/approve") {
 		return true // These handlers authenticate only the restricted bootstrap grant.
 	}
-	return r.Method == "POST" && (r.URL.Path == "/api/pair/start" || r.URL.Path == "/api/pair/claim" || r.URL.Path == "/api/pair/pin")
+	return r.Method == "POST" && (r.URL.Path == "/api/pair/start" || r.URL.Path == "/api/pair/claim" || r.URL.Path == "/api/pair/pin" ||
+		r.URL.Path == "/api/pair/scan" || r.URL.Path == "/api/pair/scan/check")
 }
 func (s *Server) browserReady(w http.ResponseWriter, r *http.Request) bool {
 	if s.devices == nil || s.devices.err != nil {
@@ -253,6 +320,23 @@ func (s *Server) browserReady(w http.ResponseWriter, r *http.Request) bool {
 	w.Header().Set("Cache-Control", "no-store")
 	return true
 }
+
+// deviceReady is browserReady for what a paired device does, and for pairing with a
+// Connect-a-phone code: the trusted HTTPS address, or the same Wi-Fi fallback while it is on
+// (phonelan.go). Pairing WITHOUT a code stays https only (browserReady).
+func (s *Server) deviceReady(w http.ResponseWriter, r *http.Request) bool {
+	if s.devices == nil || s.devices.err != nil {
+		writeError(w, 503, "device pairing unavailable")
+		return false
+	}
+	if !s.trustedProxy(r) && !s.lanRequest(r) {
+		writeError(w, 403, "open the trusted HTTPS address on this device")
+		return false
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	return true
+}
+
 func (s *Server) startPair(w http.ResponseWriter, r *http.Request) {
 	if !s.browserReady(w, r) {
 		return
@@ -374,7 +458,7 @@ func (s *Server) claimPair(w http.ResponseWriter, r *http.Request) {
 	tok := randomDeviceID()
 	now := d.now()
 	before := d.before()
-	v := ownerDevice{ID: randomDeviceID(), Name: p.Name, Host: p.Host, Hash: deviceHash(tok), Created: now, Expires: now.Add(deviceTTL)}
+	v := ownerDevice{ID: randomDeviceID(), Name: p.Name, Host: p.Host, Hash: deviceHash(tok), Created: now, Expires: now.Add(deviceTTL), Kind: deviceKind(r)}
 	if !p.RecoveryUntil.IsZero() {
 		v.Recovery, v.Expires = true, p.RecoveryUntil
 	}
@@ -388,8 +472,9 @@ func (s *Server) claimPair(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	delete(d.pairs, code)
+	s.lock.opened(v.ID) // phonelock.go: a device just paired is open
 	s.deviceEvent("paired", v.ID)
-	setDeviceCookie(w, deviceCookie, tok, int(v.Expires.Sub(now).Seconds()))
+	s.setSessionCookie(w, r, tok, int(v.Expires.Sub(now).Seconds()))
 	setDeviceCookie(w, pairingCookie, "", -1)
 	writeJSON(w, 200, map[string]any{"id": v.ID, "recovery": v.Recovery})
 }
@@ -403,7 +488,7 @@ func (s *Server) listDevices(w http.ResponseWriter, r *http.Request) {
 	defer d.mu.Unlock()
 	list := []map[string]any{}
 	for _, v := range d.state.Devices {
-		list = append(list, map[string]any{"id": v.ID, "name": v.Name, "host": v.Host, "created": v.Created, "expires": v.Expires, "recovery": v.Recovery})
+		list = append(list, map[string]any{"id": v.ID, "name": v.Name, "host": v.Host, "created": v.Created, "expires": v.Expires, "recovery": v.Recovery, "kind": v.Kind, "lan": v.LAN})
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, 200, list)
@@ -453,6 +538,7 @@ func (s *Server) revokeDevice(w http.ResponseWriter, r *http.Request) {
 	d.bootstrap = nil
 	d.ceremonies = map[string]*browserCeremony{}
 	delete(d.pinSess, id)
+	s.lock.forget(id)
 	if s.push != nil {
 		if err := s.push.Unsubscribe(id); err != nil {
 			s.log.Warn("revoked device push cleanup failed")
@@ -474,7 +560,7 @@ func minTime(a, b time.Time) time.Time {
 // action, or on the device's PIN session (Fresh/Always actions: a PIN in the last 5 min).
 // Otherwise it answers 428 with a pending confirmation of method "pin".
 func (s *Server) requireBrowserOwner(w http.ResponseWriter, r *http.Request, a gate.Action, id string) bool {
-	if !s.browserReady(w, r) {
+	if !s.deviceReady(w, r) {
 		return false
 	}
 	d := s.devices

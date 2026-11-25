@@ -1,8 +1,9 @@
 // Package accounts knows which AI accounts the owner has connected to the harnesses tmx runs
 // (Claude Code, Codex, Antigravity, Gemini CLI) and how much of each plan's limits is used, as
 // the harnesses themselves report it. It also runs each harness's own sign-in in a terminal and
-// its own sign-out. It never reads a credential file or the keychain, and never keeps a token
-// (Gemini CLI's google_accounts.json, which it reads, holds only addresses).
+// its own sign-out. Claude free-reset offers use a bounded GET with the selected
+// account's existing file-backed OAuth login. No token is kept or logged; other
+// checks run the harness's own commands. The keychain is never read.
 // See DESIGN.md "AI accounts and usage".
 package accounts
 
@@ -11,6 +12,7 @@ import (
 	"errors"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -49,6 +51,15 @@ const (
 type Payload struct {
 	Accounts  []Account `json:"accounts"`
 	UpdatedAt int64     `json:"updated_at"`
+	// Hidden: the harnesses whose default account the owner took off the list; the page offers
+	// to show each again.
+	Hidden []HiddenAccount `json:"hidden,omitempty"`
+}
+
+// HiddenAccount is a harness's default account that is off the list.
+type HiddenAccount struct {
+	Harness string `json:"harness"`
+	Label   string `json:"label"`
 }
 
 // Account is one of a harness's accounts.
@@ -63,13 +74,16 @@ type Account struct {
 	Connected     bool     `json:"connected"`
 	Account       Identity `json:"account"`
 	// Limits are the plan's limits, as the harness reports them; empty with LimitsNote saying why.
-	Limits     []Limit `json:"limits"`
-	LimitsNote string  `json:"limits_note"`
-	CheckedAt  int64   `json:"checked_at"` // Unix ms of the last check; 0 = never
-	Refreshing bool    `json:"refreshing"`
-	Error      string  `json:"error"` // the last check failed (what is shown is from before)
-	Login      Login   `json:"login"`
-	Install    string  `json:"install"` // how to install the harness
+	Limits        []Limit      `json:"limits"`
+	LimitsNote    string       `json:"limits_note"`
+	FreeResets    *FreeResets  `json:"free_resets,omitempty"`
+	Reset         *ResetStatus `json:"reset,omitempty"`
+	CheckedAt     int64        `json:"checked_at"` // Unix ms of the last check; 0 = never
+	Refreshing    bool         `json:"refreshing"`
+	Error         string       `json:"error"` // the last check failed (what is shown is from before)
+	Login         Login        `json:"login"`
+	Install       string       `json:"install"`                   // how to install the harness
+	SignOutReason string       `json:"sign_out_reason,omitempty"` // why this node cannot sign out
 }
 
 // Identity is who is signed in. Every field may be empty.
@@ -104,6 +118,9 @@ var (
 
 // Options configures the service.
 type Options struct {
+	// NodeHome bounds account storage. User logins require explicit authorization.
+	NodeHome        string
+	AllowUserLogins bool
 	// Dir is the neutral working folder the harnesses run in (created): never a project, so
 	// no session files and no trust questions.
 	Dir     string
@@ -117,6 +134,10 @@ type Options struct {
 	Env []string
 	// Profiles lists each harness's named accounts; nil = only "default".
 	Profiles *Profiles
+	// ResetDryRun permits reads only, never /limit-reset or a claim request.
+	ResetDryRun bool
+	// ClaudeUsageChanged observes successful refreshes outside the service lock.
+	ClaudeUsageChanged func(account string)
 
 	Every        time.Duration // the periodic refresh (default 5 min; <0 = none)
 	CheckTimeout time.Duration // each status command (default 20 s)
@@ -141,8 +162,14 @@ type Service struct {
 	closed    bool
 	started   bool
 
-	agyMu sync.Mutex
-	agy   agyProbe // what this agy is known to support (antigravity.go)
+	agyMu        sync.Mutex
+	agy          agyProbe // what this agy is known to support (antigravity.go)
+	resetMu      sync.Mutex
+	resetRestart bool
+	resetActive  map[context.Context]time.Time
+	resetClaim   resetBridge
+	offerReader  claudeOfferReader
+	resetSyncDir func(string) error
 }
 
 // entry is one account's state.
@@ -186,6 +213,7 @@ type result struct {
 	err       string
 	// keepLimits: the limits could not be read this time; keep the ones shown for this account.
 	keepLimits bool
+	freeResets *FreeResets
 }
 
 // New returns the service; Start begins the refreshes.
@@ -216,7 +244,13 @@ func New(o Options) *Service {
 	if o.Dir == "" {
 		o.Dir = os.TempDir()
 	}
+	if o.NodeHome == "" {
+		o.NodeHome = o.Dir
+	}
 	s := &Service{o: o, log: o.Logger}
+	s.resetClaim = resetClaim(liveResetClaim)
+	s.offerReader = liveClaudeOfferReader{}
+	s.resetSyncDir = syncResetDirectory
 	if err := os.MkdirAll(o.Dir, 0o700); err != nil {
 		s.log.Warn("accounts: working folder", "err", err)
 	}
@@ -242,8 +276,18 @@ func (s *Service) newEntry(d *def, name string) *entry {
 	if s.o.Profiles != nil {
 		home = s.o.Profiles.Env(d.h, name)
 	}
+	if len(home) == 0 && !s.o.AllowUserLogins {
+		dir := filepath.Join(s.o.NodeHome, "ai-accounts", "homes", string(d.h), name)
+		if d.h == Claude {
+			dir = filepath.Join(s.o.NodeHome, "claude-config")
+		}
+		home = HomeEnv(d.h, dir)
+	}
+	// Installed is known at once (one executable serves every account of a harness): a card
+	// must not say "Not installed" only because its first check has not finished yet.
+	_, lookErr := s.lookPath(d.h)
 	return &entry{def: d, name: name, home: home, login: Login{State: LoginIdle},
-		acct: Account{Harness: string(d.h), Name: name, Label: d.label, Install: d.install, Account: Identity{Method: MethodUnknown}}}
+		acct: Account{Harness: string(d.h), Name: name, Label: d.label, Install: d.install, Installed: lookErr == nil, Account: Identity{Method: MethodUnknown}}}
 }
 
 // scope is e's view of the service.
@@ -253,7 +297,8 @@ func defs() []*def {
 	return []*def{
 		{h: Claude, label: "Claude", check: claudeCheck, login: claudeLogin, logout: claudeLogout, install: installHint(Claude)},
 		{h: Codex, label: "Codex", check: codexCheck, login: codexLogin, logout: codexLogout, install: installHint(Codex)},
-		{h: Antigravity, label: "Antigravity", check: agyCheck, login: agyLogin, logout: agyLogout, install: installHint(Antigravity)},
+		{h: Antigravity, label: "Antigravity", check: agyCheck, login: agyLogin, logout: agyLogout, install: installHint(Antigravity),
+			signedIn: agySignedIn}, // agy's sign-in runs inside its app, which stays open afterwards
 		{h: Gemini, label: "Gemini CLI", check: geminiCheck, login: geminiLogin, logout: geminiLogout, install: installHint(Gemini),
 			signedIn: geminiSignedIn, loginEnv: geminiLoginEnv},
 	}
@@ -280,12 +325,24 @@ func (s *Service) Start() {
 		}
 		t := time.NewTicker(s.o.Every)
 		defer t.Stop()
+		fast := time.NewTicker(2 * time.Minute)
+		defer fast.Stop()
 		for {
 			select {
 			case <-s.ctx.Done():
 				return
 			case <-t.C:
 				s.refreshAll()
+			case <-fast.C:
+				for _, e := range s.snapshot() {
+					s.mu.Lock()
+					l, ok := resetUsage(e.acct, "fable")
+					hot := e.def.h == Claude && ok && l.UsedPercent >= 95
+					s.mu.Unlock()
+					if hot {
+						s.refresh(e)
+					}
+				}
 			}
 		}
 	}()
@@ -353,13 +410,56 @@ func (s *Service) payloadLocked() Payload {
 	for _, e := range s.entries {
 		a := e.acct
 		a.Limits = append(make([]Limit, 0, len(e.acct.Limits)), e.acct.Limits...)
+		if a.FreeResets != nil {
+			r := *a.FreeResets
+			r.Grants = append([]FreeReset{}, r.Grants...)
+			a.FreeResets = &r
+		}
 		a.Refreshing = e.refreshing
 		a.Login = e.login
 		a.Name = e.name
 		a.LaunchDefault = e.name == s.launchDefault(e.def.h)
 		p.Accounts = append(p.Accounts, a)
 	}
+	if s.o.Profiles != nil {
+		for _, h := range s.o.Profiles.HiddenDefaults() {
+			if d := defFor(h); d != nil {
+				p.Hidden = append(p.Hidden, HiddenAccount{Harness: string(d.h), Label: d.label})
+			}
+		}
+	}
 	return p
+}
+
+// insertAtLocked is where a new entry of harness d goes in s.entries: the default account
+// first among d's, any other after d's last; a harness with no entry left takes its place in
+// the harnesses' order.
+func (s *Service) insertAtLocked(d *def, name string) int {
+	first, last := -1, -1
+	for i, x := range s.entries {
+		if x.def.h == d.h {
+			if first < 0 {
+				first = i
+			}
+			last = i
+		}
+	}
+	switch {
+	case first >= 0 && name == DefaultName:
+		return first
+	case first >= 0:
+		return last + 1
+	}
+	order := map[model.Harness]int{}
+	for i, x := range defs() {
+		order[x.h] = i
+	}
+	for i, x := range s.entries {
+		if order[x.def.h] > order[d.h] {
+			return i
+		}
+	}
+	return len(s.entries)
 }
 
 // changedLocked notes a change; publish (without s.mu) sends it.
@@ -446,7 +546,7 @@ func (s *Service) refresh(e *entry) {
 	go func() {
 		defer s.wg.Done()
 		for {
-			s.checkAndApply(e)
+			s.checkAndApplyMode(e, true)
 			s.mu.Lock()
 			if e.again && !s.closed {
 				e.again = false
@@ -465,35 +565,76 @@ func (s *Service) refresh(e *entry) {
 // checkAndApply runs h's check and shows its result, unless a check that started later was
 // shown already. It does not publish.
 func (s *Service) checkAndApply(e *entry) {
+	s.checkAndApplyMode(e, false)
+}
+
+func (s *Service) checkAndApplyMode(e *entry, automatic bool) {
+	if automatic {
+		if !e.loginMu.TryLock() {
+			return
+		}
+		defer e.loginMu.Unlock()
+	}
 	start := s.o.Now()
 	a := s.check(e)
+	if automatic && e.def.h == Claude {
+		s.mu.Lock()
+		loggingIn := e.login.State == LoginRunning
+		s.mu.Unlock()
+		if !loggingIn {
+			a = s.trackReset(s.ctx, e, a, "fable", false, false)
+		}
+	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if start.Before(e.applied) {
+		s.mu.Unlock()
 		return
 	}
 	e.applied = start
 	e.acct = a
 	s.changedLocked()
+	s.mu.Unlock()
+	if automatic && e.def.h == Claude && a.Connected && a.Error == "" && s.o.ClaudeUsageChanged != nil {
+		s.o.ClaudeUsageChanged(e.name)
+	}
 }
 
 // check reads h's account now.
-func (s *Service) check(e *entry) Account {
+func (s *Service) check(e *entry) Account { return s.checkMode(e, false) }
+
+func (s *Service) checkMode(e *entry, dryRun bool) Account {
 	s.mu.Lock()
 	prev := e.acct
 	s.mu.Unlock()
+	if e.def.h == Claude && (dryRun || s.o.ResetDryRun) {
+		// A reset dry run uses the existing snapshot. Even /usage can perform
+		// HTTP internally, so do not start a CLI read or refresh offers here.
+		prev.Reset = &ResetStatus{State: "dry_run", Message: "Dry run: cached snapshot only; no usage or offer request made."}
+		return prev
+	}
 	a := Account{Harness: string(e.def.h), Name: e.name, Label: e.def.label, Install: e.def.install,
 		Account: Identity{Method: MethodUnknown}, Limits: []Limit{}}
+	if !s.owns(e) {
+		a.SignOutReason = ErrNotOwned.Error()
+		a.Error = ErrNotOwned.Error()
+		return a
+	}
 	path, err := s.lookPath(e.def.h)
 	if err != nil {
 		a.CheckedAt = s.now()
 		return a
 	}
 	a.Installed = true
+	if err := s.prepareHome(e); err != nil {
+		a.Error = err.Error()
+		return a
+	}
 	if s.ctx.Err() != nil {
 		return prev
 	}
-	r := e.def.check(s.ctx, s.scope(e), path)
+	scope := s.scope(e)
+	scope.resetDryRun = dryRun
+	r := e.def.check(s.ctx, scope, path)
 	a.CheckedAt = s.now()
 	if !r.known {
 		// Keep what was shown, but say the check failed.
@@ -515,6 +656,7 @@ func (s *Service) check(e *entry) Account {
 			a.Limits = append([]Limit{}, prev.Limits...)
 		}
 		a.LimitsNote = r.note
+		a.FreeResets = r.freeResets
 	}
 	return a
 }
@@ -523,10 +665,10 @@ func (s *Service) check(e *entry) Account {
 // status "rejected" in a chat agent's stream), then checks the account again. kind is the
 // harness's name for the window (five_hour, seven_day, …; "" = unknown); resetsAt is Unix
 // seconds (0 = unknown). Extra usage ("overage") is not a plan limit and only triggers the check.
-func (s *Service) RateLimited(h model.Harness, name, kind string, resetsAt int64) {
+func (s *Service) RateLimited(h model.Harness, name, kind string, resetsAt int64) bool {
 	e := s.entry(string(h), name)
 	if e == nil {
-		return
+		return false
 	}
 	id, label := rateLimitWindow(kind)
 	s.mu.Lock()
@@ -537,7 +679,7 @@ func (s *Service) RateLimited(h model.Harness, name, kind string, resetsAt int64
 		if !recent {
 			s.refresh(e)
 		}
-		return
+		return false
 	}
 	limits := append([]Limit(nil), e.acct.Limits...)
 	found, changed := false, false
@@ -571,6 +713,7 @@ func (s *Service) RateLimited(h model.Harness, name, kind string, resetsAt int64
 	if !recent {
 		s.refresh(e)
 	}
+	return changed
 }
 
 // rateLimitWindow names a Claude rate-limit type as /usage names its limits ("" = none).
@@ -584,6 +727,10 @@ func rateLimitWindow(kind string) (id, label string) {
 		return "week_opus", "Current week (Opus)"
 	case "seven_day_sonnet":
 		return "week_sonnet", "Current week (Sonnet)"
+	case "seven_day_fable":
+		return "week_fable", "Current week (Fable)"
+	case "seven_day_haiku":
+		return "week_haiku", "Current week (Haiku)"
 	case "overage":
 		return "", ""
 	}

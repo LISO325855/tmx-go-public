@@ -13,6 +13,7 @@ import (
 	"github.com/blackcode-ch/tmx-go/internal/desktop"
 	"github.com/blackcode-ch/tmx-go/internal/hiddenexec"
 	"github.com/blackcode-ch/tmx-go/internal/model"
+	"github.com/blackcode-ch/tmx-go/internal/rollback"
 )
 
 const upTimeout = 20 * time.Second
@@ -76,7 +77,7 @@ func (e *env) ensureUp() (string, error) {
 	defer out.Close()
 	cmd := hiddenexec.Command(exe, "daemon")
 	cmd.Stdout, cmd.Stderr = out, out
-	cmd.Env = os.Environ()
+	cmd.Env = append(os.Environ(), config.EnvHome+"="+e.paths.Home)
 	detach(cmd)
 	if err := cmd.Start(); err != nil {
 		return "", fmt.Errorf("start the daemon: %w", err)
@@ -100,6 +101,45 @@ func (e *env) ensureUp() (string, error) {
 		}
 	}
 	return url, fmt.Errorf("the daemon did not answer within %s; see %s", upTimeout, e.paths.DaemonLog())
+}
+
+func (e *env) recentUpdateHandover(now time.Time) bool {
+	p, ok, err := rollback.OnProbation(filepath.Join(e.paths.Home, "rollback"))
+	if err != nil || !ok {
+		return false
+	}
+	age := now.Sub(p.Deadline.Add(-rollback.ProbationWindow))
+	return age >= 0 && age < 2*upTimeout
+}
+
+func (e *env) waitForOwnedDaemon() bool {
+	deadline := time.Now().Add(upTimeout)
+	for time.Now().Before(deadline) {
+		if e.ownedHealthy(e.baseURL()) {
+			return true
+		}
+		time.Sleep(150 * time.Millisecond)
+	}
+	return e.ownedHealthy(e.baseURL())
+}
+
+func (e *env) restartDesktopDaemon() error {
+	// The updater has already arranged to start the successor. Give it the first
+	// chance to take the port, even when the old process has stopped answering.
+	if e.recentUpdateHandover(time.Now()) && e.waitForOwnedDaemon() {
+		return nil
+	}
+	_, err := e.ensureUp()
+	if err != nil && e.recentUpdateHandover(time.Now()) {
+		if e.waitForOwnedDaemon() {
+			return nil
+		}
+		_, err = e.ensureUp()
+	}
+	if err != nil && e.ownedHealthy(e.baseURL()) {
+		return nil
+	}
+	return err
 }
 
 func cmdDown(e *env, args []string) error {
@@ -167,15 +207,38 @@ func cmdStatus(e *env, args []string) error {
 	return nil
 }
 
+// cmdOpen: `tmx open` prints the link that signs a browser on this machine in as the owner;
+// `tmx open --launch` starts the daemon if needed and opens that link in the browser itself,
+// without printing it (the link carries the owner token).
 func cmdOpen(e *env, args []string) error {
-	if _, err := parse(newFlags("open"), args); err != nil {
+	fs := newFlags("open")
+	launch := fs.Bool("launch", false, "start tmx if needed and open it in this computer's browser")
+	if _, err := parse(fs, args); err != nil {
 		return err
+	}
+	if *launch {
+		if _, err := e.ensureUp(); err != nil {
+			return err
+		}
 	}
 	c, err := e.owner()
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(e.out, "%s/#token=%s\n", c.BaseURL, c.Token)
+	link := fmt.Sprintf("%s/#token=%s", c.BaseURL, c.Token)
+	if !*launch {
+		fmt.Fprintln(e.out, link)
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := openURL(ctx, link); err != nil {
+		// No browser could be started from here: the link itself is the way in.
+		fmt.Fprintf(e.errw, "could not open the browser (%v); open this link yourself:\n", err)
+		fmt.Fprintln(e.out, link)
+		return nil
+	}
+	fmt.Fprintln(e.out, "Opened tmx in your browser.")
 	return nil
 }
 
@@ -191,5 +254,5 @@ func cmdApp(e *env, args []string) error {
 	if err != nil {
 		return err
 	}
-	return desktop.Run(desktop.Options{URL: url, Token: c.Token})
+	return desktop.Run(desktop.Options{URL: url, Token: c.Token, StartDaemon: e.restartDesktopDaemon})
 }

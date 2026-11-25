@@ -127,6 +127,18 @@ func (f *Fleet) peerTargetLocked(to string) (string, error) {
 // delivers it per the mail rules. The same wire ID again returns the stored message
 // (duplicate); with another body it is KindConflict.
 func (f *Fleet) DeliverPeer(in PeerInbound) (m model.Message, duplicate bool, err error) {
+	return f.deliverPeer(in, true)
+}
+
+// QueuePeer commits receipt without delivery. The API holds the peer transaction
+// through this call, releases it, then lets DeliverQueuedPeer acquire its own
+// delivery lease. This keeps mutation -> Fleet.mu as the only nested lock order.
+func (f *Fleet) QueuePeer(in PeerInbound) (model.Message, bool, error) {
+	return f.deliverPeer(in, false)
+}
+func (f *Fleet) DeliverQueuedPeer(m model.Message) { f.deliverQueued(m.To, priorityMail(m)) }
+
+func (f *Fleet) deliverPeer(in PeerInbound, deliver bool) (m model.Message, duplicate bool, err error) {
 	peer := strings.ToLower(in.Peer)
 	if peer == "" {
 		return model.Message{}, false, errf(KindForbidden, "unknown peer machine")
@@ -143,10 +155,9 @@ func (f *Fleet) DeliverPeer(in PeerInbound) (m model.Message, duplicate bool, er
 	if strings.TrimSpace(in.Body) == "" {
 		return model.Message{}, false, errf(KindInvalid, "the message is empty")
 	}
-	if len(in.Body) > MaxBodyBytes+1024 {
+	if len(in.Body) > MaxPeerBodyBytes+1024 {
 		return model.Message{}, false, errf(KindInvalid, "the message is too long")
 	}
-	// Urgent has no equivalent here: mail is delivered at the agent's next idle turn either way.
 	sum := bodySHA(in.Body)
 	f.mu.Lock()
 	if prior, err := f.st.PeerByWire(peer, in.ID); err == nil {
@@ -173,18 +184,15 @@ func (f *Fleet) DeliverPeer(in PeerInbound) (m model.Message, duplicate bool, er
 		f.mu.Unlock()
 		return model.Message{}, false, err
 	}
-	n, err := f.st.CountQueued(r.a.ID)
-	if err != nil {
-		f.mu.Unlock()
-		return model.Message{}, false, err
-	}
-	if n >= MaxQueued {
-		f.mu.Unlock()
-		return model.Message{}, false, errf(KindTooMany, "%s already has %d messages waiting", r.a.Name, n)
-	}
 	m = model.Message{ID: model.NewID(), From: PeerParty(in.Sender, peer), To: r.a.ID, Body: in.Body,
-		State: model.MsgQueued, CreatedAt: model.Now()}
+		Urgent: in.Urgent, State: model.MsgQueued, CreatedAt: model.Now()}
 	m.Receipt, m.ReceiptAt = "queued", m.CreatedAt
+	if in.Sender != PeerOperator { // the owner writing from another of his machines is the owner
+		if err := f.diskFloorLocked(m); err != nil {
+			f.mu.Unlock()
+			return model.Message{}, false, err
+		}
+	}
 	if in.ReplyTo != "" {
 		if orig, err := f.st.PeerByWire(peer, in.ReplyTo); err == nil && orig.Direction == store.PeerOut {
 			m.ReplyTo = orig.LocalID
@@ -194,14 +202,16 @@ func (f *Fleet) DeliverPeer(in PeerInbound) (m model.Message, duplicate bool, er
 		}
 	}
 	if err := f.st.PutPeerMessage(m, store.PeerMessage{LocalID: m.ID, Peer: peer, WireID: in.ID,
-		Direction: store.PeerIn, SHA256: sum}); err != nil {
+		Direction: store.PeerIn, SHA256: sum, VerifiedSender: in.VerifiedSender, VerifiedGeneration: in.VerifiedGeneration}); err != nil {
 		f.mu.Unlock()
 		return model.Message{}, false, err
 	}
 	f.bus.Publish(model.BusEvent{Type: model.EvMessageCreated, AgentID: r.a.ID, Data: m})
 	f.refreshQueuedLocked(r)
 	f.mu.Unlock()
-	f.tryDeliver(r.a.ID)
+	if deliver {
+		f.deliverQueued(m.To, priorityMail(m))
+	}
 	m, err = f.message(m.ID)
 	return m, false, err
 }
@@ -223,7 +233,7 @@ func (f *Fleet) sendPeerLocked(c Caller, party string, req SendRequest, retryHas
 	if err != nil {
 		return model.Message{}, err
 	}
-	m := model.Message{ID: model.NewID(), From: c.ID(), To: party, Body: req.Body,
+	m := model.Message{ID: model.NewID(), From: c.ID(), To: party, Body: req.Body, Urgent: req.Urgent,
 		State: model.MsgQueued, ReplyTo: req.ReplyTo, CreatedAt: model.Now(), ThreadID: thread}
 	m.RetryID, m.RetryHash, m.Receipt, m.ReceiptAt = req.RetryID, retryHash, "queued", m.CreatedAt
 	if !c.Owner {
@@ -259,7 +269,10 @@ func (f *Fleet) sendPeer(id string) {
 	}
 	name, host, _ := SplitPeer(m.To)
 	out := PeerOutbound{ID: pm.WireID, Sender: f.nameOfLocked(m.From), SenderHost: f.selfLocked(), To: name,
-		Body: m.Body, Sent: float64(m.CreatedAt) / 1000, SHA256: pm.SHA256}
+		Body: m.Body, Urgent: m.Urgent, Sent: float64(m.CreatedAt) / 1000, SHA256: pm.SHA256}
+	if agent, ok := f.agents[m.From]; ok && agent.a.Name == out.Sender && !reservedSenders[out.Sender] {
+		out.VerifiedSender = agent.a.Name
+	}
 	if m.From == model.Owner {
 		out.Sender = PeerOperator
 	} else if reservedSenders[out.Sender] {

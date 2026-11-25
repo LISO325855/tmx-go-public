@@ -30,13 +30,18 @@ type pyPeer struct {
 	mu   sync.Mutex
 	mail []fleet.PeerOutbound
 	pins []map[string]any // owner PIN records pushed to it
+	sys  any              // GET /api/sessions "system" (set before the first poll); nil = left out
 }
 
 func (p *pyPeer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	switch r.URL.Path {
 	case "/api/sessions":
-		_ = json.NewEncoder(w).Encode(map[string]any{"host": "hosta", "commit": "abc", "sessions": []map[string]any{{"name": "tmx-lead", "state": "idle"}}})
+		v := map[string]any{"host": "hosta", "commit": "abc", "sessions": []map[string]any{{"name": "tmx-lead", "state": "idle"}}}
+		if p.sys != nil {
+			v["system"], v["version"] = p.sys, "2.41.0"
+		}
+		_ = json.NewEncoder(w).Encode(v)
 	case "/api/messages/incoming":
 		var m fleet.PeerOutbound
 		_ = json.NewDecoder(r.Body).Decode(&m)

@@ -3,13 +3,39 @@
 // the owner withdraw the prompt. With the grace window on, it says that this proof also spares
 // the next prompts for a while (every proof opens or renews the window).
 // On a paired browser (method "pin") it asks for the owner PIN instead and sends it itself.
-import { useState } from "react";
+import { useCallback, useLayoutEffect, useRef, useState } from "react";
 import { Fingerprint, KeyRound, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { cancelConfirmation, graceLabel, submitPin, useGate } from "@/lib/owner-gate";
 import { PinInput, validPin } from "@/components/pin-input";
+import { restoreGateFocus, trapGateFocus } from "@/lib/gate-focus";
 import { useStore } from "@/lib/store";
+
+function useGateFocus(open: boolean) {
+  const root = useRef<HTMLDivElement>(null);
+  const cleanup = useRef<(() => void) | undefined>(undefined);
+  const ref = useCallback((node: HTMLDivElement | null) => {
+    cleanup.current?.();
+    root.current = node;
+    cleanup.current = undefined;
+  }, [open]);
+  useLayoutEffect(() => () => cleanup.current?.(), [open]);
+  return {
+    ref,
+    onOpenAutoFocus: (event: Event) => {
+      event.preventDefault();
+      // Radix has paused the previous modal scope before this event.
+      cleanup.current?.();
+      if (root.current) cleanup.current = trapGateFocus(root.current);
+    },
+    onCloseAutoFocus: (event: Event) => {
+      event.preventDefault();
+      if (!useGate.getState().confirming) restoreGateFocus();
+    },
+    onInteractOutside: (event: Event) => event.preventDefault(),
+  };
+}
 
 export function OwnerConfirmDialog() {
   const c = useGate((s) => s.confirming);
@@ -18,6 +44,7 @@ export function OwnerConfirmDialog() {
 }
 
 function PinConfirmDialog({ reason, hello }: { reason: string; hello: boolean }) {
+  const focus = useGateFocus(true);
   const [pin, setPin] = useState("");
   const [busy, setBusy] = useState(false);
   const error = useGate((s) => s.pinError);
@@ -32,8 +59,8 @@ function PinConfirmDialog({ reason, hello }: { reason: string; hello: boolean })
     }
   };
   return (
-    <Dialog open onOpenChange={(open) => !open && void cancelConfirmation()}>
-      <DialogContent className="sm:max-w-[26.25rem]" showCloseButton={false}>
+    <Dialog modal open onOpenChange={(open) => !open && void cancelConfirmation()}>
+      <DialogContent {...focus} className="sm:max-w-[26.25rem]" showCloseButton={false}>
         <form
           className="contents"
           onSubmit={(e) => {
@@ -69,13 +96,14 @@ function PinConfirmDialog({ reason, hello }: { reason: string; hello: boolean })
 
 function OsConfirmDialog() {
   const c = useGate((s) => s.confirming);
+  const focus = useGateFocus(!!c);
   const platform = useStore((s) => s.transport?.platform);
   const where = platform === "darwin" || !platform ? "this Mac" : "this machine";
   const label = c?.method_label || (platform === "windows" ? "Windows Hello" : "Touch ID or your Mac password");
   const grace = useGate((s) => s.graceAsked ?? s.safety?.gate.grace_minutes ?? 0);
   return (
-    <Dialog open={!!c} onOpenChange={(open) => !open && void cancelConfirmation()}>
-      <DialogContent className="sm:max-w-[26.25rem]" showCloseButton={false}>
+    <Dialog modal open={!!c} onOpenChange={(open) => !open && void cancelConfirmation()}>
+      <DialogContent {...focus} className="sm:max-w-[26.25rem]" showCloseButton={false}>
         <DialogHeader className="items-center text-center sm:text-center">
           <div className="mb-1 flex size-12 items-center justify-center rounded-full border border-brand/25 bg-brand/10">
             <Fingerprint className="size-6 text-brand" />

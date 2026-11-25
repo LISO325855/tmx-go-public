@@ -39,14 +39,14 @@ func TestProjectSectionLinksMerge(t *testing.T) {
 	if got := set([]string{}, true); len(got) != 0 {
 		t.Fatalf("clear: %v", got)
 	}
-	// At most 20 links in all: a merge past that is refused, not silently cut.
+	// A ceiling of 2000 links in all (20 until 17 Nov): a merge past that is refused, not silently cut.
 	var many []string
-	for i := 0; i < 20; i++ {
+	for i := 0; i < 2000; i++ {
 		many = append(many, fmt.Sprintf("https://x.test/%d", i))
 	}
 	set(many, true)
 	more := []string{"https://x.test/extra"}
 	if _, err := f.SetProjectSection(OwnerCaller, p.ID, ProjectSectionPatch{Links: &more}); KindOf(err) != KindInvalid {
-		t.Fatalf("21st link: %v", err)
+		t.Fatalf("2001st link: %v", err)
 	}
 }

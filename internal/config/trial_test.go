@@ -30,14 +30,17 @@ func TestTrialDisablesLegacyExternalServices(t *testing.T) {
 		t.Fatal(err)
 	}
 	c.fillDefaults()
-	if c.P2P.On() || c.P2P.DHTOn() || c.P2P.MDNSOn() || c.P2P.NATPortMapOn() || c.WhatsApp.On() || c.Companion.On() || *c.Update.Resolved().Auto {
+	if !*c.Update.Resolved().Auto {
+		t.Fatal("trial ignored explicit auto updates")
+	}
+	if c.P2P.On() || c.P2P.DHTOn() || c.P2P.MDNSOn() || c.P2P.NATPortMapOn() || c.WhatsApp.On() || c.Companion.On() {
 		t.Fatal("legacy config escaped trial isolation")
 	}
 }
 
-func TestTrialHomeIsolation(t *testing.T) {
+func TestOSDefaultTrialHome(t *testing.T) {
 	t.Setenv(EnvHome, "")
-	h, err := defaultHome()
+	h, err := OSDefaultHome()
 	if err != nil || filepath.Base(h) != "tmxg-trial" {
 		t.Fatalf("home = %q, %v", h, err)
 	}

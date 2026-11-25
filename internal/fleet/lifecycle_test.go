@@ -100,7 +100,7 @@ func TestFleetControlAPI(t *testing.T) {
 	}
 	fresh.State(model.StateIdle)
 	waitState(t, f, "w1", model.StateIdle)
-	if sent := fresh.Sent(); len(sent) != 1 || sent[0] != "fresh start: pick up the audit" {
+	if sent := fresh.Sent(); len(sent) != 1 || sent[0] != "[message from alpha-lead (lead)]\n│ fresh start: pick up the audit" {
 		t.Fatalf("fresh prompt not delivered: %q", sent)
 	}
 

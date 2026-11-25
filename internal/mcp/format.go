@@ -68,6 +68,9 @@ func FormatTree(s model.Snapshot) string {
 			fmt.Fprintf(&b, "  (%s)", a.Role)
 		}
 		b.WriteString("\n")
+		for _, warning := range a.MCPWarnings {
+			fmt.Fprintf(&b, "%s  WARNING: %s\n", indent, warning)
+		}
 	}
 	fmt.Fprintf(&b, "machine %s, workspace %s\n", s.Machine, s.Workspace)
 	children := map[string][]model.Agent{}

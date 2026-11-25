@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -12,7 +13,9 @@ import (
 
 	"github.com/blackcode-ch/tmx-go/internal/chat"
 	"github.com/blackcode-ch/tmx-go/internal/companion"
+	"github.com/blackcode-ch/tmx-go/internal/config"
 	"github.com/blackcode-ch/tmx-go/internal/fleet"
+	"github.com/blackcode-ch/tmx-go/internal/gate"
 	"github.com/blackcode-ch/tmx-go/internal/model"
 )
 
@@ -46,7 +49,8 @@ func companionAllowed(r *http.Request) bool {
 	return false
 }
 
-// linkLimiter allows the Companion caller 60 requests a minute.
+// linkLimiter allows the Companion caller 6000 requests a minute: a ceiling against a loop
+// hammering the daemon, far above real use (60 until 17 Nov).
 type linkLimiter struct {
 	mu    sync.Mutex
 	start time.Time
@@ -61,7 +65,7 @@ func (l *linkLimiter) allow() bool {
 		l.start, l.n = now, 0
 	}
 	l.n++
-	return l.n <= 60
+	return l.n <= 6000
 }
 
 func loopbackRemote(r *http.Request) bool {
@@ -105,18 +109,19 @@ func (s *Server) companionGuard(w http.ResponseWriter, r *http.Request) bool {
 func (s *Server) companionRoutes(mux *http.ServeMux) {
 	on := func(h http.HandlerFunc) http.HandlerFunc { return s.companionOn(h) }
 	o := func(h http.HandlerFunc) http.HandlerFunc { return on(s.ownerOnly(h)) }
-	mux.HandleFunc("GET /api/companion", o(s.companionStatus))
+	mux.HandleFunc("GET /api/companion", on(s.managers(s.companionStatus))) // the link's state, never a key: owner, head, leads
 	mux.HandleFunc("PUT /api/companion/connect", o(s.companionConnect))
 	mux.HandleFunc("DELETE /api/companion/connect", o(s.companionDisconnect))
+	mux.HandleFunc("PUT /api/companion/trusted-programs", o(s.companionTrusted)) // behind the owner gate
 	mux.HandleFunc("POST /api/companion/install", o(s.companionInstall))
 	mux.HandleFunc("DELETE /api/companion/install", o(s.companionUninstall))
 	mux.HandleFunc("POST /api/companion/open-connect", o(s.companionOpenConnect))
 	mux.HandleFunc("POST /api/companion/link-token", o(s.companionRotate))
 	mux.HandleFunc("POST /api/companion/preview", o(s.companionPreview))
-	mux.HandleFunc("GET /api/companion/tasks", o(s.companionTasks))
-	mux.HandleFunc("POST /api/companion/tasks", on(s.companionCreate)) // owner, or an agent whose profile allows it
+	mux.HandleFunc("GET /api/companion/tasks", on(s.managers(s.companionTasks))) // owner and head: all; a lead: its project's
+	mux.HandleFunc("POST /api/companion/tasks", on(s.companionCreate))           // owner, or an agent whose profile allows it
 	mux.HandleFunc("GET /api/companion/tasks/{id}", on(s.companionTask))
-	mux.HandleFunc("POST /api/companion/tasks/{id}/cancel", o(s.companionCancel))
+	mux.HandleFunc("POST /api/companion/tasks/{id}/cancel", on(s.managers(s.companionCancel)))
 	mux.HandleFunc("GET /api/companion/conversation", o(s.companionConversation))
 	mux.HandleFunc("POST /api/companion/messages", o(s.companionMessage))
 
@@ -161,25 +166,85 @@ func writeCompanionErr(w http.ResponseWriter, err error) {
 	writeErr(w, err)
 }
 
+// companionStatus: the state of the links with Companion (installed, connected, reachable, key
+// accepted, counts). It carries no key and no token. The owner; and since 17 Nov the head and
+// leads, who were told "only the owner can do this" and could not see why a message did not go.
 func (s *Server) companionStatus(w http.ResponseWriter, r *http.Request) {
+	if c, _ := caller(r); !s.f.IsManager(c) {
+		writeError(w, http.StatusForbidden, "only the owner, the head or a project's lead can do this")
+		return
+	}
 	probe := r.URL.Query().Get("probe") != "0"
 	writeJSON(w, http.StatusOK, s.companion.Status(r.Context(), probe))
 }
 
 func (s *Server) companionConnect(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		URL   string `json:"url"`
-		Token string `json:"token"`
+		URL            string `json:"url"`
+		Token          string `json:"token"`
+		RequireChecked bool   `json:"require_checked"`
 	}
 	if !decode(w, r, &req) {
 		return
 	}
-	st, err := s.companion.Connect(r.Context(), req.URL, req.Token)
+	st, err := s.companion.Connect(r.Context(), req.URL, req.Token, req.RequireChecked)
 	if err != nil {
 		writeCompanionErr(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, st)
+}
+
+// companionTrusted: PUT /api/companion/trusted-programs {"programs": ["C:\\...\\python.exe", ...]}.
+// The programs, besides the installed app, that the owner accepts as Companion's engine when
+// tmx checks who listens before it sends its key (a development Companion). Each is the full
+// path of a program or of a folder. Always behind the owner gate: it decides who may get the
+// key. An empty list takes them all away.
+func (s *Server) companionTrusted(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Programs []string `json:"programs"`
+	}
+	if !decode(w, r, &req) {
+		return
+	}
+	var clean []string
+	for _, p := range req.Programs {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if !filepath.IsAbs(p) || len(p) > 1024 || strings.ContainsAny(p, "\x00\r\n") {
+			writeError(w, http.StatusBadRequest, "give the full path of a program or of a folder: "+p)
+			return
+		}
+		clean = append(clean, filepath.Clean(p))
+	}
+	if len(clean) > 8 {
+		writeError(w, http.StatusBadRequest, "at most 8 trusted programs")
+		return
+	}
+	reason := "accept these programs as Companion (they may receive tmx's key): " + strings.Join(clean, ", ")
+	if len(clean) == 0 {
+		reason = "accept only the installed Companion app again"
+	}
+	if !s.requireOwner(w, r, gate.Action{Reason: reason, Key: actionKey(r, req), Always: true}) {
+		return
+	}
+	c, err := config.Load(s.f.Paths())
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if c.Companion == nil { // the section is absent until something is set
+		c.Companion = &config.CompanionConfig{}
+	}
+	c.Companion.TrustedPrograms = clean
+	if err := config.Save(s.f.Paths(), c); err != nil {
+		writeErr(w, err)
+		return
+	}
+	companion.SetTrustedPrograms(clean)
+	writeJSON(w, http.StatusOK, s.companion.Status(r.Context(), true))
 }
 
 func (s *Server) companionDisconnect(w http.ResponseWriter, r *http.Request) {
@@ -258,6 +323,18 @@ func (s *Server) companionTasks(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
+	// The owner and the head see every task and message; a lead those of its own project's
+	// agents (and its own); the owner's own tasks are the owner's and the head's.
+	c, _ := caller(r)
+	if !c.Owner {
+		seen := list[:0:0]
+		for _, t := range list {
+			if s.f.SeesAgent(c, t.AgentID) {
+				seen = append(seen, t)
+			}
+		}
+		list = seen
+	}
 	writeJSON(w, http.StatusOK, list)
 }
 
@@ -275,7 +352,7 @@ func (s *Server) companionCreate(w http.ResponseWriter, r *http.Request) {
 			writeCompanionErr(w, err)
 			return
 		}
-		if p.Effects != model.EffectsNone &&
+		if companion.NeedsTaskApproval(p.Effects) &&
 			!s.RequireOwner(w, r, "hand Companion a task that "+companion.EffectsLabel(p.Effects)+": “"+short(req.Spec.Goal, 60)+"”", req) {
 			return
 		}
@@ -291,7 +368,7 @@ func (s *Server) companionCreate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, "only the owner and agents hand tasks to Companion")
 		return
 	}
-	t, err := s.companion.CreateAgent(c.AgentID, req.Spec)
+	t, err := s.companion.CreateAgent(c.AgentID, req.Spec, req.OwnerOrderID)
 	if err != nil {
 		writeCompanionErr(w, err)
 		return
@@ -302,7 +379,7 @@ func (s *Server) companionCreate(w http.ResponseWriter, r *http.Request) {
 func (s *Server) companionTask(w http.ResponseWriter, r *http.Request) {
 	c, _ := caller(r)
 	t, err := s.companion.Get(r.PathValue("id"))
-	if err != nil || !c.Owner && t.AgentID != c.AgentID {
+	if err != nil || !s.f.SeesAgent(c, t.AgentID) {
 		writeError(w, http.StatusNotFound, "no Companion task "+strconv.Quote(r.PathValue("id")))
 		return
 	}
@@ -310,7 +387,25 @@ func (s *Server) companionTask(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) companionCancel(w http.ResponseWriter, r *http.Request) {
-	t, err := s.companion.Cancel(r.PathValue("id"), "")
+	c, _ := caller(r)
+	if !s.f.IsManager(c) {
+		writeError(w, http.StatusForbidden, "only the owner, the head or a project lead can cancel Companion tasks")
+		return
+	}
+	task, err := s.companion.Get(r.PathValue("id"))
+	if err != nil || !s.f.SeesAgent(c, task.AgentID) {
+		writeError(w, http.StatusNotFound, "no Companion task")
+		return
+	}
+	if task.Origin == "owner" && !c.Owner && c.AgentID != s.f.HeadID() {
+		writeError(w, http.StatusForbidden, "only the owner or the head can cancel the owner's Companion tasks")
+		return
+	}
+	note := ""
+	if !c.Owner {
+		note = "Cancelled by the head or project lead."
+	}
+	t, err := s.companion.Cancel(r.PathValue("id"), note)
 	if err != nil {
 		writeCompanionErr(w, err)
 		return

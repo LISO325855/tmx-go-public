@@ -464,10 +464,7 @@ func TestTopicLogRules(t *testing.T) {
 		t.Fatalf("the same line again: %+v %v %v", e2, added, err)
 	}
 	for _, bad := range []TopicEntryRequest{
-		{Topic: tp.ID, Kind: "info", Text: "api key: " + "sk-ant-" + strings.Repeat("A1b2", 6)},
-		{Topic: tp.ID, Kind: "info", Text: "fine", Link: "https://x.example/?token=abc123"},
-		{Topic: tp.ID, Kind: "info", Text: strings.Repeat("x", 401)},
-		{Topic: tp.ID, Kind: "info", Text: "1\n2\n3\n4"},
+		{Topic: tp.ID, Kind: "info", Text: strings.Repeat("x", maxTopicEntryText+1)},
 		{Topic: tp.ID, Kind: "rumour", Text: "nope"},
 		{Topic: tp.ID, Kind: "info", Text: "fix", Corrects: "0123456789abcdef"},
 		{Topic: other.ID, Kind: "info", Text: "fix", Corrects: e1.ID},
@@ -506,11 +503,12 @@ func TestTopicLogRules(t *testing.T) {
 	if _, added, _ := cleo.svc.AddTopicEntry(gid, TopicEntryRequest{Topic: tp.ID, Kind: "decision", Text: "CHF 600 each."}); added {
 		t.Fatal("cleo's copy of alex's line was new")
 	}
-	// Other members' lines: a secret, or an id that does not match the content, are dropped.
+	// Other members' lines: one of an unknown kind, or with an id that does not match the
+	// content, is dropped.
 	now := model.Now()
-	secret := "password: hunter22"
+	rumour := "heard it somewhere"
 	bad, _ := json.Marshal(topicBody{V: WireVersion, Entries: []wireEntry{
-		{ID: topicEntryID(tp.ID, "info", secret, now), Topic: tp.ID, Kind: "info", Text: secret, At: now},
+		{ID: topicEntryID(tp.ID, "rumour", rumour, now), Topic: tp.ID, Kind: "rumour", Text: rumour, At: now},
 		{ID: "0123456789abcdef", Topic: tp.ID, Kind: "info", Text: "forged id", At: now},
 		{ID: topicEntryID(tp.ID, "info", "good one", now), Topic: tp.ID, Kind: "info", Text: "good one", At: now},
 	}})
@@ -518,7 +516,7 @@ func TestTopicLogRules(t *testing.T) {
 		t.Fatal(err)
 	}
 	eventually(t, "alex takes the good line", func() bool { return strings.Contains(entryTexts(board(t, alex, gid)), "good one") })
-	if x := entryTexts(board(t, alex, gid)); strings.Contains(x, "hunter") || strings.Contains(x, "forged") {
+	if x := entryTexts(board(t, alex, gid)); strings.Contains(x, "heard it") || strings.Contains(x, "forged") {
 		t.Fatalf("alex's log: %s", x)
 	}
 }
@@ -724,7 +722,7 @@ func TestAgentOrganisesBoard(t *testing.T) {
 		t.Fatalf("an agent outside the chat moved a message: %v", err)
 	}
 
-	// The budget: AgentBoardChanges per window (3 used above), then refused; the owner never is.
+	// No budget of board changes (17 Nov): well past the former AgentBoardChanges per window.
 	colors := []string{"red", "blue"}
 	for i := 3; i < AgentBoardChanges; i++ {
 		c := colors[i%2]
@@ -733,19 +731,31 @@ func TestAgentOrganisesBoard(t *testing.T) {
 		}
 	}
 	c := "green"
-	if _, err := bo.svc.UpdateTopicAs(head, gid, tp.ID, TopicPatch{Color: &c}); fleet.KindOf(err) != fleet.KindTooMany {
-		t.Fatalf("over the budget: %v", err)
+	if _, err := bo.svc.UpdateTopicAs(head, gid, tp.ID, TopicPatch{Color: &c}); err != nil {
+		t.Fatalf("beyond the former budget: %v", err)
 	}
 	if _, err := bo.svc.UpdateTopic(gid, tp.ID, TopicPatch{Color: &c}); err != nil {
 		t.Fatalf("the owner is limited: %v", err)
 	}
+	// Topic text follows the same content policy as messages.
+	key, words := "deploy key AKIA"+"IOSFODNN7EXAMPLE", "certificate password and 2FA"
+	if _, err := bo.svc.UpdateTopicAs(head, gid, tp.ID, TopicPatch{Title: &key}); err != nil {
+		t.Fatalf("an agent's title with an access key: %v", err)
+	}
+	if _, err := bo.svc.CreateTopicAs(head, gid, TopicRequest{Title: "New " + key}); err != nil {
+		t.Fatalf("an agent's new topic with an access key: %v", err)
+	}
+	if _, err := bo.svc.UpdateTopicAs(head, gid, tp.ID, TopicPatch{Title: &words}); err != nil {
+		t.Fatalf("an agent's title with the words password and 2FA: %v", err)
+	}
+	if _, err := bo.svc.UpdateTopic(gid, tp.ID, TopicPatch{Title: &key}); err != nil {
+		t.Fatalf("the owner's title: %v", err)
+	}
 }
 
-// agentBoardChangeLocked used to read c.AgentID == "" as "this is the owner, never limited" -
-// true for the owner, but also true for a peer machine (its standing is c.Peer, not c.AgentID)
-// and for Companion, so both bypassed the per-caller rate limit entirely. Only c.Owner skips it
-// now; every other caller, including an empty AgentID, is limited.
-func TestAgentBoardChangeLimitsPeerAndCompanion(t *testing.T) {
+// Board changes are counted per caller (for a report of a runaway) and never refused: agents,
+// a peer machine and Companion alike (the budget of AgentBoardChanges was removed on 17 Nov).
+func TestBoardChangesAreNeverRefused(t *testing.T) {
 	for _, c := range []fleet.Caller{fleet.PeerCaller("hosta"), fleet.CompanionCaller} {
 		s := &Service{}
 		for i := 0; i < AgentBoardChanges; i++ {
@@ -753,8 +763,8 @@ func TestAgentBoardChangeLimitsPeerAndCompanion(t *testing.T) {
 				t.Fatalf("%+v change %d: %v", c, i, err)
 			}
 		}
-		if err := s.agentBoardChangeLocked(c); fleet.KindOf(err) != fleet.KindTooMany {
-			t.Fatalf("%+v over the budget: %v", c, err)
+		if err := s.agentBoardChangeLocked(c); err != nil {
+			t.Fatalf("%+v beyond the former budget: %v", c, err)
 		}
 	}
 	// The owner is still never limited.

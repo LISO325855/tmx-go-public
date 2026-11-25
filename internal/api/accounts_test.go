@@ -54,6 +54,7 @@ func TestAccountsOwnerOnly(t *testing.T) {
 	routes := []struct{ method, path string }{
 		{"GET", "/api/accounts"}, {"POST", "/api/accounts/refresh"}, {"POST", "/api/accounts/claude/login"},
 		{"DELETE", "/api/accounts/claude/login"}, {"GET", "/api/accounts/claude/login/terminal"}, {"POST", "/api/accounts/claude/logout"},
+		{"POST", "/api/accounts/claude/reset"},
 	}
 	for _, r := range routes {
 		if s := agent.do(r.method, r.path, nil, nil); s != http.StatusForbidden {

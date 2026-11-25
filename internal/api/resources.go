@@ -24,6 +24,8 @@ func (s *Server) resourceRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/slots/{id}/wait", s.withSlots(s.waitSlot))
 	mux.HandleFunc("POST /api/slots/{id}/renew", s.withSlots(s.renewSlot))
 	mux.HandleFunc("DELETE /api/slots/{id}", s.withSlots(s.releaseSlot))
+	mux.HandleFunc("POST /api/slots/recovery", s.withSlots(s.recoverSlot))
+	mux.HandleFunc("DELETE /api/slots/recovery", s.withSlots(s.recoverSlot))
 }
 
 func (s *Server) withResources(h http.HandlerFunc) http.HandlerFunc {
@@ -134,6 +136,8 @@ func writeSlotErr(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusNotFound, err.Error())
 	case errors.Is(err, slots.ErrForbidden):
 		writeError(w, http.StatusForbidden, err.Error())
+	case errors.Is(err, slots.ErrClosed):
+		writeError(w, http.StatusServiceUnavailable, err.Error())
 	case errors.Is(err, slots.ErrUnknownKind):
 		writeError(w, http.StatusBadRequest, err.Error())
 	case errors.Is(err, slots.ErrTooMany):
@@ -166,7 +170,7 @@ func (s *Server) acquireSlot(w http.ResponseWriter, r *http.Request) {
 		writeSlotErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, l)
+	s.writeSlotGrant(w, r, http.StatusCreated, l)
 }
 
 // waitSlot renews a lease and waits (long poll, ?timeout= seconds, default 15, at most 30)
@@ -186,7 +190,7 @@ func (s *Server) waitSlot(w http.ResponseWriter, r *http.Request) {
 		writeSlotErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, l)
+	s.writeSlotGrant(w, r, http.StatusOK, l)
 }
 
 func (s *Server) renewSlot(w http.ResponseWriter, r *http.Request) {

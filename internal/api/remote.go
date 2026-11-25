@@ -82,7 +82,9 @@ func (s *Server) remote(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		onBehalf = "agent:" + a.Name
-	} else if id := s.deviceID(r); id != "" {
+	} else if id := sessionDevice(r); id != "" {
+		// guard authenticates the device session and checks the phone lock
+		// before this handler. A cookie on a bearer request is not provenance.
 		onBehalf = "device:" + id
 	}
 	var req struct {

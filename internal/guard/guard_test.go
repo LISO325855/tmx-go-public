@@ -230,16 +230,20 @@ func TestPOSIXCommands(t *testing.T) {
 		{"osascript -e 'tell app \"System Events\" to shut down'", B, RuleShutdown},
 		{"launchctl reboot", B, RuleShutdown},
 		// blocked: tmx's state and CLI
-		{"cat ~/Library/Application\\ Support/tmx-go/secrets/owner-token", B, RuleTmxState},
-		{"cat \"$HOME/Library/Application Support/tmx-go/secrets/owner-token\"", B, RuleTmxState},
-		{"cp ~/Library/'Application Support'/tmx-go/agents/k2m4/mcp.json /tmp/x", B, RuleTmxState},
+		{"cat ~/Library/Application\\ Support/tmx-go/secrets/owner-token", A, ""}, // reading is free (17 Nov)
+		{"cat \"$HOME/Library/Application Support/tmx-go/secrets/owner-token\"", A, ""},
+		{"cp ~/Library/'Application Support'/tmx-go/agents/k2m4/mcp.json /tmp/x", A, ""},
 		{"echo '{}' > ~/Library/Application\\ Support/tmx-go/config.json", B, RuleTmxState},
 		{"rm ~/Library/Application\\ Support/tmx-go/tmx.db", B, RuleTmxState},
 		{"rm -rf ~/Library/Application\\ Support", B, RuleTmxState},
-		{"sqlite3 ~/Library/Application\\ Support/tmx-go/secrets/x.db .dump", B, RuleTmxState},
-		{"sqlite3 ~/Library/Application\\ Support/tmx-go/secrets/whatsapp.db .dump", B, RuleTmxState},
-		{"ls ~/Library/Application\\ Support/tmx-go/whatsapp/media", B, RuleTmxState},
-		{"tar czf /tmp/s.tgz ~/Library/Application\\ Support/tmx-go/secrets", B, RuleTmxState},
+		{"sqlite3 ~/Library/Application\\ Support/tmx-go/secrets/x.db .dump", A, ""},
+		{"sqlite3 ~/Library/Application\\ Support/tmx-go/secrets/whatsapp.db .dump", A, ""},
+		{"ls ~/Library/Application\\ Support/tmx-go/whatsapp/media", A, ""},
+		// the node's copy of the fleet rules: an agent writing it would write every agent's instructions
+		{"echo '{}' > ~/Library/Application\\ Support/tmx-go/rules/state.json", B, RuleTmxState},
+		{"cp /tmp/hook ~/Library/Application\\ Support/tmx-go/rules/repo.git/hooks/reference-transaction", B, RuleTmxState},
+		{"rm -rf ~/Library/Application\\ Support/tmx-go/rules", B, RuleTmxState},
+		{"tar czf /tmp/s.tgz ~/Library/Application\\ Support/tmx-go/secrets", B, RuleTmxState}, // archive tools never touch the state folder (18 Nov)
 		{"tmx approve k2m4n6p8q3", B, RuleTmxCLI},
 		{"tmx gate off", B, RuleTmxCLI},
 		{"tmx open", B, RuleTmxCLI},
@@ -321,7 +325,8 @@ func TestLinuxCommands(t *testing.T) {
 		{"rm -rf /var/lib/docker", H, RuleDeleteOutside},
 		{"rm -rf /var/log", B, RuleDeleteRoot},
 		{"rm -rf /tmp/x", A, ""},
-		{"cat ~/.local/state/tmx-go/secrets/owner-token", B, RuleTmxState},
+		{"cat ~/.local/state/tmx-go/secrets/owner-token", A, ""},
+		{"echo x > ~/.local/state/tmx-go/secrets/owner-token", B, RuleTmxState},
 		{"ls ~/.local/state/tmx-go", A, ""},
 		{"tail -n 50 ~/.local/state/tmx-go/logs/daemon.log", A, ""},
 		{"git push --force", A, ""}, // on a feature branch
@@ -376,7 +381,8 @@ func TestWindowsCommands(t *testing.T) {
 		{"icacls C:\\ /grant Everyone:F /T", B, RulePermsRoot},
 		{"icacls C:\\Windows /reset /T", B, RulePermsRoot},
 		{"takeown /F C:\\Windows\\System32 /R /D Y", B, RulePermsRoot},
-		{"Get-Content $env:LOCALAPPDATA\\tmx-go\\secrets\\owner-token", B, RuleTmxState},
+		{"Get-Content $env:LOCALAPPDATA\\tmx-go\\secrets\\owner-token", A, ""},
+		{"Set-Content $env:LOCALAPPDATA\\tmx-go\\secrets\\owner-token x", B, RuleTmxState},
 		{"cmd /c \"rd /s /q C:\\\"", B, RuleDeleteRoot},
 		{"cmd /c taskkill /F /IM node.exe", B, RuleKillByName},
 		{"powershell -Command \"Stop-Process -Name node\"", B, RuleKillByName},
@@ -440,9 +446,10 @@ func TestFileTools(t *testing.T) {
 		{"Write", `{"file_path":"/Users/owner/Projects/billing/.claude/settings.local.json"}`, Hold, RuleClaudeConfig},
 		{"Write", `{"file_path":"~/.claude/settings.json"}`, Hold, RuleClaudeConfig},
 		{"MultiEdit", `{"file_path":"/Users/owner/Library/Application Support/tmx-go/config.json"}`, Block, RuleTmxState},
-		{"Read", `{"file_path":"/Users/owner/Library/Application Support/tmx-go/secrets/owner-token"}`, Block, RuleTmxState},
-		{"Grep", `{"pattern":"token","path":"/Users/owner/Library/Application Support/tmx-go/agents"}`, Block, RuleTmxState},
-		{"Read", `{"file_path":"/Users/owner/Library/Application Support/tmx-go/whatsapp/media/0a1b2c.jpg"}`, Block, RuleTmxState},
+		{"Read", `{"file_path":"/Users/owner/Library/Application Support/tmx-go/secrets/owner-token"}`, Allow, ""}, // reading is free (17 Nov)
+		{"Write", `{"file_path":"/Users/owner/Library/Application Support/tmx-go/secrets/owner-token","content":"x"}`, Block, RuleTmxState},
+		{"Grep", `{"pattern":"token","path":"/Users/owner/Library/Application Support/tmx-go/agents"}`, Allow, ""},
+		{"Read", `{"file_path":"/Users/owner/Library/Application Support/tmx-go/whatsapp/media/0a1b2c.jpg"}`, Allow, ""},
 		{"NotebookEdit", `{"notebook_path":"/Users/owner/Desktop/x.ipynb"}`, Hold, RuleWriteOutside},
 		{"Write", `{"file_path":"relative/inside.txt"}`, Allow, ""},
 		{"WebFetch", `{"url":"https://example.com"}`, Allow, ""},
@@ -490,16 +497,27 @@ func TestEveryRuleHasAnExplanationAndATest(t *testing.T) {
 }
 
 func TestSettings(t *testing.T) {
+	// No master switch: the only thing the general settings can weaken is browser automation.
 	s := DefaultSettings()
-	if !s.On("worker") {
-		t.Fatal("default must be on")
-	}
-	off := Settings{Enabled: true, OffFor: []string{"worker"}}
-	if off.On("worker") || !off.On("lead") {
-		t.Fatal("off_for")
-	}
-	if !s.Weaker(off) || off.Weaker(s) || !s.Weaker(Settings{}) || (Settings{}).Weaker(s) {
+	browser := Settings{AllowBrowserAutomation: true}
+	if !s.Weaker(browser) || browser.Weaker(s) || s.Weaker(Settings{}) {
 		t.Fatal("weaker")
+	}
+	// An older config.json still carries the switch: it is read (so the upgrade can log what it
+	// dropped) and changes nothing.
+	var old Settings
+	if err := json.Unmarshal([]byte(`{"enabled": false, "off_for": ["worker"], "rule_states": {"disk": "allow"}}`), &old); err != nil {
+		t.Fatal(err)
+	}
+	if old.LegacyEnabled == nil || *old.LegacyEnabled || len(old.LegacyOffFor) != 1 {
+		t.Fatalf("legacy switch not read: %+v", old)
+	}
+	if s.Weaker(old) || old.Effective()[RuleDisk] != Allow || old.Effective()[RuleBoot] != Block {
+		t.Fatalf("the legacy switch changed what the settings do: %v", old.Effective())
+	}
+	b, err := json.Marshal(DefaultSettings())
+	if err != nil || strings.Contains(string(b), "enabled") || strings.Contains(string(b), "off_for") {
+		t.Fatalf("default settings still carry the switch: %s %v", b, err)
 	}
 }
 

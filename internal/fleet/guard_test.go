@@ -56,12 +56,12 @@ func TestGuardHookAtLaunch(t *testing.T) {
 		t.Fatalf("settings.json mode %v", st.Mode().Perm())
 	}
 
-	// Off for workers: a worker launched now gets no hook; the head (on) restarts with one.
-	if _, err := f.SetGuardSettings(OwnerCaller, guard.Settings{Enabled: true, OffFor: []string{"Worker"}}); err != nil {
-		t.Fatal(err)
-	}
-	if got := f.GuardSettings(); len(got.OffFor) != 1 || got.OffFor[0] != "worker" {
-		t.Fatalf("settings: %+v", got)
+	// There is no master switch. What an older client still sends as one ("enabled": false,
+	// "off_for": ["worker"]) is ignored: every level keeps the hook.
+	off := false
+	got, err := f.SetGuardSettings(OwnerCaller, guard.Settings{LegacyEnabled: &off, LegacyOffFor: []string{"Worker"}})
+	if err != nil || got.LegacyEnabled != nil || got.LegacyOffFor != nil {
+		t.Fatalf("the removed switch was taken: %+v %v", got, err)
 	}
 	if _, err := f.CreateProject(OwnerCaller, ProjectRequest{Name: "alpha"}); err != nil {
 		t.Fatal(err)
@@ -70,14 +70,13 @@ func TestGuardHookAtLaunch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if e.chat.Last(w.ID).Spec.SettingsPath != "" {
-		t.Fatal("guard off for workers, yet the worker got the hook")
-	}
-	if e.chat.Last(mustAgent(t, f, "alpha-lead").ID).Spec.SettingsPath == "" {
-		t.Fatal("the lead lost the hook")
-	}
-	if _, err := f.SetGuardSettings(OwnerCaller, guard.DefaultSettings()); err != nil {
-		t.Fatal(err)
+	for _, id := range []string{w.ID, mustAgent(t, f, "alpha-lead").ID, head.ID} {
+		if e.chat.Last(id).Spec.SettingsPath == "" {
+			t.Fatalf("agent %s started without the hook", id)
+		}
+		if n := guardWarnings(t, f, id); n != 0 {
+			t.Fatalf("a guarded agent got %d guard warnings", n)
+		}
 	}
 	sh, err := f.LaunchAgent(OwnerCaller, LaunchRequest{Name: "sh1", ProjectID: "alpha", Level: model.LevelWorker, Harness: model.HarnessShell})
 	if err != nil || e.term.Last(sh.ID) == nil || e.term.Last(sh.ID).Spec.SettingsPath != "" {
@@ -98,6 +97,16 @@ func TestGuardHoldFlow(t *testing.T) {
 
 	req := HoldRequest{Tool: "Bash", ToolInput: json.RawMessage(`{"command":"sudo true"}`), Command: "sudo true",
 		Rule: guard.RuleElevation, Detail: "sudo runs a command with administrator rights", Match: "sudo true"}
+	// Administrator rights are Held by default (17 Nov); for the check that an Allowed rule has
+	// nothing to hold, the owner sets it to Allowed first.
+	if _, err := f.SetRuleState(OwnerCaller, guard.RuleElevation, guard.Allow); err != nil {
+		t.Fatal(err)
+	}
+	// The hook of an Allowed rule has nothing to hold.
+	if _, err := f.Hold(me, req); KindOf(err) != KindInvalid {
+		t.Fatalf("a hold for a rule that is Allowed: %v", err)
+	}
+	holdRules(t, f, guard.RuleElevation)
 	if _, err := f.Hold(OwnerCaller, req); KindOf(err) != KindForbidden {
 		t.Fatal("the owner created a hold")
 	}
@@ -185,8 +194,13 @@ func TestGuardHoldFlow(t *testing.T) {
 func TestGuardBlockTimelineAndRecovery(t *testing.T) {
 	e := newEnv(t)
 	f := e.started()
+	holdRules(t, f, guard.RuleElevation)
 	head := mustAgent(t, f, "head")
 	me := callerFor(t, f, e.chat, head.ID)
+	if err := f.ReportBlock(me, HoldRequest{Tool: "Bash", Command: "pkill vite", Rule: guard.RuleKillByName,
+		Detail: "pkill kills every process with that name", Match: "pkill vite"}); err != nil {
+		t.Fatalf("kill-by-name is a fixed block: %v", err)
+	}
 	if err := f.ReportBlock(me, HoldRequest{Tool: "Bash", Command: "pkill node", Rule: guard.RuleKillTmx, // node is a tmx runtime name: the fixed carve-out
 		Detail: "pkill kills every process with that name", Match: "pkill node"}); err != nil {
 		t.Fatal(err)
@@ -279,9 +293,45 @@ func TestStopAndRemoveAgentDeleteCodexGuardAuthCopy(t *testing.T) {
 	}
 }
 
-// A Claude agent whose folder sets disableAllHooks must be refused at launch (it would run with
-// no guard at all, not merely a warning in its timeline).
-func TestHooksDisabledRefusesLaunch(t *testing.T) {
+// guardWarnings counts the "runs without the command guard" rows in an agent's timeline.
+func guardWarnings(t *testing.T, f *Fleet, idOrName string) int {
+	t.Helper()
+	tl, err := f.Timeline(idOrName, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, e := range tl {
+		if _, ok := e.Meta["guard_warning"]; !ok {
+			continue
+		}
+		if e.Kind != model.EntryError || !e.IsError || !strings.Contains(e.Text, "runs without the command guard") {
+			t.Fatalf("guard warning row: %+v", e)
+		}
+		n++
+	}
+	return n
+}
+
+// lastGuardWarning is the text of the agent's newest guard warning row.
+func lastGuardWarning(t *testing.T, f *Fleet, idOrName string) string {
+	t.Helper()
+	tl, err := f.Timeline(idOrName, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := len(tl) - 1; i >= 0; i-- {
+		if _, ok := tl[i].Meta["guard_warning"]; ok {
+			return tl[i].Text
+		}
+	}
+	return ""
+}
+
+// Agents always start (the owner, 17 Nov). A Claude agent whose folder sets disableAllHooks starts
+// too, with an error row in its timeline that names the file, and without the bypass mode that
+// relies on the hook: Claude's own prompts stay.
+func TestHooksDisabledStartsWithWarning(t *testing.T) {
 	e := newEnv(t)
 	f := e.started()
 	proj, err := f.CreateProject(OwnerCaller, ProjectRequest{Name: "alpha"})
@@ -291,19 +341,51 @@ func TestHooksDisabledRefusesLaunch(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(proj.Folder, ".claude"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(proj.Folder, ".claude", "settings.local.json"),
-		[]byte(`{"disableAllHooks": true}`), 0o644); err != nil {
+	file := filepath.Join(proj.Folder, ".claude", "settings.local.json")
+	if err := os.WriteFile(file, []byte(`{"disableAllHooks": true}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	_, err = f.LaunchAgent(OwnerCaller, LaunchRequest{Name: "w1", ProjectID: "alpha", Level: model.LevelWorker})
-	if err == nil || !strings.Contains(err.Error(), "the command guard is disabled in") {
-		t.Fatalf("launch error: %v", err)
+	w, err := f.LaunchAgent(OwnerCaller, LaunchRequest{Name: "w1", ProjectID: "alpha", Level: model.LevelWorker})
+	if err != nil || e.chat.Last(w.ID) == nil {
+		t.Fatalf("an agent with hooks disabled did not start: %v", err)
+	}
+	if a := mustAgent(t, f, "w1"); a.State == model.StateError || a.Error != "" {
+		t.Fatalf("started in error: %+v", a)
+	}
+	if n := guardWarnings(t, f, w.ID); n != 1 {
+		t.Fatalf("%d guard warnings, want 1", n)
+	}
+	if text := lastGuardWarning(t, f, w.ID); !strings.Contains(text, file) || !strings.Contains(text, "disableAllHooks") {
+		t.Fatalf("warning does not name the file: %s", text)
+	}
+	spec := e.chat.Last(w.ID).Spec
+	if spec.SettingsPath == "" || spec.PermissionMode == "bypassPermissions" {
+		t.Fatalf("unguarded agent: settings %q, mode %q (the hook file stays; bypass needs a working hook)", spec.SettingsPath, spec.PermissionMode)
+	}
+	// Every start says it again; once the setting is gone the agent starts guarded, silently.
+	if _, err := f.RestartAgent(OwnerCaller, w.ID); err != nil {
+		t.Fatal(err)
+	}
+	if n := guardWarnings(t, f, w.ID); n != 2 {
+		t.Fatalf("%d guard warnings after a restart, want 2", n)
+	}
+	if err := os.Remove(file); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.RestartAgent(OwnerCaller, w.ID); err != nil {
+		t.Fatal(err)
+	}
+	if n := guardWarnings(t, f, w.ID); n != 2 {
+		t.Fatalf("%d guard warnings once hooks are back, want still 2", n)
+	}
+	if spec := e.chat.Last(w.ID).Spec; spec.PermissionMode != "bypassPermissions" {
+		t.Fatalf("guarded again, mode %q", spec.PermissionMode)
 	}
 }
 
 // The agents' own CLAUDE_CONFIG_DIR (<state>/claude-config) counts too: Claude reads its user
 // settings there, not in ~/.claude (o4, 3 Nov).
-func TestHooksDisabledInClaudeConfigRefusesLaunch(t *testing.T) {
+func TestHooksDisabledInClaudeConfigWarns(t *testing.T) {
 	e := newEnv(t)
 	f := e.started()
 	if _, err := f.CreateProject(OwnerCaller, ProjectRequest{Name: "alpha"}); err != nil {
@@ -317,14 +399,18 @@ func TestHooksDisabledInClaudeConfigRefusesLaunch(t *testing.T) {
 	if err := os.WriteFile(cfg, []byte(`{"disableAllHooks": true}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	_, err := f.LaunchAgent(OwnerCaller, LaunchRequest{Name: "w1", ProjectID: "alpha", Level: model.LevelWorker})
-	if err == nil || !strings.Contains(err.Error(), "claude-config") {
+	w, err := f.LaunchAgent(OwnerCaller, LaunchRequest{Name: "w1", ProjectID: "alpha", Level: model.LevelWorker})
+	if err != nil || e.chat.Last(w.ID) == nil {
 		t.Fatalf("launch with hooks off in claude-config: %v", err)
+	}
+	if text := lastGuardWarning(t, f, w.ID); !strings.Contains(text, "claude-config") {
+		t.Fatalf("warning: %q", text)
 	}
 	if err := os.WriteFile(cfg, []byte(`{"model": "opus"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.LaunchAgent(OwnerCaller, LaunchRequest{Name: "w2", ProjectID: "alpha", Level: model.LevelWorker}); err != nil {
+	w2, err := f.LaunchAgent(OwnerCaller, LaunchRequest{Name: "w2", ProjectID: "alpha", Level: model.LevelWorker})
+	if err != nil || guardWarnings(t, f, w2.ID) != 0 {
 		t.Fatalf("launch with hooks on: %v", err)
 	}
 }

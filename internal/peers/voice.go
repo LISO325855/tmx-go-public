@@ -31,7 +31,7 @@ var voiceID = regexp.MustCompile(`^[a-f0-9]{16}$`)
 
 // ValidateVoicePeer rejects arbitrary hosts and unpaired machines before audio is read.
 func (c *Client) ValidateVoicePeer(host string) error {
-	p, ok := c.peers[host]
+	p, ok := c.lookup(host)
 	if !ok || !config.ValidHostName(host) {
 		return fmt.Errorf("%w: transcription target is not a fleet peer", transcribe.ErrInvalid)
 	}
@@ -66,7 +66,11 @@ func (c *Client) voiceCall(ctx context.Context, host, method, path string, body,
 	} // Python's local review model allows ten minutes
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, method, c.peers[host].URL+path, rd)
+	peer, ok := c.lookup(host)
+	if !ok {
+		return fmt.Errorf("peer removed")
+	}
+	req, err := http.NewRequestWithContext(ctx, method, peer.URL+path, rd)
 	if err != nil {
 		return err
 	}
@@ -75,6 +79,9 @@ func (c *Client) voiceCall(ctx context.Context, host, method, path string, body,
 	req.Header.Set(HeaderFrom, c.machine)
 	req.Header.Set(HeaderOnBehalf, "operator") // work admitted by this daemon's existing owner routes
 	req.Header.Set("Content-Type", "application/json")
+	if path == "/api/peer/dictate" {
+		req.Header.Set("X-Transcription-Local-Only", "true")
+	}
 	res, err := c.http.Do(req)
 	if err != nil {
 		return fmt.Errorf("%w: %s is unreachable", transcribe.ErrPending, host)
@@ -104,12 +111,34 @@ func (c *Client) voiceCall(ctx context.Context, host, method, path string, body,
 		if msg == "" {
 			msg = http.StatusText(res.StatusCode)
 		}
+		if path == "/api/peer/dictate" {
+			return Refused{res.StatusCode, host + ": " + msg}
+		}
 		return Refused{res.StatusCode, host + ": " + msg + "; audio retained locally"}
 	}
 	if json.Unmarshal(b, out) != nil {
 		return fmt.Errorf("%w: invalid response from %s", transcribe.ErrPending, host)
 	}
 	return nil
+}
+
+// DictatePeer sends a bounded WAV in one request. No upload receipt, durable job,
+// checkpoint or retry survives this call. Older recording-only peers fail visibly.
+func (c *Client) DictatePeer(ctx context.Context, host string, wav []byte, language string) (transcribe.Result, error) {
+	var result transcribe.Result
+	err := c.voiceCall(ctx, host, "POST", "/api/peer/dictate", map[string]string{"data": base64.StdEncoding.EncodeToString(wav), "language": language}, &result)
+	var refused Refused
+	if errors.As(err, &refused) && refused.Status == http.StatusUnprocessableEntity {
+		return result, transcribe.ErrNoSpeech
+	}
+	// ErrPending describes only durable recording jobs; dictation has no replay/receipt.
+	if errors.Is(err, transcribe.ErrPending) {
+		return result, fmt.Errorf("dictation peer did not finish: %v", err)
+	}
+	if err == nil && strings.TrimSpace(result.Text) == "" {
+		return result, transcribe.ErrNoSpeech
+	}
+	return result, err
 }
 
 // TranscribePeer advances a resumable upload, then polls once. Every acknowledged

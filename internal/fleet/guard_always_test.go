@@ -2,6 +2,7 @@ package fleet
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/blackcode-ch/tmx-go/internal/guard"
@@ -13,6 +14,7 @@ import (
 func TestGuardAllowAlways(t *testing.T) {
 	e := newEnv(t)
 	f := e.started()
+	holdRules(t, f, guard.RuleElevation)
 	head := mustAgent(t, f, "head")
 	me := callerFor(t, f, e.chat, head.ID)
 	e.chat.Last(head.ID).State(model.StateWorking)
@@ -81,10 +83,30 @@ func TestGuardAllowAlways(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := f.Decide(OwnerCaller, ap.ID, DecideRequest{Decision: DecisionAllowAlways, Scope: "any"}); KindOf(err) != KindInvalid {
-			t.Fatalf("%q was remembered: %v", cmd, err)
+		// The owner has already confirmed: the card must not stay open. It is allowed this
+		// once, nothing is remembered, and the answer says so.
+		got, err := f.Decide(OwnerCaller, ap.ID, DecideRequest{Decision: DecisionAllowAlways, Scope: "any"})
+		if err != nil || got.State != model.ApprovalAllowed || !strings.HasPrefix(got.Answer, AllowedOnceNotAlways) || !strings.Contains(got.Answer, "only known when it runs") {
+			t.Fatalf("%q: %+v %v", cmd, got, err)
 		}
-		f.CancelHold(me, ap.ID)
+		if stored, _ := f.ApprovalByID(ap.ID); stored.State != model.ApprovalAllowed {
+			t.Fatalf("%q: the card stayed open: %+v", cmd, stored)
+		}
+		if again, err := f.Hold(me, HoldRequest{Tool: "Bash", Command: cmd, Rule: guard.RuleElevation, Cwd: "/work/a"}); err != nil || again.State != model.ApprovalPending {
+			t.Fatalf("%q was remembered: %+v %v", cmd, again, err)
+		} else {
+			f.CancelHold(me, again.ID)
+		}
+	}
+	// A long multi-line command with a variable (the case of 17 Nov): resolved, once.
+	long := "sudo bash -c '\n" + strings.Repeat("echo step\n", 200) + "cp $SRC /etc/x\n'"
+	lap, err := f.Hold(me, HoldRequest{Tool: "Bash", Command: long, Rule: guard.RuleElevation, Cwd: "/work/a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := f.Decide(OwnerCaller, lap.ID, DecideRequest{Decision: DecisionAllowAlways, Scope: "agent"}); err != nil || got.State != model.ApprovalAllowed ||
+		!strings.HasPrefix(got.Answer, AllowedOnceNotAlways) {
+		t.Fatalf("a long multi-line command: %+v %v", got, err)
 	}
 	if n := len(f.GuardSettings().AlwaysAllow); n != 1 {
 		t.Fatalf("run-time commands added entries: %d", n)
@@ -99,7 +121,7 @@ func TestGuardAllowAlways(t *testing.T) {
 	}
 
 	// PUT of the settings neither adds nor drops standing allows.
-	inject := guard.Settings{Enabled: true, AlwaysAllow: []guard.AlwaysAllow{{ID: "x", Rule: guard.RuleElevation, Tool: "Bash", Command: "sudo evil"}}}
+	inject := guard.Settings{AlwaysAllow: []guard.AlwaysAllow{{ID: "x", Rule: guard.RuleElevation, Tool: "Bash", Command: "sudo evil"}}}
 	if s, err := f.SetGuardSettings(OwnerCaller, inject); err != nil || len(s.AlwaysAllow) != 1 || s.AlwaysAllow[0].ID == "x" || s.AlwaysAllow[0].Cwd != "/work/a" {
 		t.Fatalf("settings PUT changed the allows: %+v %v", s.AlwaysAllow, err)
 	}

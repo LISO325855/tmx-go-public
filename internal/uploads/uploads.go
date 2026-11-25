@@ -22,9 +22,9 @@ import (
 
 const (
 	// MaxFileBytes is the largest file one upload takes.
-	MaxFileBytes = 20 << 20
+	MaxFileBytes = 100 << 20 // held in memory on the way in; 20 MB until 17 Nov
 	// MaxPerMessage is how many files one message carries.
-	MaxPerMessage = 10
+	MaxPerMessage = 100 // 10 until 17 Nov
 	maxNameRunes  = 120
 	metaFile      = "meta.json"
 )
@@ -37,13 +37,14 @@ var (
 
 // File describes one stored upload.
 type File struct {
-	ID        string `json:"id"`
-	AgentID   string `json:"agent_id"`
-	Name      string `json:"name"`
-	Type      string `json:"type"`
-	Size      int64  `json:"size"`
-	Path      string `json:"path"`
-	CreatedAt int64  `json:"created_at"`
+	ID         string `json:"id"`
+	AgentID    string `json:"agent_id"`
+	UploaderID string `json:"uploader_id,omitempty"`
+	Name       string `json:"name"`
+	Type       string `json:"type"`
+	Size       int64  `json:"size"`
+	Path       string `json:"path"`
+	CreatedAt  int64  `json:"created_at"`
 }
 
 // Image reports whether the file is an image (the UI shows a thumbnail).
@@ -90,6 +91,11 @@ func (s *Store) OpenAgentRoot(agentID string) (*os.Root, error) {
 // Save stores data for agentID under a cleaned version of name. The type is taken from the
 // content when the client sent none (or a generic one).
 func (s *Store) Save(agentID, name, typ string, data []byte) (File, error) {
+	return s.SaveFrom(agentID, "", name, typ, data)
+}
+
+// SaveFrom binds an agent upload to the authenticated sender as well as the recipient.
+func (s *Store) SaveFrom(agentID, uploaderID, name, typ string, data []byte) (File, error) {
 	if !validID(agentID) {
 		return File{}, ErrNotFound
 	}
@@ -101,7 +107,7 @@ func (s *Store) Save(agentID, name, typ string, data []byte) (File, error) {
 	}
 	name = CleanName(name)
 	typ = fileType(name, typ, data)
-	f := File{ID: model.NewID(), AgentID: agentID, Name: name, Type: typ, Size: int64(len(data)), CreatedAt: model.Now()}
+	f := File{ID: model.NewID(), AgentID: agentID, UploaderID: uploaderID, Name: name, Type: typ, Size: int64(len(data)), CreatedAt: model.Now()}
 	if err := os.MkdirAll(s.root, 0o700); err != nil {
 		return File{}, err
 	}

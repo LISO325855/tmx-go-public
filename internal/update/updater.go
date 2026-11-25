@@ -43,20 +43,24 @@ const (
 
 // Status is GET /api/update.
 type Status struct {
-	Current    string   `json:"current"`
-	State      State    `json:"state"`
-	Reason     string   `json:"reason,omitempty"` // StateOff: why
-	Auto       bool     `json:"auto"`
-	Channel    string   `json:"channel"`
-	Repo       string   `json:"repo"`
-	Latest     string   `json:"latest,omitempty"` // newest release of the channel
-	LatestURL  string   `json:"latest_url,omitempty"`
-	Available  bool     `json:"available"`         // Latest is newer than Current
-	Waiting    []string `json:"waiting,omitempty"` // StateReady: agents it waits for
-	Error      string   `json:"error,omitempty"`
-	NeedsToken bool     `json:"needs_token,omitempty"` // the releases are not visible without a GitHub token
-	HasToken   bool     `json:"has_token"`
-	CheckedAt  int64    `json:"checked_at,omitempty"`
+	Current        string   `json:"current"`
+	RunningFlavour string   `json:"running_flavour,omitempty"`
+	Flavour        string   `json:"flavour,omitempty"`
+	Migration      string   `json:"migration,omitempty"`
+	MigrationError string   `json:"migration_error,omitempty"`
+	State          State    `json:"state"`
+	Reason         string   `json:"reason,omitempty"` // StateOff: why
+	Auto           bool     `json:"auto"`
+	Channel        string   `json:"channel"`
+	Repo           string   `json:"repo"`
+	Latest         string   `json:"latest,omitempty"` // newest release of the channel
+	LatestURL      string   `json:"latest_url,omitempty"`
+	Available      bool     `json:"available"`         // Latest can be installed
+	Waiting        []string `json:"waiting,omitempty"` // StateReady: agents it waits for
+	Error          string   `json:"error,omitempty"`
+	NeedsToken     bool     `json:"needs_token,omitempty"` // the releases are not visible without a GitHub token
+	HasToken       bool     `json:"has_token"`
+	CheckedAt      int64    `json:"checked_at,omitempty"`
 	// Probation: the installed version is still on its post-swap health probation (DESIGN.md
 	// "Updates"); LastUpdate: how the last probation ended (confirmed, rolled back and why).
 	Probation  string                    `json:"probation,omitempty"`
@@ -78,8 +82,14 @@ type Options struct {
 	Busy func() []string
 	// Restart stops the daemon gracefully and starts it again from exe.
 	Restart func(exe string)
-	Publish func(model.BusEvent)
-	Logger  *slog.Logger
+	// DeferSwap hands the final Windows rename to the daemon's shutdown path.
+	// It runs after the fleet has released the daemon executable pins.
+	DeferSwap func(apply func() (string, error)) bool
+	// PrepareRestart reserves a handover against audio capture before any executable swap.
+	// Release the reservation on failure. An immediate agent update is not an audio override.
+	PrepareRestart func() (release func(), err error)
+	Publish        func(model.BusEvent)
+	Logger         *slog.Logger
 
 	HTTP    *http.Client
 	APIBase string   // default https://api.github.com
@@ -95,19 +105,28 @@ type Options struct {
 	GH func() string
 }
 
+type installRequest struct {
+	now                  bool
+	automatic            bool
+	epoch                uint64
+	sameVersionMigration bool
+}
+
 // Updater is the update service. New, then Run in a goroutine.
 type Updater struct {
 	o Options
 
-	mu       sync.Mutex
-	st       Status
-	rel      release
-	ver      Version // of rel, for this channel
-	staged   *staged
-	busy     bool // a check or download is running
-	installs chan bool
-	target   target
-	tgtErr   error
+	mu         sync.Mutex
+	st         Status
+	rel        release
+	ver        Version // of rel, for this channel
+	staged     *staged
+	busy       bool // a check or download is running
+	installs   chan installRequest
+	autoEpoch  uint64
+	autoCancel context.CancelFunc
+	target     target
+	tgtErr     error
 
 	// keysMu orders every writer of the update config (a rotation statement, the owner's re-pin,
 	// Configure): each re-reads what it replaces under it, so none saves over a newer re-pin.
@@ -152,7 +171,7 @@ func New(o Options) *Updater {
 	if o.Busy == nil {
 		o.Busy = func() []string { return nil }
 	}
-	u := &Updater{o: o, installs: make(chan bool, 1)}
+	u := &Updater{o: o, installs: make(chan installRequest, 1)}
 	u.target, u.tgtErr = detectTarget(o.Executable, o.Desktop, o.GOOS, o.GOARCH)
 	u.st = Status{Current: o.Version, State: StateIdle}
 	if reason := u.offReason(); reason != "" {
@@ -197,6 +216,49 @@ func (u *Updater) settings() config.UpdateConfig {
 	return (&s).Resolved()
 }
 
+func (u *Updater) selectedTarget(s config.UpdateConfig) (target, error) {
+	t := u.target
+	if t.goos != "windows" {
+		return t, nil
+	}
+	switch s.Flavour {
+	case "":
+	case config.FlavourHeadless:
+		t.desk = false
+	case config.FlavourDesktop:
+		t.desk = true
+	default:
+		return t, errors.New(`update.flavour must be "headless" or "desktop"`)
+	}
+	return t, nil
+}
+
+func (u *Updater) wantsDesktop(s config.UpdateConfig) bool {
+	return u.target.goos == "windows" && !u.target.desk && s.Flavour == config.FlavourDesktop
+}
+
+func (u *Updater) availableVersion(v Version, s config.UpdateConfig) bool {
+	cur, ok := ParseVersion(u.o.Version)
+	if !ok {
+		return false
+	}
+	if u.wantsDesktop(s) {
+		return cur.String() == v.String() || *s.Auto && cur.Less(v)
+	}
+	return cur.Less(v)
+}
+
+// A failed migration keeps the owner's desired flavour. Do not automatically
+// attempt that release again or fall back to an older one.
+func (u *Updater) migrationRetryBlocked(v Version) bool {
+	result, ok := rollback.LastFailedDesktopMigration(u.checkpoint())
+	if !ok {
+		return false
+	}
+	failed, ok := ParseVersion(result.To)
+	return ok && !failed.Less(v)
+}
+
 // Status returns the current status.
 func (u *Updater) Status() Status {
 	u.mu.Lock()
@@ -212,8 +274,33 @@ func (u *Updater) copyLocked() Status {
 	if p, ok, _ := rollback.OnProbation(dir); ok {
 		s.Probation = p.To
 	}
+	if u.target.goos == "windows" {
+		s.RunningFlavour = config.FlavourHeadless
+		if u.target.desk {
+			s.RunningFlavour = config.FlavourDesktop
+		}
+		s.Flavour = u.settings().Flavour
+		if s.Flavour == "" {
+			s.Flavour = s.RunningFlavour
+		}
+	}
 	if r, ok := rollback.LastProbation(dir); ok {
 		s.LastUpdate = &r
+		if r.DesktopMigration {
+			switch r.Outcome {
+			case "confirmed":
+				if u.target.desk {
+					s.Migration = "Switched to the desktop app."
+				}
+			case "rolled back", "rollback failed":
+				s.MigrationError = "Desktop migration " + r.Outcome + ": " + r.Reason
+			}
+		}
+	}
+	if s.MigrationError == "" && s.RunningFlavour == config.FlavourHeadless && s.Flavour == config.FlavourDesktop {
+		if r, ok := rollback.LastFailedDesktopMigration(dir); ok {
+			s.MigrationError = "Desktop migration " + r.Outcome + ": " + r.Reason
+		}
 	}
 	s.DrillArmed = rollback.DrillArmed(dir)
 	return s
@@ -272,6 +359,12 @@ func (u *Updater) Configure(auto *bool, channel *string) (Status, error) {
 		}
 	}
 	u.mu.Lock()
+	if auto != nil && !*auto {
+		u.autoEpoch++ // even off -> on cannot revive a previously queued automatic request
+		if u.autoCancel != nil {
+			u.autoCancel()
+		}
+	}
 	changedChannel := channel != nil && *channel != u.st.Channel
 	u.refreshSettingsLocked()
 	if changedChannel { // what was found or staged belongs to the other channel
@@ -311,7 +404,7 @@ func (u *Updater) checkRelease(ctx context.Context, allowAutoInstall bool) Statu
 		return st
 	}
 	u.busy = true
-	prev := u.st.State
+	prev, checkEpoch := u.st.State, u.autoEpoch
 	u.st.State, u.st.Error = StateChecking, ""
 	u.publishLocked()
 	u.mu.Unlock()
@@ -320,9 +413,16 @@ func (u *Updater) checkRelease(ctx context.Context, allowAutoInstall bool) Statu
 	u.mu.Lock()
 	want := u.want
 	u.mu.Unlock()
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	r, err := u.findRelease(ctx, s.Repo, s.Channel, want)
-	cancel()
+	if want == "" && u.wantsDesktop(s) && !*s.Auto {
+		want = u.o.Version
+	}
+	t, err := u.selectedTarget(s)
+	var r release
+	if err == nil {
+		ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		r, err = u.findRelease(ctx, s.Repo, s.Channel, want)
+		cancel()
+	}
 	var ver Version
 	if err == nil {
 		ver, err = u.releaseVersion(r)
@@ -340,29 +440,33 @@ func (u *Updater) checkRelease(ctx context.Context, allowAutoInstall bool) Statu
 		u.mu.Unlock()
 		return st
 	}
-	cur, _ := ParseVersion(u.o.Version)
+	current := u.settings()
+	u.refreshSettingsLocked()
 	u.rel, u.ver = r, ver
 	u.st.Latest, u.st.LatestURL = ver.String(), r.HTMLURL
-	u.st.Available = cur.Less(ver)
+	u.st.Available = u.availableVersion(ver, current)
 	switch {
 	case !u.st.Available:
 		u.st.State = StateIdle
-	case u.staged != nil && u.staged.version == ver.String():
+	case u.staged != nil && u.staged.version == ver.String() && u.staged.asset == t.asset(ver.String()):
 		u.st.State = StateReady
-	case prev == StateReady || prev == StateDownloading:
+	case prev == StateDownloading:
 		u.st.State = prev
 	default:
 		u.st.State = StateAvailable
 	}
-	auto := allowAutoInstall && u.st.Auto && *s.Auto && u.st.Available && u.st.State == StateAvailable
+	sameMigration := u.wantsDesktop(current) && ver.String() == u.o.Version
+	auto := allowAutoInstall && checkEpoch == u.autoEpoch && (*current.Auto || sameMigration) &&
+		u.st.Available && u.st.State == StateAvailable &&
+		(!u.wantsDesktop(current) || !u.migrationRetryBlocked(ver))
 	u.publishLocked()
 	st := u.copyLocked()
 	u.mu.Unlock()
 	if st.Available {
-		u.o.Logger.Info("update: a newer release", "current", u.o.Version, "latest", ver.String())
+		u.o.Logger.Info("update: release available", "current", u.o.Version, "latest", ver.String())
 	}
 	if auto {
-		u.Install(false)
+		u.queueInstall(installRequest{automatic: true, epoch: checkEpoch, sameVersionMigration: sameMigration})
 		return u.Status()
 	}
 	return st
@@ -386,25 +490,66 @@ func (u *Updater) explain(err error) string {
 
 // Install downloads and verifies the newest release (if not done yet) and installs it: now =
 // at once, else once nothing is busy. It returns at once; Status follows the progress.
-func (u *Updater) Install(now bool) {
+func (u *Updater) Install(now bool) { u.queueInstall(installRequest{now: now}) }
+
+func (u *Updater) queueInstall(req installRequest) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
 	select {
-	case u.installs <- now:
-	default:
-		if now { // a waiting install becomes immediate
-			select {
-			case <-u.installs:
-			default:
-			}
-			u.installs <- now
+	case old := <-u.installs:
+		// Manual requests always outrank automatic ones; preserve an immediate install.
+		if !old.automatic {
+			req.automatic = false
+			req.now = req.now || old.now
 		}
+	default:
 	}
+	u.installs <- req
+}
+
+func (u *Updater) autoAllowed(req installRequest) bool {
+	if !req.automatic {
+		return true
+	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.autoAllowedLocked(req)
+}
+
+func (u *Updater) autoAllowedLocked(req installRequest) bool {
+	s := u.settings()
+	return req.epoch == u.autoEpoch && (*s.Auto || req.sameVersionMigration && u.wantsDesktop(s))
+}
+
+func (u *Updater) runInstall(parent context.Context, req installRequest) {
+	ctx, cancel := context.WithCancel(parent)
+	defer cancel()
+	if req.automatic {
+		u.mu.Lock()
+		if !u.autoAllowedLocked(req) {
+			u.mu.Unlock()
+			return
+		}
+		u.autoCancel = cancel
+		u.mu.Unlock()
+		defer func() {
+			u.mu.Lock()
+			u.autoCancel = nil
+			if (ctx.Err() != nil || !u.autoAllowedLocked(req)) && u.st.State != StateInstalling {
+				u.st.State, u.st.Error, u.st.Waiting = StateAvailable, "", nil
+				u.publishLocked()
+			}
+			u.mu.Unlock()
+		}()
+	}
+	u.install(ctx, req)
 }
 
 // InstallTag installs exactly the release tag (a published fleet release on this channel: an rc
 // only on "latest"), verified like any other, and only when it is newer than the running version
 // (no downgrade). It checks at once, so an unknown, unpublished or older tag is refused here.
 func (u *Updater) InstallTag(ctx context.Context, tag string, now bool) (Status, error) {
-	if v, ok := ParseVersion(tag); !ok || v.Ahead != 0 {
+	if v, ok := ParseVersion(tag); !ok || v.Ahead != 0 && !(tag == u.o.Version && u.wantsDesktop(u.settings())) {
 		return u.Status(), fmt.Errorf("%q is not a fleet release tag (fleet-vX.Y.Z or fleet-vX.Y.Z-rcN)", tag)
 	}
 	u.mu.Lock()
@@ -429,6 +574,9 @@ func (u *Updater) InstallTag(ctx context.Context, tag string, now bool) (Status,
 		return st, fmt.Errorf("%s is not the release found (%s)", tag, st.Latest)
 	case !st.Available:
 		u.clearWant()
+		if s := u.settings(); u.wantsDesktop(s) && !*s.Auto && tag != st.Current {
+			return st, fmt.Errorf("with automatic updates off, the desktop migration requires the running release %s", st.Current)
+		}
 		return st, fmt.Errorf("%s is not newer than the running %s", tag, st.Current)
 	}
 	u.Install(now)
@@ -456,47 +604,62 @@ func (u *Updater) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-next.C:
-			if *u.settings().Auto {
+			if s := u.settings(); *s.Auto || u.wantsDesktop(s) {
 				u.checkRelease(ctx, true)
 			}
 			next.Reset(time.Duration(u.settings().CheckHours) * time.Hour)
-		case now := <-u.installs:
-			u.install(ctx, now)
+		case req := <-u.installs:
+			u.runInstall(ctx, req)
 		}
 	}
 }
 
 // install stages the release (downloading and verifying), waits for a quiet moment unless now,
 // then swaps it in and restarts.
-func (u *Updater) install(ctx context.Context, now bool) {
-	defer u.clearWant() // an InstallTag pin lasts for one install
+func (u *Updater) install(ctx context.Context, req installRequest) {
+	now := req.now
+	if ctx.Err() != nil || !u.autoAllowed(req) {
+		return
+	}
+	if !req.automatic {
+		defer u.clearWant()
+	} // only the manual request owns its tag pin
+	settings := u.settings()
+	t, err := u.selectedTarget(settings)
+	if err != nil {
+		u.set(func(st *Status) { st.State, st.Error = StateError, err.Error() })
+		return
+	}
 	u.mu.Lock()
-	if u.st.State == StateOff {
+	if u.st.State == StateOff || u.st.State == StateInstalling {
 		u.mu.Unlock()
 		return
 	}
-	if u.rel.TagName == "" || !u.st.Available {
+	if u.rel.TagName == "" || !u.st.Available || !u.availableVersion(u.ver, settings) {
 		u.mu.Unlock()
 		if u.Check(ctx).State == StateError {
 			return
 		}
 		u.mu.Lock()
-		if !u.st.Available {
-			u.mu.Unlock()
-			return
-		}
 	}
 	r, ver, s := u.rel, u.ver, u.staged
 	u.mu.Unlock()
+	if !u.availableVersion(ver, settings) || (req.automatic && u.wantsDesktop(settings) && u.migrationRetryBlocked(ver)) {
+		return
+	}
 
-	if s == nil || s.version != ver.String() {
+	if s == nil || s.version != ver.String() || s.asset != t.asset(ver.String()) {
 		u.set(func(st *Status) { st.State, st.Error = StateDownloading, "" })
 		dctx, cancel := context.WithTimeout(ctx, 15*time.Minute)
-		got, err := u.stage(dctx, u.target, r, ver.String())
+		got, err := u.stage(dctx, t, r, ver.String())
 		cancel()
 		if err != nil {
 			u.o.Logger.Warn("update: download failed", "release", ver.String(), "err", err)
 			u.set(func(st *Status) { st.State, st.Error = StateError, u.explain(err) })
+			return
+		}
+		if ctx.Err() != nil || !u.autoAllowed(req) {
+			os.RemoveAll(got.cleanup)
 			return
 		}
 		u.mu.Lock()
@@ -511,6 +674,9 @@ func (u *Updater) install(ctx context.Context, now bool) {
 
 	// Wait for a quiet moment: twice in a row nothing busy, IdlePoll/6 apart.
 	for !now {
+		if ctx.Err() != nil || !u.autoAllowed(req) {
+			return
+		}
 		busy := u.o.Busy()
 		if len(busy) == 0 {
 			select {
@@ -527,48 +693,123 @@ func (u *Updater) install(ctx context.Context, now bool) {
 		case <-ctx.Done():
 			return
 		case n := <-u.installs:
-			now = now || n
+			if req.automatic && !n.automatic {
+				// Start the manual request with its own uncancelled context.
+				u.queueInstall(n)
+				return
+			}
+			if !n.automatic {
+				now = now || n.now
+			}
 		case <-time.After(u.o.IdlePoll):
 		}
 		u.mu.Lock()
-		gone := u.staged == nil || u.staged.version != s.version
+		gone := u.staged == nil || u.staged.version != s.version || u.staged.asset != s.asset
 		u.mu.Unlock()
 		if gone { // the channel changed meanwhile
 			return
 		}
 	}
 
-	u.set(func(st *Status) { st.State, st.Waiting = StateInstalling, nil })
+	if ctx.Err() != nil || !u.autoAllowed(req) {
+		return
+	}
+	handedOver := false
+	if u.o.PrepareRestart != nil {
+		release, err := u.o.PrepareRestart()
+		if err != nil {
+			u.set(func(st *Status) { st.State, st.Error = StateError, err.Error() })
+			return
+		}
+		// A successful Restart stops this process. Until it does, keep capture admission closed.
+		defer func() {
+			if !handedOver {
+				release()
+			}
+		}()
+	}
 	checkpoint := u.checkpoint()
 	if err := rollback.Prepare(ctx, checkpoint, u.target.path, u.o.Paths.DB()); err != nil {
 		u.set(func(st *Status) { st.State, st.Error = StateError, "cannot prepare rollback: "+err.Error() })
 		return
 	}
+	// Check the exact staged asset against the current policy both before
+	// handoff and after teardown. The caller holds keysMu.
+	swapSettings := func() (config.UpdateConfig, bool) {
+		current := u.settings()
+		currentTarget, targetErr := u.selectedTarget(current)
+		u.mu.Lock()
+		stillStaged := u.staged == s && u.staged.asset == currentTarget.asset(ver.String())
+		u.mu.Unlock()
+		ok := stillStaged && u.autoAllowed(req) && targetErr == nil && currentTarget == t &&
+			current.Repo == settings.Repo && current.Channel == settings.Channel && u.availableVersion(ver, current)
+		return current, ok
+	}
+	u.keysMu.Lock()
+	current, allowed := swapSettings()
+	if ctx.Err() != nil || !allowed {
+		u.keysMu.Unlock()
+		return
+	}
+	if u.Status().State == StateInstalling {
+		u.keysMu.Unlock()
+		return
+	}
+	u.set(func(st *Status) { st.State, st.Waiting = StateInstalling, nil })
+	if u.o.DeferSwap != nil {
+		u.keysMu.Unlock()
+		handedOver = u.o.DeferSwap(func() (string, error) {
+			u.keysMu.Lock()
+			defer u.keysMu.Unlock()
+			current, allowed := swapSettings()
+			if !allowed {
+				return "", errors.New("update settings changed before swap")
+			}
+			return u.applySwap(*s, t, current)
+		})
+		return
+	}
+	defer u.keysMu.Unlock()
+	exe, err := u.applySwap(*s, t, current)
+	if err == nil && u.o.Restart != nil {
+		handedOver = true
+		u.o.Restart(exe)
+	}
+}
+
+func (u *Updater) applySwap(s staged, t target, settings config.UpdateConfig) (string, error) {
+	checkpoint := u.checkpoint()
 	if err := rollback.MarkUpdate(checkpoint); err != nil {
 		u.set(func(st *Status) { st.State, st.Error = StateError, err.Error() })
-		return
+		return "", err
 	}
 	// The new binary must confirm itself healthy within rollback.ProbationWindow (cli/daemon.go).
-	if err := rollback.BeginProbation(checkpoint, u.o.Version, s.version, time.Now()); err != nil {
-		rollback.CompleteUpdate(checkpoint)
-		u.set(func(st *Status) { st.State, st.Error = StateError, "cannot start the update's probation: "+err.Error() })
-		return
+	var probationErr error
+	if u.wantsDesktop(settings) {
+		probationErr = rollback.BeginDesktopMigration(checkpoint, u.o.Version, s.version, s.hash, time.Now())
+	} else {
+		probationErr = rollback.BeginProbation(checkpoint, u.o.Version, s.version, time.Now())
 	}
-	exe, err := swap(u.target, *s)
+	if probationErr != nil {
+		rollback.CompleteUpdate(checkpoint)
+		u.set(func(st *Status) {
+			st.State, st.Error = StateError, "cannot start the update's probation: "+probationErr.Error()
+		})
+		return "", probationErr
+	}
+	exe, err := swap(t, s)
 	if err != nil {
 		rollback.EndProbation(checkpoint)
 		rollback.CompleteUpdate(checkpoint)
 		u.o.Logger.Error("update: install failed", "release", s.version, "err", err)
 		u.set(func(st *Status) { st.State, st.Error = StateError, err.Error() })
-		return
+		return "", err
 	}
 	u.mu.Lock()
 	u.staged = nil
 	u.mu.Unlock()
 	u.o.Logger.Info("update: installed; restarting", "from", u.o.Version, "to", s.version, "exe", exe)
-	if u.o.Restart != nil {
-		u.o.Restart(exe)
-	}
+	return exe, nil
 }
 
 // ---- GitHub token (only for private repositories)
@@ -614,6 +855,12 @@ func (u *Updater) token() string {
 	if u.settings().Repo == config.PublicUpdateRepo {
 		return ""
 	}
+	return u.GitHubToken()
+}
+
+// GitHubToken is this node's GitHub token, whatever the release source: the fleet's rules
+// source (internal/rules) is a private repository also where releases come from the public one.
+func (u *Updater) GitHubToken() string {
 	if t := u.fileToken(); t != "" {
 		return t
 	}

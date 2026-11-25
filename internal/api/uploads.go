@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/blackcode-ch/tmx-go/internal/fleet"
 	"github.com/blackcode-ch/tmx-go/internal/uploads"
 )
 
@@ -22,13 +23,26 @@ type uploadView struct {
 
 func view(f uploads.File) uploadView { return uploadView{File: f, Image: f.Image()} }
 
+func sessionMailCaller(w http.ResponseWriter, r *http.Request) (fleet.Caller, bool) {
+	c, ok := caller(r)
+	if !ok || (!c.Owner && c.AgentID == "") {
+		writeError(w, http.StatusForbidden, "session mail requires the owner or an authenticated local agent")
+		return fleet.Caller{}, false
+	}
+	return c, true
+}
+
 // POST /api/agents/{id}/uploads {name, type, data}: store a file for a later message.
 func (s *Server) upload(w http.ResponseWriter, r *http.Request) {
+	c, ok := sessionMailCaller(w, r)
+	if !ok {
+		return
+	}
 	if s.uploads == nil {
 		writeError(w, http.StatusNotImplemented, "uploads are not available")
 		return
 	}
-	a, err := s.f.Agent(r.PathValue("id"))
+	id, err := s.f.MailAttachmentRecipient(c, r.PathValue("id"))
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -46,7 +60,7 @@ func (s *Server) upload(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "data is not valid base64")
 		return
 	}
-	f, err := s.uploads.Save(a.ID, req.Name, req.Type, data)
+	f, err := s.uploads.SaveFrom(id, c.AgentID, req.Name, req.Type, data)
 	switch {
 	case errors.Is(err, uploads.ErrTooLarge):
 		writeError(w, http.StatusRequestEntityTooLarge, err.Error())
@@ -89,7 +103,7 @@ func (s *Server) getUpload(w http.ResponseWriter, r *http.Request) {
 
 // attach resolves upload ids for a message to agentID and returns text with the note that
 // lists them. Every id must be an upload made for that same agent.
-func (s *Server) attach(agentID, text string, ids []string) (string, error) {
+func (s *Server) attach(agentID, senderID, text string, ids []string) (string, error) {
 	if len(ids) == 0 {
 		return text, nil
 	}
@@ -108,7 +122,7 @@ func (s *Server) attach(agentID, text string, ids []string) (string, error) {
 		}
 		seen[id] = true
 		f, err := s.uploads.Get(id)
-		if err != nil || f.AgentID != agentID {
+		if err != nil || f.AgentID != agentID || (senderID != "" && f.UploaderID != senderID) {
 			return "", fmt.Errorf("no upload %q for this agent", id)
 		}
 		files = append(files, f)

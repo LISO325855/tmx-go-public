@@ -201,6 +201,9 @@ func (a *analyzer) inTemp(p string) bool {
 // claudeData are Claude Code's own working folders, which it writes through the file tools
 // (memory, plans, todos): not the owner's files.
 func (a *analyzer) claudeData(p string) bool {
+	if a.ownAccountData(p) {
+		return true
+	}
 	if a.home == "" {
 		return false
 	}
@@ -235,16 +238,42 @@ func isNullDevice(p string) bool {
 	return strings.HasPrefix(p, "/dev/fd/")
 }
 
+// accountDataDirs are the folders a harness keeps an agent's own work in, inside its account
+// home: conversations and memory (projects), plans, todos, tasks and what a session leaves
+// behind. Not the home itself: .credentials.json, .claude.json and settings.json sit there.
+var accountDataDirs = []string{"/projects", "/plans", "/todos", "/tasks", "/session-env", "/shell-snapshots", "/file-history"}
+
+// ownAccountData reports whether p is in one of the agent's own data folders of its own account
+// home in tmx's state (Context.AccountHome). Until 17 Nov the secrets rule refused an agent on a
+// named account its own conversation and memory folder, because the whole of ai-accounts counted.
+func (a *analyzer) ownAccountData(p string) bool {
+	if a.accountHome == "" || p == "" {
+		return false
+	}
+	for _, d := range accountDataDirs {
+		if inside(p, a.accountHome+d) || p == a.accountHome+d {
+			return true
+		}
+	}
+	return false
+}
+
 // stateSecret reports whether p is inside tmx's secrets or agents folders, or the WhatsApp
 // attachments (other people's photos and voice notes: agents read WhatsApp only through tmx).
 func (a *analyzer) stateSecret(p string) bool {
 	if a.state == "" || p == "" {
 		return false
 	}
+	if a.ownAccountData(p) {
+		return false
+	}
 	return within(p, a.state+"/secrets") || within(p, a.state+"/agents") || within(p, a.state+"/whatsapp") ||
 		// the AI accounts' homes: sign-ins, and a Claude account's settings.json, which is the
 		// user settings of every agent on that account (disableAllHooks there would unguard them)
 		within(p, a.state+"/ai-accounts") ||
+		// the node's copy of the fleet rules and which commit of it is in force (internal/rules):
+		// an agent writing there would write every agent's instructions
+		within(p, a.state+"/rules") ||
 		// the guard's own settings (config.json: rule_states, off_for, always_allow), the approvals
 		// (tmx.db and its -wal/-shm) and daemon.json: an agent writing them would undo the owner gate
 		p == a.state+"/config.json" || p == a.state+"/daemon.json" || strings.HasPrefix(p, a.state+"/tmx.db")
@@ -253,7 +282,7 @@ func (a *analyzer) stateSecret(p string) bool {
 // inState reports whether p is in tmx's state folder. Secrets and agent folders always count;
 // the rest not where the agent's folder or the workspace were put inside the state folder.
 func (a *analyzer) inState(p string) bool {
-	if a.state == "" || !within(p, a.state) {
+	if a.state == "" || !within(p, a.state) || a.ownAccountData(p) {
 		return false
 	}
 	return a.stateSecret(p) || !(within(p, a.own) || within(p, a.workspace))

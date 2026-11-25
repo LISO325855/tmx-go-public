@@ -5,10 +5,13 @@
 // microphone is released as soon as they stop. The app-wide session around it (one at a
 // time, surviving page switches) is dictation-session.ts.
 import { voiceApi, type TranscribeResult } from "./voice";
+import { audioCaptureLease } from "./audio-capture-lease";
 
 /** Longest dictation the daemon takes (POST /api/transcribe). */
 export const MAX_DICTATION_MS = 120_000;
 const RATE = 16_000;
+// Cancellation is synchronous to the UI, but a new capture waits for native teardown.
+let captureClosing: Promise<void> = Promise.resolve();
 
 export class DictationError extends Error {}
 
@@ -42,21 +45,31 @@ function micError(e: unknown): DictationError {
 /** Starts capturing the microphone. */
 export async function startDictation(): Promise<Dictation> {
   if (!dictationSupported()) throw new DictationError("This window cannot use the microphone.");
+  await captureClosing;
+  const releaseLease = await audioCaptureLease();
   let stream: MediaStream;
   try {
     stream = await navigator.mediaDevices.getUserMedia({
       audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
     });
   } catch (e) {
+    releaseLease();
     throw micError(e);
   }
-  const ctx = new AudioContext();
+  let ctx: AudioContext;
+  try { ctx = new AudioContext(); }
+  catch (e) {
+    stream.getTracks().forEach(tr => tr.stop());
+    releaseLease();
+    throw micError(e);
+  }
+  let done = false;
   const chunks: Float32Array[] = [];
   let samples = 0;
   let level = 0;
   const started = performance.now();
   const take = (b: Float32Array) => {
-    if (!b.length) return;
+    if (done || !b.length) return;
     chunks.push(b);
     samples += b.length;
     let sum = 0;
@@ -66,13 +79,25 @@ export async function startDictation(): Promise<Dictation> {
 
   let flush: () => Promise<void> = async () => {};
   const nodes: AudioNode[] = [];
+  const detach: (() => void)[] = [];
+  const closeContext = async () => {
+    try { await ctx.close(); } catch { /* already closed or interrupted by the browser */ }
+  };
+  const disconnect = () => {
+    for (const clear of detach) {
+      try { clear(); } catch { /* a dead worklet must not prevent track cleanup */ }
+    }
+    for (const n of nodes) {
+      try { n.disconnect(); } catch { /* already disconnected */ }
+    }
+  };
   try {
     await ctx.resume();
     const src = ctx.createMediaStreamSource(stream);
     const mute = ctx.createGain(); // processing nodes must reach the destination to run; silently
     mute.gain.value = 0;
-    mute.connect(ctx.destination);
     nodes.push(src, mute);
+    mute.connect(ctx.destination);
     let worklet: AudioWorkletNode | null = null;
     if (ctx.audioWorklet) {
       try {
@@ -89,62 +114,78 @@ export async function startDictation(): Promise<Dictation> {
         if (e.data === "flushed") flushed?.();
         else if (e.data instanceof Float32Array) take(e.data);
       };
+      let flushTimer: ReturnType<typeof setTimeout> | undefined;
+      detach.push(() => {
+        clearTimeout(flushTimer);
+        flushed?.();
+        flushed = null;
+        w.port.onmessage = null;
+        w.port.close();
+      });
       flush = () =>
         new Promise<void>((resolve) => {
-          flushed = resolve;
+          flushed = () => { clearTimeout(flushTimer); resolve(); };
+          flushTimer = setTimeout(flushed, 300);
           w.port.postMessage("flush");
-          setTimeout(resolve, 300);
         });
+      nodes.push(w);
       src.connect(w);
       w.connect(mute);
-      nodes.push(w);
     } else {
       const sp = ctx.createScriptProcessor(4096, 1, 1);
       sp.onaudioprocess = (e) => take(e.inputBuffer.getChannelData(0).slice());
+      detach.push(() => { sp.onaudioprocess = null; });
+      nodes.push(sp);
       src.connect(sp);
       sp.connect(mute);
-      nodes.push(sp);
     }
   } catch (e) {
+    done = true;
+    disconnect();
     stream.getTracks().forEach((tr) => tr.stop());
-    void ctx.close();
+    await closeContext();
+    releaseLease();
     throw micError(e);
   }
 
-  let done = false;
   let ended: (() => void) | null = null;
+  let interrupted = false;
   const track = stream.getAudioTracks()[0];
   const onTrackEnded = () => {
-    if (!done) ended?.();
+    if (!done && !interrupted) { interrupted = true; ended?.(); }
   };
   track?.addEventListener("ended", onTrackEnded);
+  track?.addEventListener("mute", onTrackEnded);
   // A hidden window keeps capturing; where the browser suspended the audio anyway (WebKit may,
   // when the window is minimized), coming back resumes it.
   const onVisible = () => {
     if (!done && !document.hidden && ctx.state !== "running") void ctx.resume();
   };
   document.addEventListener("visibilitychange", onVisible);
+  let closing: Promise<void> | undefined;
   const release = () => {
+    if (closing) return closing;
     done = true;
     track?.removeEventListener("ended", onTrackEnded);
+    track?.removeEventListener("mute", onTrackEnded);
     document.removeEventListener("visibilitychange", onVisible);
-    for (const n of nodes) {
-      try {
-        n.disconnect();
-      } catch {
-        /* already */
-      }
-    }
+    disconnect();
     stream.getTracks().forEach((tr) => tr.stop());
-    void ctx.close();
+    // Do not let the next capture race a still-closing audio context.
+    closing = closeContext().finally(releaseLease);
+    captureClosing = closing;
+    return closing;
   };
 
   return {
     async stop() {
       if (done) throw new DictationError("The dictation has ended.");
-      await flush();
+      try {
+        await flush();
+      } finally {
+        await release(); // flush/postMessage errors must never leave the microphone live
+      }
       const rate = ctx.sampleRate;
-      release();
       const all = new Float32Array(samples);
       let o = 0;
       for (const c of chunks) {
@@ -154,12 +195,13 @@ export async function startDictation(): Promise<Dictation> {
       return encodeWAV(resample(all, rate, RATE), RATE);
     },
     cancel() {
-      if (!done) release();
+      if (!done) void release();
     },
     level: () => level,
     elapsed: () => performance.now() - started,
     onEnded(fn) {
       ended = fn;
+      if (interrupted || track?.readyState === "ended" || track?.muted) { interrupted = true; fn(); }
     },
   };
 }

@@ -8,12 +8,13 @@ import (
 	"time"
 
 	"github.com/blackcode-ch/tmx-go/internal/hiddenexec"
+	"github.com/blackcode-ch/tmx-go/internal/runner"
 )
 
 // ProbeEffective inspects the pinned binary's merged configuration without a
 // model turn. Terminal launches use this before opening their TUI; chat performs
 // the same check on its existing app-server connection before thread/start.
-func ProbeEffective(ctx context.Context, exe string, args, env []string, cwd, tmx string) error {
+func ProbeEffective(ctx context.Context, exe string, args, env []string, cwd, tmx string, managed ...map[string]runner.MCPServer) error {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	cmd := hiddenexec.Command(exe, args...)
@@ -50,7 +51,7 @@ func ProbeEffective(ctx context.Context, exe string, args, env []string, cwd, tm
 			Result json.RawMessage `json:"result"`
 		}
 		if json.Unmarshal(scan.Bytes(), &response) == nil && response.ID == 2 {
-			return ValidateEffective(response.Result, tmx)
+			return ValidateEffective(response.Result, tmx, managed...)
 		}
 	}
 	return fmt.Errorf("Codex effective configuration could not be verified; launch refused")

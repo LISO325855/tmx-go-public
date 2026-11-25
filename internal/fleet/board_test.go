@@ -79,9 +79,9 @@ func TestBoardTopicsMailAndCards(t *testing.T) {
 	toolUse(hp, "mcp__tmxg__send", map[string]any{"to": "owner", "body": "Drafting it now."})
 	toolUse(hp, "mcp__tmxg__agent_launch", map[string]any{"name": "copywriter", "project": "alpha"})
 
-	// Meanwhile a General message waits for the end of the turn instead of joining it.
+	// The owner interrupts the current turn. Its result remains in its original topic.
 	m, err := f.SendOwner("head", "how are things?", "")
-	if err != nil || m.State != model.MsgQueued {
+	if err != nil || m.State != model.MsgQueued || hp.Interrupts() != 1 {
 		t.Fatalf("general while busy: %+v %v", m, err)
 	}
 	// So does a lead's report, filed under its project.
@@ -91,9 +91,13 @@ func TestBoardTopicsMailAndCards(t *testing.T) {
 		t.Fatalf("lead report: %+v %v", rep, err)
 	}
 
+	// A lead's report still waits for the end of the turn.
+	if rep, _ := f.st.GetMessage(rep.ID); rep.State != model.MsgQueued {
+		t.Fatalf("an agent's mail was delivered into a running turn: %+v", rep)
+	}
 	hp.Turn("Plan: hero, pricing, signup.", 0.01, 1)
-	eventually(t, "general message delivered alone", func() bool { return lastSent(hp) == "[message from owner] how are things?" })
-	hp.Turn("All quiet.", 0.01, 1)
+	eventually(t, "owner ahead of lead mail", func() bool { return lastSent(hp) == "how are things?" })
+	hp.Turn("Status sent.", 0.01, 1)
 	eventually(t, "lead report delivered in its topic", func() bool {
 		return lastSent(hp) == "[topic: Alpha]\n[message from alpha-lead (lead)]\n│ alpha plan ready"
 	})
@@ -434,9 +438,7 @@ func TestThreadLogs(t *testing.T) {
 	for name, req := range map[string]AddEntryRequest{
 		"bad kind":  {Thread: topic.ID, Kind: "idea", Text: "x"},
 		"empty":     {Thread: topic.ID, Kind: "info", Text: "  "},
-		"too long":  {Thread: topic.ID, Kind: "info", Text: strings.Repeat("x", 401)},
-		"4 lines":   {Thread: topic.ID, Kind: "info", Text: "a\nb\nc\nd"},
-		"secret":    {Thread: topic.ID, Kind: "info", Text: "the staging api_key: sk-live-abcdefghijklmnop1234"},
+		"too long":  {Thread: topic.ID, Kind: "info", Text: strings.Repeat("x", maxEntryText+1)}, // the only cap left: 256 KB
 		"no topic":  {Kind: "info", Text: "x"},
 		"bad fix":   {Thread: topic.ID, Kind: "info", Text: "x", Corrects: "nope"},
 		"elsewhere": {Thread: shop, Kind: "info", Text: "x", Corrects: d1.ID},

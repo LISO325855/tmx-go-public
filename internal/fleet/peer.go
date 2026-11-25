@@ -38,28 +38,31 @@ func SplitPeer(id string) (name, host string, ok bool) {
 // PeerOutbound is one message for an agent on another machine, as the wire carries it
 // (Python's /api/messages/incoming body). ID and ReplyTo are wire IDs.
 type PeerOutbound struct {
-	ID         string  `json:"id"`
-	Sender     string  `json:"sender"`      // the local agent's name ("owner" for the owner)
-	SenderHost string  `json:"sender_host"` // this machine
-	To         string  `json:"to"`          // the remote agent's name
-	Body       string  `json:"body"`
-	ReplyTo    *string `json:"reply_to"` // the wire ID of the message answered, or null
-	Urgent     bool    `json:"urgent"`
-	Sent       float64 `json:"sent"`   // Unix seconds
-	SHA256     string  `json:"sha256"` // of Body, UTF-8, lowercase hex
+	VerifiedSender string  `json:"-"` // set only from the sending fleet's local agent record, never wire JSON
+	ID             string  `json:"id"`
+	Sender         string  `json:"sender"`      // the local agent's name ("owner" for the owner)
+	SenderHost     string  `json:"sender_host"` // this machine
+	To             string  `json:"to"`          // the remote agent's name
+	Body           string  `json:"body"`
+	ReplyTo        *string `json:"reply_to"` // the wire ID of the message answered, or null
+	Urgent         bool    `json:"urgent"`
+	Sent           float64 `json:"sent"`   // Unix seconds
+	SHA256         string  `json:"sha256"` // of Body, UTF-8, lowercase hex
 }
 
 // PeerInbound is one message an authenticated peer machine hands over. Peer is the machine
 // its pair token belongs to (never taken from the body).
 type PeerInbound struct {
-	Peer       string
-	ID         string // the wire ID
-	Sender     string
-	SenderHost string
-	To         string // a local agent's name (or "name@<this machine>")
-	Body       string
-	ReplyTo    string // the wire ID of the message answered, or ""
-	Urgent     bool
+	VerifiedGeneration string // durable receiving credential epoch, never wire JSON
+	VerifiedSender     string // authenticated daemon attestation; never decoded from JSON
+	Peer               string
+	ID                 string // the wire ID
+	Sender             string
+	SenderHost         string
+	To                 string // a local agent's name (or "name@<this machine>")
+	Body               string
+	ReplyTo            string // the wire ID of the message answered, or ""
+	Urgent             bool
 }
 
 // PeerSender posts peer mail. Send returns nil once the peer accepted the message (2xx with

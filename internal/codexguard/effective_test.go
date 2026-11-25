@@ -7,7 +7,7 @@ import (
 
 func TestEffectiveConfigRejectsOtherChannels(t *testing.T) {
 	base := func() map[string]any {
-		return map[string]any{"sandbox_mode": "danger-full-access", "approval_policy": "on-request", "web_search": "disabled", "notify": []string{}, "features": map[string]bool{"hooks": false, "plugins": false, "apps": false, "multi_agent": false}, "mcp_servers": map[string]any{}}
+		return map[string]any{"sandbox_mode": "danger-full-access", "approval_policy": "on-request", "web_search": "disabled", "notify": []string{}, "features": map[string]bool{"hooks": false, "plugins": false, "apps": false, "multi_agent": false}, "mcp_servers": map[string]any{"tmxg": map[string]any{"command": "tmx.exe", "args": []string{"mcp"}}}}
 	}
 	for _, test := range []struct {
 		name, key string

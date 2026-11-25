@@ -1,3 +1,4 @@
+import { useClassic } from "@/hooks/use-classic";
 // The Matrix (DESIGN.md "Matrix"): the owner's master data view. Three views of the same
 // threads: a canvas (one string per project, a card per thread, the Board's sheet), a windowed
 // list (thousands scroll smoothly; the phone's view), and a grid (threads x the values of an
@@ -16,24 +17,30 @@ import { Canvas, Knot, LaneFrame } from "@/components/board/canvas";
 import { EntryIcon } from "@/components/board/log";
 import { NewTopicDialog } from "@/components/board/dialogs";
 import { CardView, HeadPanel, QuestionCard, ThreadMenu } from "@/components/matrix/head";
+import { FoldedText } from "@/components/folded-text";
 import { PageHeader, PageTitle } from "@/components/page";
+import { ThreadBoard } from "@/components/matrix/thread-board";
+import { useNow } from "@/hooks/use-now";
 import { boardApi, colorValue, loadBoard, THREAD_COLORS, useBoard } from "@/lib/board";
 import { relativeTime } from "@/lib/format";
 import { cardsByThread, legacyPath, questionsByThread, reorder, withBoard } from "@/lib/matrix-head";
 import { ROW_H, visibleRange } from "@/lib/matrix-window";
 import { remScale } from "@/lib/text-size";
 import { LINK_AXES, MATRIX_EVENTS, matrixApi, statusLabel, type PivotRow, type ThreadCard, type ThreadView } from "@/lib/matrix";
-import { navigate, paths } from "@/lib/router";
+import { peopleApi } from "@/lib/people";
+import { href, navigate, paths } from "@/lib/router";
 import { onBusEvent, useStore } from "@/lib/store";
 import type { Approval, BoardCard, LinkAxis, ThreadLink } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 type By = "thread" | LinkAxis;
-type Look = "canvas" | "list" | "grid";
+type Look = "board" | "canvas" | "list" | "grid";
 /** what the head panel shows: a turn, writing to the head in a thread, or a thread's log */
 type HeadSel = { card: number } | { compose: string } | { log: string; adding?: boolean } | null;
 
 const LOOK_KEY = "tmx.matrix.look";
+/** classic keeps its own choice: there the Board is the Matrix's default screen (the owner, 17 Nov) */
+const CLASSIC_LOOK_KEY = "tmx.matrix.look.classic";
 
 function firstLook(): Look {
   const saved = localStorage.getItem(LOOK_KEY);
@@ -41,7 +48,13 @@ function firstLook(): Look {
   return window.matchMedia("(min-width: 768px)").matches ? "canvas" : "list";
 }
 
+function firstClassicLook(): Look {
+  const saved = localStorage.getItem(CLASSIC_LOOK_KEY);
+  return saved === "board" || saved === "canvas" || saved === "list" || saved === "grid" ? saved : "board";
+}
+
 export function MatrixPage() {
+  const classic = useClassic();
   const [cards, setCards] = useState<ThreadCard[] | null>(null);
   const [by, setBy] = useState<By>("thread");
   const [pivot, setPivot] = useState<PivotRow[]>([]);
@@ -49,11 +62,21 @@ export function MatrixPage() {
   const [q, setQ] = useState("");
   const [open, setOpen] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
-  const [look, setLookState] = useState<Look>(firstLook);
+  // Classic: the Board is the default screen; the other views are a click away and the choice is
+  // remembered. The default dashboard has no Board and keeps its own remembered view.
+  const [plainLook, setPlainLook] = useState<Look>(firstLook);
+  const [classicLook, setClassicLook] = useState<Look>(firstClassicLook);
+  const look: Look = classic ? classicLook : plainLook;
   const setLook = (l: Look) => {
-    setLookState(l);
-    localStorage.setItem(LOOK_KEY, l);
+    if (classic) {
+      setClassicLook(l);
+      localStorage.setItem(CLASSIC_LOOK_KEY, l);
+    } else {
+      setPlainLook(l);
+      localStorage.setItem(LOOK_KEY, l);
+    }
   };
+  const boardNow = useNow(60_000);
   const connected = useStore((s) => s.transport != null);
   const status = useStore((s) => s.status);
   const approvals = useStore((s) => s.approvals);
@@ -63,6 +86,19 @@ export function MatrixPage() {
   const [needsYou, setNeedsYou] = useState(false);
   const [headSel, setHeadSel] = useState<HeadSel>(null);
   const [newTopic, setNewTopic] = useState(false);
+  // classic: how many promise records exist from before (they are kept, read-only: pages/people.tsx)
+  const [oldPromises, setOldPromises] = useState(0);
+  useEffect(() => {
+    if (!classic) return;
+    let live = true;
+    peopleApi.promises().then(
+      (l) => live && setOldPromises(l?.length ?? 0),
+      () => {},
+    );
+    return () => {
+      live = false;
+    };
+  }, [classic]);
 
   // The Board's old address lands here.
   useEffect(() => {
@@ -133,7 +169,7 @@ export function MatrixPage() {
   const controls = (
     <>
       <div className="ml-2 flex rounded-md border p-0.5" role="radiogroup" aria-label="View">
-        {(["canvas", "list", "grid"] as const).map((l) => (
+        {((classic ? ["board", "canvas", "list", "grid"] : ["canvas", "list", "grid"]) as Look[]).map((l) => (
           <button
             key={l}
             type="button"
@@ -174,9 +210,9 @@ export function MatrixPage() {
         actions={
           <>
             {waiting > 0 && (
-              <Button variant={needsYou ? "secondary" : "ghost"} size="sm" onClick={() => setNeedsYou((v) => !v)} aria-pressed={needsYou} aria-label="Needs you" className="gap-1.5">
+              <Button variant={needsYou ? "secondary" : "ghost"} size="sm" onClick={() => setNeedsYou((v) => !v)} aria-pressed={needsYou} aria-label={classic ? "Your turn" : "Needs you"} className="gap-1.5">
                 <span className="size-1.5 rounded-full bg-state-waiting" />
-                <span className="hidden md:inline">Needs you</span>
+                <span className="hidden md:inline">{classic ? "Your turn" : "Needs you"}</span>
                 <span className="tabular text-muted-foreground">{waiting}</span>
               </Button>
             )}
@@ -195,16 +231,16 @@ export function MatrixPage() {
                   {showArchived ? "Hide archived threads" : "Show archived threads"}
                 </DropdownMenuItem>
                 <DropdownMenuItem disabled={!board} onSelect={() => setTimeout(() => setNewTopic(true), 0)}>
-                  <Plus /> New topic with the head
+                  <Plus /> {classic ? "New topic with the Architect" : "New topic with the head"}
                 </DropdownMenuItem>
                 {head && board && (
                   <DropdownMenuItem onSelect={() => setHeadSel({ compose: "general" })}>
-                    <MessageSquarePlus /> Write to the head
+                    <MessageSquarePlus /> {classic ? "Write to the Architect" : "Write to the head"}
                   </DropdownMenuItem>
                 )}
                 {head && (
                   <DropdownMenuItem onSelect={() => navigate(paths.agent(head.id))}>
-                    <Waypoints /> The head's full conversation
+                    <Waypoints /> {classic ? "The Architect's full conversation" : "The head's full conversation"}
                   </DropdownMenuItem>
                 )}
               </DropdownMenuContent>
@@ -245,6 +281,8 @@ export function MatrixPage() {
             <p className="p-6 text-sm text-muted-foreground">Loading…</p>
           ) : shown.length === 0 ? (
             <p className="p-6 text-sm text-muted-foreground">{needsYou ? "Nothing waits for you." : "No thread here yet."}</p>
+          ) : look === "board" ? (
+            <ThreadBoard cards={shown} questions={questions} open={open} onOpen={setOpen} now={boardNow} onChanged={() => void reload()} />
           ) : look === "canvas" ? (
             <ThreadCanvas cards={shown} open={open} onOpen={setOpen} questions={questions} turns={turns} />
           ) : look === "grid" ? (
@@ -290,10 +328,18 @@ export function MatrixPage() {
           </div>
         )}
       </div>
+      {/* Classic: Promises is not a place any more (the owner, 17 Nov 18:55); the records made before stay readable */}
+      {classic && oldPromises > 0 && (
+        <div className="shrink-0 border-t px-4 py-1 text-2xs text-subtle-foreground" data-old-promises-link>
+          <a className="hover:text-foreground hover:underline" href={href(paths.promises())}>
+            Old promises ({oldPromises})
+          </a>
+        </div>
+      )}
       <NewTopicDialog
         open={newTopic}
         onOpenChange={setNewTopic}
-        description="A new thread with the head. What you and the head say in it stays together."
+        description={classic ? "A new thread with the Architect. What you and the Architect say in it stays together." : "A new thread with the head. What you and the head say in it stays together."}
         create={async (title, color) => {
           const t = await boardApi.createThread(title, color);
           setNeedsYou(false);
@@ -405,6 +451,7 @@ function ThreadCanvas({
 }
 
 function ThreadCardView({ card, active, onOpen, asks, turns }: { card: ThreadCard; active: boolean; onOpen: (id: string) => void; asks: number; turns: number }) {
+  const classic = useClassic();
   const th = card.thread;
   const counts = LINK_AXES.filter((a) => (card.counts[a] ?? 0) > 0).map((a) => `${card.counts[a]} ${a}`);
   return (
@@ -429,7 +476,7 @@ function ThreadCardView({ card, active, onOpen, asks, turns }: { card: ThreadCar
       </span>
       {(asks > 0 || turns > 0) && (
         <span className="mt-1 flex items-center gap-2 text-2xs text-muted-foreground">
-          {turns > 0 && <span>{turns} with the head</span>}
+          {turns > 0 && <span>{turns} {classic ? "with the Architect" : "with the head"}</span>}
           {asks > 0 && (
             <span className="inline-flex items-center gap-1 text-state-waiting">
               <CircleHelp className="size-3" /> {asks} for you
@@ -535,6 +582,7 @@ interface HeadOnThread {
 const HEAD_SHOWN = 6; // turns before "N earlier"
 
 function ThreadPanel({ id, onClose, head }: { id: string; onClose: () => void; head?: HeadOnThread }) {
+  const classic = useClassic();
   const [allTurns, setAllTurns] = useState(false);
   const [v, setV] = useState<ThreadView | null>(null);
   const [all, setAll] = useState(false);
@@ -577,9 +625,9 @@ function ThreadPanel({ id, onClose, head }: { id: string; onClose: () => void; h
       <StateButtons id={th.id} status={th.status ?? "active"} />
 
       {head?.known && (
-        <section aria-label="The head" className="mt-5">
+        <section aria-label={classic ? "Architect" : "The head"} className="mt-5">
           <div className="mb-1 flex items-center gap-2">
-            <h3 className="flex-1 text-xs font-semibold tracking-wide text-muted-foreground uppercase">The head</h3>
+            <h3 className="flex-1 text-xs font-semibold tracking-wide text-muted-foreground uppercase">{classic ? "Architect" : "The head"}</h3>
             <Button variant="ghost" size="xs" className="gap-1 text-muted-foreground" onClick={() => head.onLog(false)}>
               <NotebookPen className="size-3.5" /> Log
             </Button>
@@ -596,11 +644,11 @@ function ThreadPanel({ id, onClose, head }: { id: string; onClose: () => void; h
             {(allTurns ? head.cards : head.cards.slice(-HEAD_SHOWN)).map((c, i) => (
               <CardView key={c.id} card={c} selected={head.selected === c.id} working={head.working === c.id} onOpen={() => head.onCard(c)} first={i === 0} />
             ))}
-            {head.cards.length === 0 && head.questions.length === 0 && <p className="text-xs text-muted-foreground">Nothing with the head on this thread yet.</p>}
+            {head.cards.length === 0 && head.questions.length === 0 && <p className="text-xs text-muted-foreground">{classic ? "Nothing with the Architect on this thread yet." : "Nothing with the head on this thread yet."}</p>}
             {!th.archived && (
               <Button variant="outline" size="sm" className="gap-1.5 self-start" onClick={head.onCompose}>
                 <MessageSquarePlus className="size-3.5" />
-                {head.cards.length ? "Write to the head here" : "Start with the head"}
+                {classic ? (head.cards.length ? "Write to the Architect here" : "Start with the Architect") : (head.cards.length ? "Write to the head here" : "Start with the head")}
               </Button>
             )}
           </div>
@@ -641,8 +689,8 @@ function ThreadPanel({ id, onClose, head }: { id: string; onClose: () => void; h
         {v.events.map((e) => (
           <li key={e.id} className="flex gap-2 text-sm">
             <EntryIcon kind={e.kind} className="mt-0.5" />
-            <span className="min-w-0 flex-1">
-              {e.text}
+            <span className="min-w-0 flex-1 [overflow-wrap:anywhere]">
+              <FoldedText text={e.text} />
               <span className="block text-2xs text-muted-foreground">
                 {e.kind} · {e.by} · {relativeTime(e.at)}
               </span>

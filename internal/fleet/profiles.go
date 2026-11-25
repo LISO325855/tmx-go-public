@@ -6,6 +6,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/blackcode-ch/tmx-go/internal/claudeext"
 	"github.com/blackcode-ch/tmx-go/internal/model"
 )
 
@@ -15,6 +16,7 @@ const (
 	maxProfileDesc   = 500
 	maxInstructions  = 32 << 10
 	maxToolEntries   = 100
+	maxMCPServers    = 20
 	maxToolEntryLen  = 200
 	maxAllowedModels = 20
 )
@@ -41,6 +43,9 @@ func (f *Fleet) loadProfiles(seed model.Policy) error {
 		applyPolicy(add, seed, add)
 	} else {
 		for _, slug := range model.BuiltInProfiles {
+			if slug == model.FreeWorkerProfile {
+				continue // Seeded with its launch grants in UpgradeFreeWorker.
+			}
 			if _, ok := f.profiles[slug]; !ok {
 				d, _ := model.DefaultProfile(slug)
 				d.CanLaunch = slices.DeleteFunc(d.CanLaunch, func(s string) bool { return f.profiles[s] == nil && !model.IsBuiltInProfile(s) })
@@ -58,6 +63,14 @@ func (f *Fleet) loadProfiles(seed model.Policy) error {
 		f.profiles[p.Slug] = &p
 	}
 	if err := f.st.UpgradeModelDefaults(); err != nil {
+		return err
+	}
+	// Fable among the allowed models of head, lead and worker, for a store seeded before it
+	// (once; an owner's own model list is left alone: store/profiles.go).
+	if err := f.st.UpgradeFableAllowed(); err != nil {
+		return err
+	}
+	if err := f.st.UpgradeFreeWorker(); err != nil {
 		return err
 	}
 	upgraded, err := f.st.ListProfiles()
@@ -85,7 +98,7 @@ func applyPolicy(ps []model.Profile, pol model.Policy, all []model.Profile) {
 	for i := range ps {
 		p := &ps[i]
 		lp, ok := pol.Levels[p.Level]
-		if !ok || !model.IsBuiltInProfile(p.Slug) {
+		if !ok || p.Slug != string(p.Level) {
 			continue
 		}
 		p.Model, p.AllowedModels = lp.Model, slices.Clone(lp.AllowedModels)
@@ -99,11 +112,14 @@ func applyPolicy(ps []model.Profile, pol model.Policy, all []model.Profile) {
 func launchSlugs(levels []model.Level, current []string, all []model.Profile) []string {
 	out := []string{}
 	for _, p := range all {
-		if !slices.Contains(levels, p.Level) {
-			continue
-		}
-		if model.IsBuiltInProfile(p.Slug) || slices.Contains(current, p.Slug) {
+		if p.Slug == string(p.Level) && slices.Contains(levels, p.Level) {
 			out = append(out, p.Slug)
+		}
+	}
+	for _, slug := range current {
+		i := slices.IndexFunc(all, func(p model.Profile) bool { return p.Slug == slug })
+		if i >= 0 && slug != string(all[i].Level) && slices.Contains(levels, all[i].Level) {
+			out = append(out, slug)
 		}
 	}
 	return out
@@ -137,6 +153,17 @@ func (f *Fleet) profileListLocked() []model.Profile {
 // decorate returns a copy with the derived fields set.
 func (f *Fleet) decorate(p model.Profile) model.Profile {
 	p = p.Clone()
+	p.MCPWarnings = nil
+	for _, r := range f.agents {
+		if r.a.Profile == p.Slug || (r.a.Profile == "" && string(r.a.Level) == p.Slug) {
+			for _, warning := range r.a.MCPWarnings {
+				if !slices.Contains(p.MCPWarnings, warning) {
+					p.MCPWarnings = append(p.MCPWarnings, warning)
+				}
+			}
+		}
+	}
+	sort.Strings(p.MCPWarnings)
 	p.BuiltIn = model.IsBuiltInProfile(p.Slug)
 	p.Modified = false
 	if p.BuiltIn {
@@ -189,12 +216,19 @@ func (f *Fleet) GetProfile(slug string) (model.Profile, error) {
 
 // CreateProfile adds a custom profile (owner only).
 func (f *Fleet) CreateProfile(c Caller, p model.Profile) (model.Profile, error) {
-	if !c.Owner {
-		return model.Profile{}, errf(KindForbidden, "only the owner can change profiles")
-	}
 	p.Slug = strings.TrimSpace(p.Slug)
+	var notInstalled []string
+	if !c.Owner {
+		notInstalled = f.serversNotInstalled(p.MCPServers) // before f.mu: it may ask Claude Code
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err := f.manageNodeLocked(c, "change profiles"); err != nil {
+		return model.Profile{}, err
+	}
+	if len(notInstalled) > 0 {
+		return model.Profile{}, errf(KindForbidden, mcpServersInstalledOnly, strings.Join(notInstalled, ", "))
+	}
 	if !model.ValidName(p.Slug) || p.Slug == model.Owner {
 		return model.Profile{}, errf(KindInvalid, "%q is not a valid profile slug (lowercase letters, digits and dashes, up to 40)", p.Slug)
 	}
@@ -209,18 +243,66 @@ func (f *Fleet) CreateProfile(c Caller, p model.Profile) (model.Profile, error) 
 	return f.putProfileLocked(p)
 }
 
-// UpdateProfile replaces a profile's settings (owner only). The slug stays; a built-in keeps
+// A profile's MCP servers decide what programs its agents start, with the owner's credentials
+// in their environment (claudeext). Installing a server stays the owner's, behind his gate.
+// The head, who manages profiles, may give a profile any server the owner has installed
+// (tmx-lead for the owner, 17 Nov 22:55: "the head can do everything"), and no other: a name
+// that is not installed, or one of tmx's own (never listed), is refused.
+const mcpServersInstalledOnly = "a profile can get only MCP servers the owner has installed in Claude Code; not installed: %s (installing one is the owner's)"
+
+// serversNotInstalled returns those of ids that the owner's Claude Code does not have. Without
+// the service nothing is installed. Called without f.mu: the inventory may run claude.
+func (f *Fleet) serversNotInstalled(ids []string) []string {
+	ids = cleanList(ids)
+	if len(ids) == 0 {
+		return nil
+	}
+	if f.opts.ClaudeExt == nil {
+		return ids
+	}
+	inv := f.opts.ClaudeExt.Inventory(f.ctx, false)
+	var out []string
+	for _, id := range ids {
+		if _, ok := inv.Config(id); !ok {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+// UpdateProfile replaces a profile's settings: the owner or the head (manage.go; until 22:18 on
+// 17 Nov the head could change only the instructions text). The slug stays; a built-in keeps
 // its level, and a custom profile changes level only while no agent uses it. Agents pick up
 // the change at their next start.
 func (f *Fleet) UpdateProfile(c Caller, slug string, p model.Profile) (model.Profile, error) {
+	var notInstalled []string
 	if !c.Owner {
-		return model.Profile{}, errf(KindForbidden, "only the owner can change profiles")
+		notInstalled = f.serversNotInstalled(p.MCPServers) // before f.mu: it may ask Claude Code
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err := f.manageNodeLocked(c, "change profiles"); err != nil {
+		return model.Profile{}, err
+	}
 	cur, ok := f.profiles[slug]
 	if !ok {
 		return model.Profile{}, errf(KindNotFound, "no profile %q", slug)
+	}
+	if !c.Owner {
+		// The head sets a profile's MCP servers too, but only to servers the owner installed
+		// (or that the profile already had). A request that leaves the field out keeps them.
+		if p.MCPServers == nil {
+			p.MCPServers = cur.MCPServers
+		}
+		var refused []string
+		for _, id := range notInstalled {
+			if !slices.Contains(cur.MCPServers, id) {
+				refused = append(refused, id)
+			}
+		}
+		if len(refused) > 0 {
+			return model.Profile{}, errf(KindForbidden, mcpServersInstalledOnly, strings.Join(refused, ", "))
+		}
 	}
 	if p.Slug != "" && p.Slug != slug {
 		return model.Profile{}, errf(KindInvalid, "a profile's slug cannot be changed (%s → %s)", slug, p.Slug)
@@ -244,13 +326,13 @@ func (f *Fleet) UpdateProfile(c Caller, slug string, p model.Profile) (model.Pro
 	return f.putProfileLocked(p)
 }
 
-// ResetProfile puts a built-in profile back to its default (owner only).
+// ResetProfile puts a built-in profile back to its default (the owner or the head).
 func (f *Fleet) ResetProfile(c Caller, slug string) (model.Profile, error) {
-	if !c.Owner {
-		return model.Profile{}, errf(KindForbidden, "only the owner can change profiles")
-	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err := f.manageNodeLocked(c, "change profiles"); err != nil {
+		return model.Profile{}, err
+	}
 	cur, ok := f.profiles[slug]
 	if !ok {
 		return model.Profile{}, errf(KindNotFound, "no profile %q", slug)
@@ -268,11 +350,11 @@ func (f *Fleet) ResetProfile(c Caller, slug string) (model.Profile, error) {
 // DeleteProfile removes a custom profile no agent uses (owner only) and drops it from the
 // launch rights of the others.
 func (f *Fleet) DeleteProfile(c Caller, slug string) error {
-	if !c.Owner {
-		return errf(KindForbidden, "only the owner can change profiles")
-	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if err := f.manageNodeLocked(c, "change profiles"); err != nil {
+		return err
+	}
 	if _, ok := f.profiles[slug]; !ok {
 		return errf(KindNotFound, "no profile %q", slug)
 	}
@@ -302,6 +384,7 @@ func (f *Fleet) DeleteProfile(c Caller, slug string) error {
 // putProfileLocked stores p, registers it and publishes profile.updated.
 func (f *Fleet) putProfileLocked(p model.Profile) (model.Profile, error) {
 	p.BuiltIn, p.Modified = false, false
+	p.MCPWarnings = nil
 	if err := f.st.PutProfile(p); err != nil {
 		return model.Profile{}, err
 	}
@@ -334,6 +417,14 @@ func (f *Fleet) validateProfileLocked(p *model.Profile) error {
 		return errf(KindInvalid, "the built-in profile %s stays a %s profile", p.Slug, d.Level)
 	}
 
+	// Provider routing is part of the built-in profile, including when an older client
+	// saves editable settings without these fields.
+	p.Harness, p.Account, p.Provider = "", "", ""
+	if p.Slug == model.FreeWorkerProfile {
+		d, _ := model.DefaultProfile(p.Slug)
+		p.Harness, p.Account, p.Provider = d.Harness, d.Account, d.Provider
+	}
+
 	p.Model = strings.TrimSpace(p.Model)
 	if p.Model == "" {
 		return errf(KindInvalid, "the profile has no default model")
@@ -344,6 +435,13 @@ func (f *Fleet) validateProfileLocked(p *model.Profile) error {
 	}
 	if len(models) > maxAllowedModels {
 		return errf(KindInvalid, "at most %d allowed models", maxAllowedModels)
+	}
+	if p.Provider == model.FaeProvider {
+		for _, m := range models {
+			if _, ok := model.FaeModelName(m); !ok {
+				return errf(KindInvalid, "model %s must use the fae/ provider", m)
+			}
+		}
 	}
 	p.AllowedModels = models
 
@@ -383,6 +481,16 @@ func (f *Fleet) validateProfileLocked(p *model.Profile) error {
 		launch = append(launch, s)
 	}
 	p.CanLaunch = launch
+	servers := cleanList(p.MCPServers)
+	if len(servers) > maxMCPServers {
+		return errf(KindInvalid, "at most %d MCP servers", maxMCPServers)
+	}
+	for _, id := range servers {
+		if claudeext.Reserved(id) || !claudeext.ValidServerID(id) {
+			return errf(KindInvalid, "%q is not an MCP server a profile can add (a Claude Code server name, or plugin:<plugin>:<server>; not tmx's own or Claude in Chrome)", id)
+		}
+	}
+	p.MCPServers = servers
 	normalizeSlices(p)
 	return nil
 }
@@ -413,7 +521,7 @@ func cleanTools(which string, in []string) ([]string, error) {
 }
 
 func normalizeSlices(p *model.Profile) {
-	for _, s := range []*[]string{&p.AllowedModels, &p.AllowedTools, &p.DisallowedTools, &p.CanLaunch} {
+	for _, s := range []*[]string{&p.AllowedModels, &p.AllowedTools, &p.DisallowedTools, &p.CanLaunch, &p.MCPServers} {
 		if *s == nil {
 			*s = []string{}
 		}

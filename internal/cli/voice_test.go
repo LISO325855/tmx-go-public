@@ -62,7 +62,7 @@ func TestVoiceCommands(t *testing.T) {
 	}
 	bad := filepath.Join(t.TempDir(), "notes.txt")
 	os.WriteFile(bad, []byte("not audio"), 0o600)
-	if _, errOut, code := tmx(t, "transcribe", bad); code != 1 || !strings.Contains(errOut, "not a WAV, MP3, FLAC or Ogg") {
+	if _, errOut, code := tmx(t, "transcribe", bad); code != 1 || !strings.Contains(errOut, "not a WAV, MP3, FLAC, Ogg, M4A or AAC") {
 		t.Fatalf("not audio: %d %s", code, errOut)
 	}
 	if _, _, code := tmx(t, "transcribe"); code != 2 {
@@ -92,5 +92,38 @@ func TestVoiceCommands(t *testing.T) {
 	}
 	if _, _, code := tmx(t, "voice", "frobnicate"); code != 2 {
 		t.Fatalf("unknown subcommand: %d", code)
+	}
+	dir := t.TempDir()
+	for _, field := range []string{"tools_dir", "model_dir"} {
+		if _, errOut, code := tmx(t, "voice", field, dir); code != 1 {
+			t.Fatalf("incomplete activation %s: %d %s", field, code, errOut)
+		}
+		if _, _, code := tmx(t, "voice", field, "relative-path"); code != 1 {
+			t.Fatalf("%s relative path: %d", field, code)
+		}
+	}
+	if _, _, code := tmx(t, "voice", "engine", "unknown"); code != 1 {
+		t.Fatalf("invalid engine: %d", code)
+	}
+	if _, _, code := tmx(t, "voice", "python"); code != 2 {
+		t.Fatalf("missing python argument: %d", code)
+	}
+	if _, _, code := tmx(t, "voice", "set", "engine", "whisper.cpp"); code != 0 {
+		t.Fatalf("grouped settings: %d", code)
+	}
+	if _, _, code := tmx(t, "voice", "set", "engine", "whisper.cpp", "tools_dir", "relative-path"); code != 1 {
+		t.Fatalf("grouped invalid paths: %d", code)
+	}
+	if _, _, code := tmx(t, "voice", "set", "engine", "whisper.cpp", "engine", "faster-whisper"); code != 2 {
+		t.Fatalf("duplicate fields: %d", code)
+	}
+	if _, _, code := tmx(t, "voice", "set", "remote_url", "http://fae:8010", "remote_model", "large-v3-turbo", "idle_unload_s", "600"); code != 0 {
+		t.Fatalf("remote settings: %d", code)
+	}
+	if _, _, code := tmx(t, "voice", "set", "idle_unload_s", "not-a-number"); code != 2 {
+		t.Fatalf("non-numeric idle_unload_s: %d", code)
+	}
+	if _, errOut, code := tmx(t, "voice", "set", "remote_url", "not-a-url"); code != 1 || !strings.Contains(errOut, "remote_url") {
+		t.Fatalf("invalid remote_url: %d %s", code, errOut)
 	}
 }

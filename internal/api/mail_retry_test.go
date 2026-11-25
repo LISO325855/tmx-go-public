@@ -10,6 +10,7 @@ import (
 func TestMailRetryOwnerRouteAndVisibleReceipt(t *testing.T) {
 	d := apitest.New(t)
 	owner := client{t: t, base: d.URL, token: d.OwnerToken}
+	d.Ready(t, "head")
 	request := map[string]string{"text": "retry safely", "retry_id": "owner-request"}
 	var first, again model.Message
 	if status := owner.do("POST", "/api/agents/head/send", request, &first); status != 200 {

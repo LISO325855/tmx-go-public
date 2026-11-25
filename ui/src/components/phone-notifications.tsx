@@ -3,6 +3,7 @@ import { phoneNotificationPrompt } from "@/lib/phone-notifications";
 import { Button } from "@/components/ui/button";
 import { Section } from "@/components/page";
 import { useStore } from "@/lib/store";
+import { useClassic } from "@/hooks/use-classic";
 import { ownerAction, withConfirmation } from "@/lib/owner-gate";
 
 type PushStatus = { public_key: string; enabled: boolean };
@@ -104,6 +105,9 @@ function usePhone() {
 
 export function PhoneNotificationBanner() {
   const { supported, ios, status, enabled, busy, message, enable } = usePhone();
+  // The classic profile has no banner (Python has none): notifications are switched on in
+  // Settings > Phone notifications, which Home's "Notifications" row opens.
+  const classic = useClassic();
   // Deliberately in memory: Later only lasts for this open, never persisted.
   const [dismissed, setDismissed] = useState(false);
   useEffect(() => {
@@ -112,7 +116,7 @@ export function PhoneNotificationBanner() {
     return () => document.removeEventListener("visibilitychange", reopen);
   }, []);
   const prompt = phoneNotificationPrompt({ supported, ready: !!status, enabled, dismissed, ios });
-  if (prompt === "hidden") return null;
+  if (classic || prompt === "hidden") return null;
   if (prompt === "home-screen") return <p className="m-0 shrink-0 bg-[#151e19] px-4 py-3 text-[18px] text-white md:hidden">iPhone: add to Home Screen first</p>;
   return <section aria-label="Phone notifications" className="shrink-0 space-y-3 border-b border-white/30 bg-[#151e19] p-4 text-[18px] text-white md:hidden">
     <p className="font-semibold">Get approvals on this phone</p>
@@ -131,7 +135,7 @@ export function PhoneNotifications() {
       <p className="text-sm text-muted-foreground">Get a notification when an approval needs you. Open Tiamatrix to review it and approve with your owner PIN.</p>
       {supported && status
         ? <Button disabled={busy} variant={enabled ? "outline" : "default"} onClick={() => void (enabled ? disable() : enable())}>{enabled ? "Disable notifications" : "Enable notifications"}</Button>
-        : <p className="text-sm">Open Tiamatrix on your paired phone to enable notifications. On iPhone, add it to your Home Screen first.</p>}
+        : <div className="space-y-2"><p className="text-sm">On your phone, open Tiamatrix and go to Settings → General → Phone notifications (or Settings → Phone notifications). On iPhone, first use Safari's Share → Add to Home Screen, then open the new icon.</p><a href="#/settings?section=owner-devices" className="inline-block text-sm font-medium underline underline-offset-4">Connect a phone in Owner devices</a></div>}
       {message && <p role="status" className="text-sm">{message}</p>}
     </div>
   </Section>;

@@ -775,11 +775,15 @@ func TestAgentMailLabels(t *testing.T) {
 	}
 }
 
-func TestAgentRunPauses(t *testing.T) {
+// Agents may write to each other without end: no pause after a number of agent messages in a
+// row, no "wait until a person writes" (17 Nov). A chat that an older build had paused is
+// open again, because the pause was never stored: it was counted from the messages.
+func TestAgentsWriteWithoutALoopLimit(t *testing.T) {
 	n := p2ptest.NewNetwork()
 	alex, bo := newSide(t, n, "alex"), newSide(t, n, "bo")
 	id := pairDM(t, alex, bo)
-	for i := range MaxAgentRun {
+	const many = 45 // the old limit was 20
+	for i := range many {
 		s := alex
 		if i%2 == 1 {
 			s = bo
@@ -792,15 +796,10 @@ func TestAgentRunPauses(t *testing.T) {
 			return len(messages(t, alex, id)) == want && len(messages(t, bo, id)) == want
 		})
 	}
-	if _, err := alex.svc.Send(fleet.AgentCaller("h1"), id, "one more"); fleet.KindOf(err) != fleet.KindTooMany {
-		t.Fatalf("21st agent message: %v", err)
-	}
-	if _, err := bo.svc.Send(owner, id, "ok agents, carry on"); err != nil {
-		t.Fatal(err)
-	}
-	eventually(t, "alex has bo's line", func() bool { return strings.Contains(bodies(messages(t, alex, id)), "carry on") })
-	if _, err := alex.svc.Send(fleet.AgentCaller("h1"), id, "thanks"); err != nil {
-		t.Fatalf("after a person wrote: %v", err)
+	for _, s := range []*side{alex, bo} {
+		if b := bodies(messages(t, s, id)); strings.Contains(b, "Agents paused") {
+			t.Fatalf("a pause notice: %s", b)
+		}
 	}
 }
 
@@ -944,5 +943,28 @@ func TestNameFromStrangerIsIgnored(t *testing.T) {
 	env.From = bo.node.ID()
 	if err := alex.svc.onEnvelope(env); err == nil {
 		t.Fatal("accepted a name from a stranger")
+	}
+}
+
+// Agents may send invite links and credential-shaped text.
+func TestAgentChatAllowsInvitesAndCredentials(t *testing.T) {
+	n := p2ptest.NewNetwork()
+	alex, bo := newSide(t, n, "alex"), newSide(t, n, "bo")
+	id := pairDM(t, alex, bo)
+	for _, body := range []string{"join here: tmx://join/AQASIAJ7abc", "use ghp_" + "0123456789abcdefghijABCDEFGHIJ012345", "-----BEGIN " + "OPENSSH PRIVATE KEY-----"} {
+		if _, err := alex.svc.Send(fleet.AgentCaller("h1"), id, body); err != nil {
+			t.Fatalf("an agent could not write %q into a chat: %v", body, err)
+		}
+	}
+	for _, body := range []string{"your code is 482913", "password: hunter2!", "PIN 4821 for the bike lock"} {
+		if _, err := alex.svc.Send(fleet.AgentCaller("h1"), id, body); err != nil {
+			t.Fatalf("an agent's ordinary words %q were refused: %v", body, err)
+		}
+	}
+	if _, err := alex.svc.Send(owner, id, "tmx://join/AQASIAJ7abc"); err != nil {
+		t.Fatalf("the owner's own message: %v", err)
+	}
+	if _, err := alex.svc.Send(fleet.AgentCaller("h1"), id, "lunch at 12?"); err != nil {
+		t.Fatalf("ordinary agent text: %v", err)
 	}
 }

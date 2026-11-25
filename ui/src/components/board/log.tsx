@@ -1,9 +1,11 @@
+import { canAutoFocusComposer } from "@/lib/composer-focus";
 // A string's log on the board canvas (the head's threads and the chat topics): short lines
 // worth keeping (decision, action, info, link); append-only, a correction strikes the old line
 // through. Where a line is saved is the page's (onSave).
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { ArrowRightLeft, CheckCheck, CheckCircle2, CircleCheck, CirclePause, Gavel, Info, Link2, MessageCircleQuestion, OctagonX, Play, Undo2 } from "lucide-react";
 import { toast } from "sonner";
+import { FoldedText } from "@/components/folded-text";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
@@ -97,7 +99,7 @@ export function LogView<T extends LogLine>({
                 <li key={e.id} className="group flex items-start gap-2.5">
                   <EntryIcon kind={e.kind} className="mt-1" />
                   <div className="min-w-0 flex-1">
-                    <p className={cn("text-sm leading-snug [overflow-wrap:anywhere] whitespace-pre-line", fixedBy && "text-muted-foreground line-through")}>{e.text}</p>
+                    <p className={cn("text-sm leading-snug [overflow-wrap:anywhere] whitespace-pre-line", fixedBy && "text-muted-foreground line-through")}><FoldedText text={e.text} /></p>
                     {e.link &&
                       (isURL(e.link) ? (
                         <a href={e.link} target="_blank" rel="noreferrer noopener" className="mt-0.5 block truncate text-xs text-brand hover:underline">
@@ -224,7 +226,7 @@ export function EntryForm({
             void save();
           } else if (e.key === "Escape") onDone(false);
         }}
-        autoFocus={autoFocus}
+        autoFocus={autoFocus && canAutoFocusComposer()}
         rows={2}
         placeholder={kind === "decision" ? "What was decided, in a line or two" : kind === "action" ? "What was done or is to be done" : kind === "link" ? "What the link is" : "What is worth knowing"}
         aria-label="Log line"

@@ -1,5 +1,6 @@
-// Settings → Safety: the dangerous-command guard (on/off, per level), its rules, and the owner
-// gate with its grace window (DESIGN.md "Safety"). Changes that protect less go through the owner gate.
+// Settings → Safety: the dangerous-command guard's rules (Blocked, Held for me, Allowed: the whole
+// safety model, there is no on/off switch) and the owner gate with its grace window (DESIGN.md
+// "Safety"). Every rule change goes through the owner gate.
 import { useEffect, useState } from "react";
 import { AlertTriangle, Ban, ChevronRight, Fingerprint, KeyRound, LifeBuoy, Lock, LockOpen, ShieldAlert, ShieldCheck } from "lucide-react";
 import { toast } from "sonner";
@@ -12,12 +13,11 @@ import { CopyButton } from "@/components/copy-button";
 import { PinInput, validPin } from "@/components/pin-input";
 import { Section } from "@/components/page";
 import { api } from "@/lib/api";
-import { displayPath, LEVEL_LABEL } from "@/lib/format";
+import { displayPath } from "@/lib/format";
+import { clearRuleChanges, pendingChanges, savedState, stageRule, useRuleChanges } from "@/lib/rule-changes";
 import { GRACE_STEPS, graceLabel, graceTick, graceUntilLabel, loadSafety, setGateStatus, useGate, useGraceUntil } from "@/lib/owner-gate";
-import type { GateStatus, GuardAlwaysAllow, GuardRule, GuardSettings, Level, PinStatus, RuleState } from "@/lib/types";
+import type { GateStatus, GuardAlwaysAllow, GuardRule, GuardSettings, PinStatus, RuleState } from "@/lib/types";
 import { cn } from "@/lib/utils";
-
-const LEVELS: Level[] = ["head", "lead", "worker"];
 
 function Card({ children, className }: { children: React.ReactNode; className?: string }) {
   return <div className={cn("rounded-xl border bg-card", className)}>{children}</div>;
@@ -49,91 +49,58 @@ function ToggleRow({
   );
 }
 
-function GuardCard({ g }: { g: GuardSettings }) {
-  const [busy, setBusy] = useState(false);
-
-  async function save(next: GuardSettings, done: string) {
-    setBusy(true);
-    try {
-      const saved = await api.putGuard(next);
-      useGate.setState((s) => (s.safety ? { safety: { ...s.safety, guard: saved ?? next } } : {}));
-      toast.success(done, { description: "Running agents keep their current setting until they restart." });
-    } catch (e) {
-      toast.error((e as Error).message);
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  const offFor = new Set(g.off_for ?? []);
+/**
+ * What the guard is, in place of the old on/off switch: it is always there, every agent starts,
+ * and the rules below decide. Says plainly what it cannot check.
+ */
+function GuardCard() {
   return (
     <Card className="divide-y">
-      <ToggleRow
-        id="guard-on"
-        label={
-          <span className="flex items-center gap-1.5 font-medium">
-            {g.enabled ? <ShieldCheck className="size-4 text-state-ok" /> : <ShieldAlert className="size-4 text-state-error" />}
-            Dangerous-command guard
-          </span>
-        }
-        hint="Checks every command and file write of chat-mode Claude agents, in every permission mode, including Bypass permissions."
-        checked={g.enabled}
-        disabled={busy}
-        onChange={(on) => void save({ ...g, enabled: on }, on ? "Guard switched on" : "Guard switched off")}
-      />
-      {!g.enabled && (
-        <div className="flex items-start gap-2 bg-diff-del-bg px-4 py-2.5 text-xs">
-          <AlertTriangle className="mt-px size-3.5 shrink-0 text-state-error" />
-          <span>Nothing stops an agent from wiping a disk, deleting your home folder or killing other agents' tools.</span>
+      <div className="px-4 py-3">
+        <div className="flex items-center gap-1.5 text-sm font-medium">
+          <ShieldCheck className="size-4 text-state-ok" />
+          Command guard
+          <span className="ml-1 rounded-md border px-1.5 py-px text-2xs font-medium text-muted-foreground">Always on</span>
         </div>
-      )}
-      {LEVELS.map((l) => (
-        <ToggleRow
-          key={l}
-          id={"guard-" + l}
-          label={`${LEVEL_LABEL[l]} agents`}
-          checked={g.enabled && !offFor.has(l)}
-          disabled={busy || !g.enabled}
-          onChange={(on) => {
-            const next = new Set(offFor);
-            if (on) next.delete(l);
-            else next.add(l);
-            void save({ ...g, off_for: [...next] }, on ? `Guard on for ${l}s` : `Guard off for ${l}s`);
-          }}
-        />
-      ))}
-      <p className="px-4 py-2.5 text-xs text-muted-foreground">
-        Terminal-mode agents are not covered: the guard cannot see what is typed into a terminal.
-      </p>
+        <p className="mt-0.5 text-xs text-muted-foreground">
+          Checks every command and file write of your agents, in every permission mode, including Bypass permissions. It has no off switch: the rules below
+          are the whole safety model. Set each one to Blocked, Held for me or Allowed.
+        </p>
+      </div>
+      <div className="flex items-start gap-2 px-4 py-2.5 text-xs text-muted-foreground">
+        <AlertTriangle className="mt-px size-3.5 shrink-0 text-[color-mix(in_oklch,var(--state-waiting)_80%,var(--foreground))]" />
+        <span>
+          Agents always start. One the guard cannot check (a harness tmx has no guard for, or Claude settings that switch hooks off) starts too, with a red
+          warning in its timeline: nothing it runs is blocked or held. What you type into a terminal is not checked either.
+        </span>
+      </div>
     </Card>
   );
 }
 
 const STATE_LABEL: Record<RuleState, string> = { block: "Blocked", hold: "Held for me", allow: "Allowed" };
 
+/** Rule-log entries that are not about one rule (GuardSettings.rule_log). */
+const LOG_NAME: Record<string, string> = { "master-switch": "Guard on/off switch (removed)" };
+
 /**
  * A rule's switch (the owner, 3 Nov): three ways on the Blocked list, Held for me / Allowed on the
- * Held list. Each flip asks for your PIN (or Windows Hello at the machine) and is logged.
+ * Held list. A click only chooses (lib/rule-changes.ts); "Save" above the lists sends all
+ * choices together, so one PIN (or Windows Hello at the machine) covers them all (17 Nov).
  */
-function RuleSwitch({ r, onSaved }: { r: GuardRule; onSaved: (g: GuardSettings, rules: GuardRule[]) => void }) {
-  const [busy, setBusy] = useState(false);
+function RuleSwitch({ r, busy }: { r: GuardRule; busy: boolean }) {
+  const staged = useRuleChanges((s) => s.staged[r.id]);
   const states: RuleState[] = r.outcome === "block" ? ["block", "hold", "allow"] : ["hold", "allow"];
-  const cur = r.state ?? r.default ?? r.outcome;
-  async function flip(next: RuleState) {
-    if (next === cur || busy) return;
-    setBusy(true);
-    try {
-      const out = await api.putRuleState(r.id, next);
-      if (out) onSaved(out.guard, out.rules);
-      toast.success(`${r.name}: ${STATE_LABEL[next]}`);
-    } catch (e) {
-      toast.error((e as Error).message);
-    } finally {
-      setBusy(false);
-    }
-  }
+  const saved = savedState(r);
+  const cur = staged ?? saved;
   return (
-    <div role="radiogroup" aria-label={`${r.name}: what agents get`} className="inline-flex shrink-0 overflow-hidden rounded-md border text-2xs" onClick={(e) => e.stopPropagation()}>
+    <div
+      role="radiogroup"
+      aria-label={`${r.name}: what agents get`}
+      data-rule-changed={cur !== saved ? "" : undefined}
+      className={cn("inline-flex shrink-0 overflow-hidden rounded-md border text-2xs", cur !== saved && "ring-2 ring-primary/40")}
+      onClick={(e) => e.stopPropagation()}
+    >
       {states.map((st) => (
         <button
           key={st}
@@ -141,7 +108,7 @@ function RuleSwitch({ r, onSaved }: { r: GuardRule; onSaved: (g: GuardSettings, 
           role="radio"
           aria-checked={cur === st}
           disabled={busy}
-          onClick={() => void flip(st)}
+          onClick={() => stageRule(r, st)}
           className={cn(
             "px-2 py-1 font-medium transition-colors not-first:border-l disabled:opacity-60",
             cur === st
@@ -160,9 +127,10 @@ function RuleSwitch({ r, onSaved }: { r: GuardRule; onSaved: (g: GuardSettings, 
   );
 }
 
-function RuleRow({ r, onSaved }: { r: GuardRule; onSaved: (g: GuardSettings, rules: GuardRule[]) => void }) {
+function RuleRow({ r, busy }: { r: GuardRule; busy: boolean }) {
   const [open, setOpen] = useState(false);
-  const cur = r.state ?? r.outcome;
+  const staged = useRuleChanges((s) => s.staged[r.id]);
+  const cur = staged ?? r.state ?? r.outcome;
   return (
     <Collapsible open={open} onOpenChange={setOpen}>
       <div className="grid w-full grid-cols-1 items-start gap-3 px-4 py-2.5 md:flex">
@@ -181,7 +149,7 @@ function RuleRow({ r, onSaved }: { r: GuardRule; onSaved: (g: GuardSettings, rul
           </span>
           <ChevronRight className={cn("mt-0.5 size-3.5 shrink-0 text-subtle-foreground transition-transform duration-150", open && "rotate-90")} />
         </CollapsibleTrigger>
-        {r.switchable !== false && r.state && <RuleSwitch r={r} onSaved={onSaved} />}
+        {r.switchable !== false && r.state && <RuleSwitch r={r} busy={busy} />}
       </div>
       <CollapsibleContent>
         <div className="space-y-2 px-4 pb-3 pl-10.5">
@@ -243,14 +211,53 @@ function AlwaysCard({ items }: { items: GuardAlwaysAllow[] }) {
 function RulesCard({ rules, log }: { rules: GuardRule[]; log?: GuardSettings["rule_log"] }) {
   const onSaved = (g: GuardSettings, next: GuardRule[]) =>
     useGate.setState((s) => (s.safety ? { safety: { ...s.safety, guard: g, rules: next } } : {}));
-  // Fixed carve-outs have no switch: their parent row says "Always on: ...".
+  const staged = useRuleChanges((s) => s.staged);
+  const pending = pendingChanges(staged, rules);
+  const [busy, setBusy] = useState(false);
+  async function saveAll() {
+    if (busy || pending.length === 0) return;
+    setBusy(true);
+    try {
+      const out = await api.putRuleStates(Object.fromEntries(pending.map((p) => [p.rule.id, p.next])));
+      if (out) onSaved(out.guard, out.rules);
+      clearRuleChanges();
+      toast.success(pending.length === 1 ? `${pending[0].rule.name}: ${STATE_LABEL[pending[0].next]}` : `${pending.length} rules changed`);
+    } catch (e) {
+      toast.error((e as Error).message); // the choices stay, to try again
+    } finally {
+      setBusy(false);
+    }
+  }
+  // The fixed rules have no switch: they are all Blocks and get their own read-only list.
   const shown = rules.filter((r) => r.switchable !== false);
+  const never = rules.filter((r) => r.switchable === false);
+  // One list per state, by what each rule does now: a rule moves when you flip it.
+  const now = (r: GuardRule): RuleState => r.state ?? r.default ?? r.outcome;
   const groups: { title: string; hint: string; items: GuardRule[] }[] = [
-    { title: "Blocked", hint: "Blocked never runs; Held waits for you; Allowed runs. Every change asks for your PIN.", items: shown.filter((r) => r.outcome === "block") },
-    { title: "Held for you", hint: "Held waits in Needs you (Allow once, Allow always or Deny; no answer in 10 minutes means no); Allowed runs.", items: shown.filter((r) => r.outcome === "hold") },
+    { title: "Blocked", hint: "Never runs; the agent is told why. Choose, then Save: one PIN covers all your changes.", items: shown.filter((r) => now(r) === "block") },
+    { title: "Held for me", hint: "Waits in Needs you (Allow once, Allow always or Deny; no answer in 10 minutes means no).", items: shown.filter((r) => now(r) === "hold") },
+    { title: "Allowed", hint: "Runs without asking. The parts marked Always on stay blocked whatever you choose.", items: shown.filter((r) => now(r) === "allow") },
+    ...(never.length ? [{ title: "Always blocked", hint: "No switch: these never run, whatever the lists above say.", items: never }] : []),
   ];
   return (
     <div className="space-y-3">
+      {pending.length > 0 && (
+        <Card className="sticky top-2 z-10 border-primary/40 px-4 py-2.5">
+          <div className="flex flex-wrap items-center gap-2">
+            <p className="min-w-0 flex-1 text-[0.8125rem]">
+              <span className="font-semibold">{pending.length === 1 ? "1 change not saved yet" : `${pending.length} changes not saved yet`}</span>
+              <span className="block text-xs text-muted-foreground">{pending.map((p) => `${p.rule.name}: ${STATE_LABEL[p.next]}`).join(" · ")}</span>
+            </p>
+            <Button size="sm" onClick={() => void saveAll()} disabled={busy}>
+              <Fingerprint />
+              {pending.length === 1 ? "Save" : `Save all ${pending.length}`}
+            </Button>
+            <Button size="sm" variant="ghost" onClick={clearRuleChanges} disabled={busy}>
+              Discard
+            </Button>
+          </div>
+        </Card>
+      )}
       {groups.map((gr) => (
         <Card key={gr.title} className="overflow-hidden">
           <div className="grid grid-cols-1 gap-2 border-b px-4 py-2.5 md:flex md:items-baseline">
@@ -259,8 +266,9 @@ function RulesCard({ rules, log }: { rules: GuardRule[]; log?: GuardSettings["ru
           </div>
           <div className="divide-y">
             {gr.items.map((r) => (
-              <RuleRow key={r.id} r={r} onSaved={onSaved} />
+              <RuleRow key={r.id} r={r} busy={busy} />
             ))}
+            {gr.items.length === 0 && <p className="px-4 py-2.5 text-xs text-muted-foreground">No rule is set to this.</p>}
           </div>
         </Card>
       ))}
@@ -271,9 +279,9 @@ function RulesCard({ rules, log }: { rules: GuardRule[]; log?: GuardSettings["ru
           <ul className="max-h-56 divide-y overflow-auto text-xs">
             {[...log].reverse().slice(0, 50).map((ch, i) => (
               <li key={i} className="grid min-w-0 grid-cols-1 gap-2 px-4 py-1.5 md:flex md:items-baseline">
-                <span className="min-w-0 w-full whitespace-normal break-words md:w-auto md:flex-1 md:truncate">{rules.find((r) => r.id === ch.rule)?.name ?? ch.rule}</span>
+                <span className="min-w-0 w-full whitespace-normal break-words md:w-auto md:flex-1 md:truncate">{rules.find((r) => r.id === ch.rule)?.name ?? LOG_NAME[ch.rule] ?? ch.rule}</span>
                 <span className="text-muted-foreground">
-                  {STATE_LABEL[ch.old] ?? ch.old} → <span className="text-foreground">{STATE_LABEL[ch.new] ?? ch.new}</span>
+                  {STATE_LABEL[ch.old as RuleState] ?? ch.old} → <span className="text-foreground">{STATE_LABEL[ch.new as RuleState] ?? ch.new}</span>
                 </span>
                 <span className="tabular min-w-0 w-full text-2xs text-subtle-foreground md:w-36 md:shrink-0 md:text-right">
                   {ch.by === "tmx" ? "tmx defaults · " : ""}
@@ -637,7 +645,7 @@ export function SafetySection() {
         )
       ) : (
         <div className="space-y-6">
-          <GuardCard g={safety.guard} />
+          <GuardCard />
           <div>
             <h3 className="mb-2 text-xs font-medium text-muted-foreground">Allowed always</h3>
             <AlwaysCard items={safety.guard.always_allow ?? []} />

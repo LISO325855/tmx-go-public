@@ -1,5 +1,6 @@
 // Chats home: every chat with other people's tmx, the contacts, open invites; the empty state
 // explains how to start (send someone an invite).
+import { useClassic } from "@/hooks/use-classic";
 import { useEffect, useMemo, useState } from "react";
 import { Link2, MessageSquare, MessagesSquare, QrCode, Unplug, Users, Waypoints } from "lucide-react";
 import { toast } from "sonner";
@@ -18,13 +19,15 @@ import type { P2PStatus } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 export function ChatsPage() {
+  const classic = useClassic();
   const enabled = useChats((s) => s.enabled);
   const offMessage = useChats((s) => s.offMessage);
   const chats = useChats((s) => s.chats);
   const contacts = useChats((s) => s.contacts);
-  const list = useMemo(() => sortedChats(chats), [chats]);
+  const list = useMemo(() => sortedChats(chats).filter((c) => !classic || c.kind !== "group"), [chats, classic]);
   const people = useMemo(() => Object.values(contacts).sort((a, b) => a.name.localeCompare(b.name)), [contacts]);
   const [invites, setInvites] = useState<Invite[]>([]);
+  const visibleInvites = invites.filter((i) => !classic || i.kind !== "group");
   const inviteOpen = useChats((s) => s.invite.open);
   const [p2pStatus, setP2PStatus] = useState<P2PStatus | null>(null);
   useNow(30_000);
@@ -64,7 +67,7 @@ export function ChatsPage() {
   const p2pBanner = p2pStatus ? savedVsLiveBanner(p2pStatus) : null;
 
   const actions =
-    enabled !== false ? (
+    enabled === true ? (
       <>
         <Button variant="ghost" size="sm" onClick={() => chatUI.openJoin()}>
           <Link2 /> Join
@@ -81,7 +84,9 @@ export function ChatsPage() {
         <PageTitle>Chats</PageTitle>
       </PageHeader>
       <PageBody width="max-w-[51.25rem]">
-        {enabled === false ? (
+        {enabled === null ? (
+          <p className="text-sm text-muted-foreground">Chat status unavailable.</p>
+        ) : enabled === false ? (
           <EmptyState icon={Unplug} title="Peer-to-peer is off">
             Chats connect your tmx directly with other people's. This tmx runs without it right now.
             {offMessage && <p className="mt-2 text-xs text-subtle-foreground">{offMessage}</p>}
@@ -103,14 +108,14 @@ export function ChatsPage() {
             }
           >
             Send someone an invite: a QR code or a link. When they join, your two tmx connect directly. No accounts, nothing to set up. You, they and your
-            agents can then write to each other; groups work the same way.
+            agents can then write to each other{!classic && "; groups work the same way"}.
           </EmptyState>
         ) : (
           <div className="space-y-8">
             <Section
               title="Chats"
               right={
-                <Button variant="ghost" size="xs" className="text-muted-foreground" onClick={() => chatUI.openInvite("group")}>
+                !classic && <Button variant="ghost" size="xs" className="text-muted-foreground" onClick={() => chatUI.openInvite("group")}>
                   <Users /> New group
                 </Button>
               }
@@ -143,14 +148,14 @@ export function ChatsPage() {
                           </div>
                         </div>
                       </a>
-                      <a
+                      {!classic && <a
                         href={href(paths.chatBoard(c.id))}
                         aria-label={`Board of ${c.name}`}
                         title="The chat's board: its messages by topic"
                         className="absolute right-3 bottom-2.5 flex size-7 items-center justify-center rounded-md text-muted-foreground outline-none hover:bg-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
                       >
                         <Waypoints className="size-3.5" />
-                      </a>
+                      </a>}
                     </li>
                   ))}
                 </ul>
@@ -192,10 +197,10 @@ export function ChatsPage() {
               </Section>
             )}
 
-            {invites.length > 0 && (
+            {visibleInvites.length > 0 && (
               <Section title="Open invites">
                 <ul className="divide-y overflow-hidden rounded-xl border bg-card">
-                  {invites.map((i) => (
+                  {visibleInvites.map((i) => (
                     <li key={i.id} className="flex items-center gap-3 px-4 py-2.5 text-[0.8125rem]">
                       <QrCode className="size-4 shrink-0 text-muted-foreground" />
                       <span className="min-w-0 flex-1 truncate">

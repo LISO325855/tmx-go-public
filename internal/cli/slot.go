@@ -54,11 +54,37 @@ func cmdSlot(e *env, args []string) error {
 	}
 	cx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	var l slots.Lease
-	err = c.Post(cx, "/api/slots", map[string]any{"kind": *kind, "command": strings.Join(argv, " "), "pid": os.Getpid()}, &l)
+	var l struct {
+		slots.Lease
+		Proof string `json:"recovery_proof,omitempty"`
+	}
+	acquire := func() error {
+		return c.Post(cx, "/api/slots", map[string]any{"kind": *kind, "command": strings.Join(argv, " "), "pid": os.Getpid()}, &l)
+	}
+	retry := func() bool {
+		select {
+		case <-cx.Done():
+			return false
+		case <-time.After(time.Second):
+			return true
+		}
+	}
+	err = acquire()
 	var ae *client.APIError
+	if errors.As(err, &ae) && ae.Status == http.StatusServiceUnavailable {
+		fmt.Fprintln(e.errw, "tmx slot: daemon stopping; waiting to acquire a slot after restart")
+		for err != nil && retry() {
+			err = acquire()
+			if errors.As(err, &ae) && ae.Status != http.StatusServiceUnavailable {
+				break
+			}
+		}
+		if cx.Err() != nil {
+			return exitError{code: 130, msg: "interrupted while waiting for a slot"}
+		}
+	}
 	switch {
-	case errors.As(err, &ae) && ae.Status != http.StatusNotImplemented:
+	case errors.As(err, &ae) && ae.Status != http.StatusNotImplemented && ae.Status != http.StatusServiceUnavailable:
 		return err
 	case err != nil:
 		fmt.Fprintf(e.errw, "tmx slot: the daemon is not reachable (%v); running without a slot\n", err)
@@ -67,9 +93,16 @@ func cmdSlot(e *env, args []string) error {
 	release := func() {
 		rc, rcancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer rcancel()
+		if l.Proof != "" {
+			_ = c.Do(rc, http.MethodDelete, "/api/slots/recovery", map[string]string{"proof": l.Proof}, nil)
+			return
+		}
 		_ = c.Do(rc, http.MethodDelete, "/api/slots/"+client.Seg(l.ID), nil, nil)
 	}
 	defer release()
+	recoverLease := func(ctx context.Context) error {
+		return c.Post(ctx, "/api/slots/recovery", map[string]string{"proof": l.Proof}, &l)
+	}
 
 	lastPos, lastNote := 0, time.Time{}
 	for l.State != slots.Held {
@@ -77,16 +110,21 @@ func cmdSlot(e *env, args []string) error {
 			fmt.Fprintf(e.errw, "tmx slot: waiting for a %s slot (%s in line)\n", l.Kind, ordinal(l.Position))
 			lastPos, lastNote = l.Position, time.Now()
 		}
-		err := c.Post(cx, fmt.Sprintf("/api/slots/%s/wait?timeout=%d", client.Seg(l.ID), slotWaitSecs), nil, &l)
+		var err error
+		if l.Proof != "" {
+			err = recoverLease(cx)
+		} else {
+			err = c.Post(cx, fmt.Sprintf("/api/slots/%s/wait?timeout=%d", client.Seg(l.ID), slotWaitSecs), nil, &l)
+		}
 		if cx.Err() != nil {
 			return exitError{code: 130, msg: "interrupted while waiting for a slot"}
 		}
 		if err != nil {
-			if errors.As(err, &ae) && ae.Status == http.StatusNotFound {
-				return errors.New("the slot request lapsed; run the command again")
+			if !errors.As(err, &ae) || ae.Status == http.StatusServiceUnavailable {
+				retry()
+				continue
 			}
-			fmt.Fprintf(e.errw, "tmx slot: lost the daemon while waiting (%v); running without a slot\n", err)
-			return runSlotCommand(argv, nil)
+			return err
 		}
 	}
 	renew := func(stop <-chan struct{}) {
@@ -99,11 +137,23 @@ func cmdSlot(e *env, args []string) error {
 				return
 			case <-t.C:
 				rc, rcancel := context.WithTimeout(context.Background(), 5*time.Second)
-				err := c.Post(rc, "/api/slots/"+client.Seg(l.ID)+"/renew", nil, nil)
+				var err error
+				if l.Proof != "" {
+					err = recoverLease(rc)
+				} else {
+					err = c.Post(rc, "/api/slots/"+client.Seg(l.ID)+"/renew", nil, nil)
+				}
 				rcancel()
 				if err != nil && !warned {
 					fmt.Fprintf(e.errw, "tmx slot: could not renew the slot (%v); the command keeps running\n", err)
 					warned = true
+				}
+				var lost *client.APIError
+				if errors.As(err, &lost) && lost.Status == http.StatusNotFound {
+					return
+				}
+				if err == nil {
+					warned = false
 				}
 			}
 		}
@@ -122,7 +172,6 @@ func runSlotCommand(argv []string, during func(stop <-chan struct{})) error {
 	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(sigs)
 	stop := make(chan struct{})
-	defer close(stop)
 	go func() {
 		for {
 			select {
@@ -133,10 +182,16 @@ func runSlotCommand(argv []string, during func(stop <-chan struct{})) error {
 			}
 		}
 	}()
-	if during != nil {
-		go during(stop)
-	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if during != nil {
+			during(stop)
+		}
+	}()
 	err := cmd.Wait()
+	close(stop)
+	<-done
 	if err == nil {
 		return nil
 	}

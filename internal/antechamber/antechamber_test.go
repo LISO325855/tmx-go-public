@@ -584,7 +584,8 @@ func TestBlockedNeverLeavesAndRefuseBlocksHash(t *testing.T) {
 
 func TestAdmitLimits(t *testing.T) {
 	a, _ := newChamber(t)
-	if _, err := a.AdmitBytes(make([]byte, 26<<20), "big", personOrigin, false); status(err) != 413 {
+	a.Limits.MaxFilePerson = 1 << 20 // the shipped ceiling is 1 GB; the rule is tested at a size a test can hold
+	if _, err := a.AdmitBytes(make([]byte, 1<<20+1), "big", personOrigin, false); status(err) != 413 {
 		t.Errorf("over the person limit: %v", err)
 	}
 	if ents, _ := os.ReadDir(filepath.Join(a.Root, "uploads")); len(ents) != 0 {

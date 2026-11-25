@@ -174,3 +174,38 @@ func TestConnectBoundaryURLDiagnostic(t *testing.T) {
 		t.Fatal("invalid address accepted or key echoed")
 	}
 }
+
+func TestCheckedConnectPreservesPreviousConnection(t *testing.T) {
+	p := config.Paths{Home: t.TempDir()}
+	if err := config.Save(p, config.Config{Companion: &config.CompanionConfig{URL: "http://127.0.0.1:8111", TrustedPrograms: []string{"trusted-program"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := config.WriteSecret(p.CompanionAgentTokenFile(), "previous-test-key"); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(p.CompanionAgentTokenFile())
+	if err != nil {
+		t.Fatal(err)
+	}
+	hc := &http.Client{Transport: boundaryTransport(func(r *http.Request) (*http.Response, error) {
+		return boundaryResponse(r, 503, `{"detail":"busy"}`), nil
+	})}
+	if _, err := companion.Connect(context.Background(), p, "http://127.0.0.1:8222", "new-test-key", hc, "test", true); err == nil {
+		t.Fatal("unchecked handover succeeded")
+	}
+	after, _ := os.ReadFile(p.CompanionAgentTokenFile())
+	c, err := config.Load(p)
+	if err != nil || string(after) != string(before) || c.Companion.URL != "http://127.0.0.1:8111" || len(c.Companion.TrustedPrograms) != 1 {
+		t.Fatal("failed handover changed previous connection")
+	}
+	hc.Transport = boundaryTransport(func(r *http.Request) (*http.Response, error) {
+		return boundaryResponse(r, 200, `{"label":"test"}`), nil
+	})
+	if res, err := companion.Connect(context.Background(), p, "http://127.0.0.1:8222", "new-test-key", hc, "test", true); err != nil || !res.Reachable {
+		t.Fatalf("checked handover failed: %v", err)
+	}
+	after, _ = os.ReadFile(p.CompanionAgentTokenFile())
+	if string(after) == string(before) {
+		t.Fatal("successful handover did not replace key")
+	}
+}

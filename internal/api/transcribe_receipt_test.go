@@ -14,6 +14,30 @@ func receiptRequest(key, body, ct string) *http.Request {
 	r.Header.Set("Idempotency-Key", key)
 	return r
 }
+
+func TestUIReceiptRetriesTransientFailures(t *testing.T) {
+	calls := 0
+	h := (&Server{}).transcribeReceipt(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 1 {
+			writeError(w, 502, "restarting")
+			return
+		}
+		writeJSON(w, 200, map[string]string{"text": "recovered"})
+	})
+	for i, want := range []int{502, 200, 200} {
+		r := receiptRequest("", "audio", "application/json")
+		r.URL.RawQuery = "request_id=device-clip"
+		w := httptest.NewRecorder()
+		h(w, r)
+		if w.Code != want {
+			t.Fatalf("attempt %d: %d", i, w.Code)
+		}
+	}
+	if calls != 2 {
+		t.Fatalf("calls=%d, want transient retry then successful replay", calls)
+	}
+}
 func TestTranscriptionReceiptReplayAndConflict(t *testing.T) {
 	for _, ct := range []string{"application/json", "audio/wav"} {
 		t.Run(ct, func(t *testing.T) {

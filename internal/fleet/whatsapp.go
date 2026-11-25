@@ -91,16 +91,11 @@ func (f *Fleet) DeliverWhatsApp(agentID, body string) (model.Message, error) {
 		f.mu.Unlock()
 		return model.Message{}, errf(KindNotFound, "no agent %q", agentID)
 	}
-	n, err := f.st.CountQueued(agentID)
-	if err != nil {
+	m := model.Message{ID: model.NewID(), From: model.WhatsAppParty, To: agentID, Body: body, State: model.MsgQueued, CreatedAt: model.Now()}
+	if err := f.diskFloorLocked(m); err != nil {
 		f.mu.Unlock()
 		return model.Message{}, err
 	}
-	if n >= MaxQueued {
-		f.mu.Unlock()
-		return model.Message{}, errf(KindTooMany, "%s already has %d messages waiting", r.a.Name, n)
-	}
-	m := model.Message{ID: model.NewID(), From: model.WhatsAppParty, To: agentID, Body: body, State: model.MsgQueued, CreatedAt: model.Now()}
 	if err := f.st.PutMessage(m); err != nil {
 		f.mu.Unlock()
 		return model.Message{}, err

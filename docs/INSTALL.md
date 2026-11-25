@@ -41,7 +41,7 @@ Do this before running any downloaded binary. A checksum alone does not prove
 who published it: verify `SHA256SUMS.sig` as well. The repository's
 `cmd/public-release` verification tool checks the Ed25519 signature against
 pinned public keys, binds it to the public repository and exact tag, and checks
-all four binary hashes against the exact manifest bytes.
+the required headless binaries and Windows desktop executable against the exact manifest bytes.
 
 On a trusted verification computer, install Git, the GitHub CLI (`gh`), and the
 Go toolchain required by `go.mod`. Obtain a reviewed checkout of
@@ -67,9 +67,10 @@ gh release download fleet-v1.0.1 --repo blackcode-ch/tmx-go-public --dir release
 go run ./cmd/public-release -mode verify -tag fleet-v1.0.1 -dir release-dist -sig release-dist/SHA256SUMS.sig -pins public-pins.json
 ```
 
-Keep all six assets in `release-dist`: four binaries, `SHA256SUMS` and
-`SHA256SUMS.sig`. The verifier requires all four platforms even if you only
-intend to run one. Continue only if it exits successfully. Missing assets,
+Use the verifier from the release's reviewed source revision for older asset layouts.
+Keep all release assets in `release-dist`, including the four headless binaries,
+the Windows desktop executable, `SHA256SUMS`, and `SHA256SUMS.sig` for the current
+layout. Continue only if verification exits successfully. Missing assets,
 unknown keys, invalid signatures or mismatched checksums are failures; do not
 bypass them. Verification can happen on another trusted computer, but ensure
 the installed bytes still match the verified manifest after transferring them.

@@ -446,13 +446,27 @@ export function buildWorld(scenario: string): MockWorld {
     "Three options, each under ten words:\n\n1. **Billing your customers will actually understand.**\n2. **Invoices, plans and payments, in one calm place.**\n3. **Stop answering billing emails.**\n\nI'd go with 1: it says what it is and who it's for.",
   );
   head.result(1, 7_400);
+  // a wide table in a reply (markdown tables must not break words in a cell: index.css .prose-tmx td)
+  head.owner("Where did the Python tabs go?");
+  head.say(
+    [
+      "| Python tab | In Go | Note |",
+      "| --- | --- | --- |",
+      "| Workspace | The Architect's conversation, and each agent's page | Chat and Terminal side by side on a wide screen |",
+      "| Recordings | Recordings | The recorder and its summaries, unchanged |",
+      "| Your turn | Your turn | Cards by project, the recommended choice first |",
+      "| Promises | Matrix | Replaced by the Matrix's threads; the old records stay readable |",
+    ].join("\n"),
+  );
+  head.result(1, 5200);
   w.agents.get("hd3k9q2m7x")!.last_activity_at = head.t;
   w.threads.push(
-    { id: "p-pbl7n2c4ka", title: "billing-portal", kind: "project", project_id: "pbl7n2c4ka", created_at: now - 88 * min, updated_at: now - 88 * min },
-    { id: "p-pdc5v7x9za", title: "docs-site", kind: "project", project_id: "pdc5v7x9za", created_at: now - 2 * 86400_000, updated_at: now - 2 * 86400_000 },
-    { id: "p-pin2b4d6fh", title: "ingest-pipeline", kind: "project", project_id: "pin2b4d6fh", created_at: now - 5 * 86400_000, updated_at: now - 5 * 86400_000 },
+    // progress, where it stands and what it waits for: the Board view of the Matrix (lib/matrix-board.ts)
+    { id: "p-pbl7n2c4ka", title: "billing-portal", kind: "project", project_id: "pbl7n2c4ka", owner: "ld8q2w4e6r", progress: 55, progress_why: "Webhooks and the plan picker are done; payment methods next.", created_at: now - 88 * min, updated_at: now - 12 * min },
+    { id: "p-pdc5v7x9za", title: "docs-site", kind: "project", project_id: "pdc5v7x9za", owner: "ld9w3e5r7t", status: "waiting_on_owner", progress: 30, progress_why: "Pages migrated; search not chosen yet.", blocker: "Choose the search: a static index (free) or a hosted one.", created_at: now - 2 * 86400_000, updated_at: now - 25 * min },
+    { id: "p-pin2b4d6fh", title: "ingest-pipeline", kind: "project", project_id: "pin2b4d6fh", owner: "ld2e4r6t8y", status: "blocked", progress: 40, progress_why: "The parser is written.", blocker: "Waits for the sample files from the customer.", created_at: now - 5 * 86400_000, updated_at: now - 3 * 3600_000 },
     { id: "t-landing", title: "Launch page", kind: "topic", color: "violet", created_at: now - 80 * min, updated_at: now - 80 * min },
-    { id: "t-hiring", title: "Hiring", kind: "topic", color: "amber", created_at: now - 34 * min, updated_at: now - 34 * min },
+    { id: "t-hiring", title: "Hiring", kind: "topic", color: "amber", status: "done", progress: 100, progress_why: "Job post is live.", created_at: now - 34 * min, updated_at: now - 5 * min },
   );
   const entry = (id: string, thread_id: string, kind: ThreadEntry["kind"], text: string, by: string, ago: number, extra: Partial<ThreadEntry> = {}) =>
     w.entries.push({ id, thread_id, kind, text, by, at: now - ago * min, ...extra });

@@ -118,18 +118,18 @@ func (f *Fleet) ImportProject(c Caller, project string, req ProjectImportRequest
 	if req.Section != nil {
 		in := req.Section
 		status := strings.NewReplacer("\r\n", "\n", "\r", "\n", "\v", "\n", "\f", "\n", "\u0085", "\n", "\u2028", "\n", "\u2029", "\n").Replace(in.Status)
-		if len(strings.Split(status, "\n")) > 3 || utf8.RuneCountInString(status) > 600 {
-			return empty, errf(KindInvalid, "status must be at most three lines and 600 characters")
+		if utf8.RuneCountInString(status) > 16000 { // any number of lines; 600 characters in 3 lines until 17 Nov
+			return empty, errf(KindInvalid, "status is longer than 16000 characters")
 		}
 		if in.UpdatedAt <= 0 || !importLabel(in.UpdatedBy) {
 			return empty, errf(KindInvalid, "section needs source updated_at (Unix milliseconds) and updated_by")
 		}
-		if len(in.Needs) > 20 || len(in.Links) > 20 {
-			return empty, errf(KindInvalid, "section has more than 20 needs or links")
+		if len(in.Needs) > 2000 || len(in.Links) > 2000 { // storage ceilings (20 until 17 Nov)
+			return empty, errf(KindInvalid, "section has more than 2000 needs or links")
 		}
 		for _, need := range in.Needs {
-			if strings.TrimSpace(need.Text) == "" || utf8.RuneCountInString(need.Text) > 300 {
-				return empty, errf(KindInvalid, "need text is empty or exceeds 300 characters")
+			if strings.TrimSpace(need.Text) == "" || utf8.RuneCountInString(need.Text) > 4000 { // 300 until 17 Nov
+				return empty, errf(KindInvalid, "need text is empty or exceeds 4000 characters")
 			}
 		}
 		for _, link := range in.Links {
@@ -213,6 +213,11 @@ func (f *Fleet) ImportProject(c Caller, project string, req ProjectImportRequest
 			// History is an expired imported record, never a fresh owner decision.
 			ap.State, ap.Answer, ap.DecidedAt, ap.Deferred = model.ApprovalExpired, in.Answer, in.ClosedAt, false
 			card.CloseReason = "Imported history (" + state + "): " + in.Reason
+		} else if ap.Deferred {
+			// A card the owner had put aside at the source is not a fresh question here: it
+			// comes in closed, readable in the project's history, never on the owner's list.
+			ap.State, ap.DecidedAt, ap.Deferred = model.ApprovalExpired, model.Now(), false
+			card.CloseReason = "Imported closed: it was parked for later at the source"
 		}
 		cards = append(cards, ap)
 		rec.CardIDs = append(rec.CardIDs, id)

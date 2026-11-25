@@ -101,29 +101,47 @@ export async function startDaemon({ phone = false, config = {} } = {}) {
       port,
       voice: { auto_transcribe: false },
       summaries: { local_url: model.url },
+      onboarded_at: 1, // the first-run setup was shown: it must not open over the pages under test (config: { onboarded_at: 0 } brings it back)
       ...(proxy ? { api: { trusted_hosts: [proxy.host] } } : {}),
       ...config,
     }, null, 1));
     const log = [];
-    const proc = spawn(BIN, ["daemon"], {
-      env: { ...process.env, TMXG_HOME: home, TMXG_GATESIM: home, TMXG_PORT: String(port) },
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    let spawnError;
-    const exited = new Promise(resolve => {
-      proc.once("exit", resolve);
-      proc.once("error", error => { spawnError = error; resolve(); });
-    });
-    own(() => spawnError ? undefined : stopProcess(proc, exited));
-    for (const s of [proc.stdout, proc.stderr]) s.on("data", d => { log.push(String(d)); if (log.length > 400) log.shift(); });
     const url = `http://127.0.0.1:${port}`;
-    const deadline = Date.now() + 30_000;
-    for (;;) {
-      try { if ((await fetch(url + "/api/health", { signal: AbortSignal.timeout(1000) })).ok) break; } catch { /* not up yet */ }
-      if (spawnError) throw spawnError;
-      if (proc.exitCode !== null || proc.signalCode !== null || Date.now() > deadline) throw new Error("the daemon did not start:\n" + log.join(""));
-      await sleep(100);
+    let current;
+    async function restart() {
+      if (current && current.proc.exitCode === null && current.proc.signalCode === null) return current.proc.pid;
+      const proc = spawn(BIN, ["daemon"], {
+        env: { ...process.env, TMXG_HOME: home, TMXG_GATESIM: home, TMXG_PORT: String(port) },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let spawnError;
+      const exited = new Promise(resolve => {
+        proc.once("exit", resolve);
+        proc.once("error", error => { spawnError = error; resolve(); });
+      });
+      current = { proc, exited };
+      own(() => spawnError ? undefined : stopProcess(proc, exited));
+      for (const stream of [proc.stdout, proc.stderr]) stream.on("data", d => {
+        log.push(String(d));
+        if (log.length > 400) log.shift();
+      });
+      const deadline = Date.now() + 30_000;
+      for (;;) {
+        try {
+          if ((await fetch(url + "/api/health", { signal: AbortSignal.timeout(1000) })).ok) return proc.pid;
+        } catch { /* not up yet */ }
+        if (spawnError) throw spawnError;
+        if (proc.exitCode !== null || proc.signalCode !== null || Date.now() > deadline) throw new Error("the daemon did not start:\n" + log.join(""));
+        await sleep(100);
+      }
     }
+    async function kill() {
+      const { proc, exited } = current;
+      proc.kill("SIGKILL");
+      await exited;
+      return proc.pid;
+    }
+    await restart();
     const token = readFileSync(path.join(home, "secrets", "owner-token"), "utf8").trim();
     const api = async (method, p, body) => {
       const r = await fetch(url + p, { method, headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" },
@@ -133,7 +151,7 @@ export async function startDaemon({ phone = false, config = {} } = {}) {
       return text ? JSON.parse(text) : null;
     };
     return {
-      home, port, url, token, model, proxy, api, log,
+      home, port, url, token, model, proxy, api, log, kill, restart,
       ownerURL: (route = "/") => `${url}/#token=${encodeURIComponent(token)}`,
     };
   });

@@ -91,10 +91,10 @@ func TestGraceWindowOverTheAPI(t *testing.T) {
 	if s, _ := call(t, owner, "DELETE", "/api/projects/"+p.ID, nil, nil); s != 0 {
 		t.Fatalf("delete inside the window: %d", s)
 	}
-	if s, _ := call(t, owner, "PUT", "/api/safety/guard", guard.Settings{Enabled: false, OffFor: []string{}}, nil); s != 0 {
-		t.Fatalf("guard off inside the window: %d", s)
+	if s, _ := call(t, owner, "PUT", "/api/safety/guard", guard.Settings{AllowBrowserAutomation: true}, nil); s != 0 {
+		t.Fatalf("browser automation inside the window: %d", s)
 	}
-	call(t, owner, "PUT", "/api/safety/guard", guard.Settings{Enabled: true, OffFor: []string{}}, nil)
+	call(t, owner, "PUT", "/api/safety/guard", guard.Settings{}, nil)
 	if got := len(d.GateAuth.Prompts()); got != prompts {
 		t.Fatalf("the window prompted %d times", got-prompts)
 	}
@@ -107,27 +107,34 @@ func TestGraceWindowOverTheAPI(t *testing.T) {
 	var pol model.Policy
 	call(t, owner, "GET", "/api/policy", nil, &pol)
 	call(t, owner, "POST", "/api/projects", map[string]string{"name": "Kept"}, &p)
+	// head: since 17 Nov the head manages projects, the policy and profiles like the owner, with
+	// no confirmation asked of him (fleet/manage.go); these four are then not the owner's alone.
+	// The owner's identity stays his: deciding approvals, the guard, adoption, the gate.
 	gated := []struct {
 		m, p string
 		body any
+		head bool
 	}{
-		{"POST", "/api/approvals/" + ap2.ID, map[string]string{"decision": "allow"}},
-		{"DELETE", "/api/projects/" + p.ID, nil},
-		{"PUT", "/api/policy", pol},
-		{"PUT", "/api/safety/guard", guard.Settings{Enabled: false, OffFor: []string{}}},
-		{"POST", "/api/profiles", map[string]any{"name": "Wild", "permission_mode": "bypassPermissions"}},
-		{"PUT", "/api/profiles/worker", map[string]any{"name": "Worker", "permission_mode": "bypassPermissions"}},
-		{"POST", "/api/adopt", map[string]any{"pid": 1, "confirm": true}},
-		{"PUT", "/api/gate", map[string]bool{"enabled": false}},
-		{"PUT", "/api/gate/grace", map[string]int{"grace_minutes": 1440}},
-		{"POST", "/api/gate/lock", nil},
-		{"GET", "/api/gate", nil},
+		{"POST", "/api/approvals/" + ap2.ID, map[string]string{"decision": "allow"}, false},
+		{"DELETE", "/api/projects/" + p.ID, nil, true},
+		{"PUT", "/api/policy", pol, true},
+		{"PUT", "/api/safety/guard", guard.Settings{AllowBrowserAutomation: true}, false},
+		{"POST", "/api/profiles", map[string]any{"name": "Wild", "permission_mode": "bypassPermissions"}, true},
+		{"PUT", "/api/profiles/worker", map[string]any{"name": "Worker", "permission_mode": "bypassPermissions"}, true},
+		{"POST", "/api/adopt", map[string]any{"pid": 1, "confirm": true}, false},
+		{"PUT", "/api/gate", map[string]bool{"enabled": false}, false},
+		{"PUT", "/api/gate/grace", map[string]int{"grace_minutes": 1440}, false},
+		{"POST", "/api/gate/lock", nil, false},
+		{"GET", "/api/gate", nil, false},
 	}
 	for _, c := range []struct {
 		name string
 		cl   *tc.Client
 	}{{"agent", agent}, {"Companion", link}} {
 		for _, g := range gated {
+			if g.head && c.name == "agent" {
+				continue
+			}
 			if s, _ := call(t, c.cl, g.m, g.p, g.body, nil); s != http.StatusForbidden {
 				t.Errorf("%s %s %s inside the window: %d, want 403", c.name, g.m, g.p, s)
 			}

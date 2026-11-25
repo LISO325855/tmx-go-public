@@ -85,13 +85,39 @@ export class MockMatrix {
       return view;
     }
     if (what === "threads" && th && action === "state" && method === "POST") {
-      const b = body as { status?: string; lifecycle?: string };
+      const b = body as { status?: string; lifecycle?: string; why?: string; pct?: number; blocker?: string };
       if (b.status !== undefined && !STATUSES.includes(b.status)) throw new ApiError(400, `Unknown status "${b.status}".`);
+      if (b.pct !== undefined && !(b.pct >= 0 && b.pct <= 100)) throw new ApiError(400, "pct must be from 0 to 100");
       if (b.status !== undefined) th.status = b.status as Thread["status"];
       if (b.lifecycle !== undefined) th.lifecycle = b.lifecycle as Thread["lifecycle"];
+      // the Board's fields, as the daemon keeps them (internal/fleet/matrixops.go SetState)
+      if (b.pct !== undefined) {
+        th.progress = Math.round(b.pct);
+        if (b.why) th.progress_why = b.why;
+      }
+      if (b.blocker !== undefined) th.blocker = b.blocker.trim().replace(/\s+/g, " ");
+      else if (b.status === "active" || b.status === "done") th.blocker = "";
+      if (b.status === "done") th.progress = 100;
       th.updated_at = Date.now();
       this.emit("thread.updated", th);
       return th;
+    }
+    // the owner acting on a Board row (internal/fleet/matrix_owner.go)
+    if (what === "threads" && th && action === "owner" && method === "POST") {
+      const b = body as { act?: string; note?: string };
+      const words: Record<string, string> = { park: "Park it: stop work on this for now.", not_relevant: "Not relevant any more: drop it.", done: "Done: I did the next action.", thanks: "Thanks." };
+      const act = b.act ?? "";
+      if (act !== "note" && !words[act]) throw new ApiError(400, "act must be note, park, not_relevant, done or thanks");
+      const text = [words[act], (b.note ?? "").trim()].filter(Boolean).join(" ");
+      if (!text) throw new ApiError(400, "the note is empty");
+      const at = Date.now();
+      this.w.entries.push({ id: "e-" + Math.random().toString(36).slice(2, 12), thread_id: th.id, kind: act === "park" ? "pause" : act === "done" || act === "thanks" ? "result" : "decision", text, by: "owner", at } as (typeof this.w.entries)[number]);
+      if (act === "park") th.status = "paused";
+      if (act === "not_relevant") th.archived = true;
+      th.updated_at = at;
+      this.emit("thread.updated", th);
+      const to = th.owner ? this.w.agents.get(th.owner) : undefined;
+      return { thread: th, mailed_to: to?.name };
     }
     if (what === "links" && !id && method === "POST") {
       const b = body as { thread: string; axis: LinkAxis; ref: string; role?: string; label?: string; why?: string };

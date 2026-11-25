@@ -27,10 +27,12 @@ function explained(): boolean {
   }
 }
 
-/** Switches the agent's mode (a switch that waits for the turn shows as pending_mode on the agent). */
-export async function switchMode(agent: Agent, mode: Mode): Promise<boolean> {
+/** Switches the agent's mode (a switch that waits for the turn shows as pending_mode on the agent).
+ * say: tell the owner what the daemon answered ("it switches when the turn ends"). */
+export async function switchMode(agent: Agent, mode: Mode, say = false): Promise<boolean> {
   try {
-    await api.setMode(agent.id, mode);
+    const r = await api.setMode(agent.id, mode);
+    if (say && r?.note) toast(r.note);
     return true;
   } catch (e) {
     toast.error((e as Error).message);

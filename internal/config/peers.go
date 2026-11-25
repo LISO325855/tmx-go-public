@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"github.com/blackcode-ch/tmx-go/internal/model"
 	"net"
 	"net/url"
 	"path/filepath"
@@ -63,3 +64,20 @@ func (c *Config) validatePeers() error {
 
 // PeersFile holds the pair tokens (one per peer, both sides store the same one).
 func (p Paths) PeersFile() string { return filepath.Join(p.SecretsDir(), "peers.json") }
+
+// FleetLeadAddress validates the owner's explicit fleet leadership selection.
+func FleetLeadAddress(raw string) (string, error) {
+	raw = strings.ToLower(strings.TrimSpace(raw))
+	if raw == "" {
+		return "", nil
+	}
+	name, host, ok := strings.Cut(raw, "@")
+	if !ok || !model.ValidName(name) || !ValidHostName(host) {
+		return "", fmt.Errorf("fleet_lead must be agent@node")
+	}
+	switch name {
+	case "owner", "operator", "system", "tmx", "companion":
+		return "", fmt.Errorf("fleet_lead must name an agent, not an owner or system party")
+	}
+	return name + "@" + host, nil
+}

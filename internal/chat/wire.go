@@ -27,6 +27,12 @@ const (
 	TypeAdminOffer  = "chat.admin_offer"  // admin → member: take over the group
 	TypeAdminAccept = "chat.admin_accept" // member → admin: taken
 	TypeAdminCert   = "chat.admin"        // signed by the admin: from version on, admin is the admin
+	// Team status (team.go): a member's computer reports its status to the group's admin, once
+	// its owner opted in, and the admin's tmx tells the members that it takes reports (and, when
+	// it opens the team to everyone, passes on everyone's signed reports). A member only reports
+	// after the admin's chat.team, so an install that does not know these types is never sent one.
+	TypeStatus = "chat.status" // member → admin: this computer's status report (team.Report)
+	TypeTeam   = "chat.team"   // admin → members: it takes reports; open; the signed reports when open
 )
 
 // WireVersion is the major version of the Body formats. 2: group members send to each

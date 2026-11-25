@@ -227,7 +227,7 @@ func (u UpdateConfig) MarshalJSON() ([]byte, error) {
 	switch {
 	case u.rawKeys != nil:
 		aux.FleetKeys = u.rawKeys
-	case len(u.FleetKeys) > 0:
+	case u.FleetKeys != nil:
 		if aux.FleetKeys, err = json.Marshal(u.FleetKeys); err != nil {
 			return nil, err
 		}
@@ -235,7 +235,7 @@ func (u UpdateConfig) MarshalJSON() ([]byte, error) {
 	switch {
 	case u.rawRequire != nil:
 		aux.Require = u.rawRequire
-	case len(u.Require) > 0:
+	case u.Require != nil:
 		if aux.Require, err = json.Marshal(u.Require); err != nil {
 			return nil, err
 		}

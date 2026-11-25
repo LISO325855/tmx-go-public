@@ -32,18 +32,20 @@ type Fleet interface {
 
 // Options configures the service.
 type Options struct {
-	Store    *store.Store
-	Client   Client
-	MediaDir string // whatsapp/media: attachments downloaded on demand
-	Publish  func(model.BusEvent)
+	Store      *store.Store
+	Client     Client
+	MediaDir   string                                        // whatsapp/media: retained attachments
+	AutoMedia  bool                                          // independent bounded download and transcription queues
+	Transcribe func(context.Context, string) (string, error) // existing local voice service
+	DiskFree   func(string) (uint64, error)                  // tests; nil measures the cache volume
+	Publish    func(model.BusEvent)
 	// Config reads config.json "whatsapp" (nil = the defaults); SaveConfig changes and saves it.
 	Config     func() *config.WhatsAppConfig
 	SaveConfig func(func(*config.WhatsAppConfig)) error
 	Fleet      Fleet // nil: no agents (tests)
 	Logger     *slog.Logger
 	Now        func() time.Time
-	// Tests shorten the waits: ChatGap (0 = ChatGap) and NoticeQuiet (0 = NoticeQuiet).
-	ChatGap     time.Duration
+	// Tests can shorten the notification wait (0 = NoticeQuiet).
 	NoticeQuiet time.Duration
 }
 
@@ -74,7 +76,6 @@ type Service struct {
 	o   Options
 	log *slog.Logger
 	key []byte // signs media tickets; lives only in memory
-	win window
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -82,18 +83,27 @@ type Service struct {
 
 	evMu sync.Mutex // one event at a time, in order
 
-	mu        sync.Mutex
-	st        model.WaStatus // without settings (read from the config on every use)
-	acct      Account
-	linking   context.CancelFunc
-	linkHow   string
-	lastQR    *model.WaQR
-	histTimer *time.Timer
-	queues    map[string]*chatQueue
-	notices   map[string]*notice
-	naming    map[string]bool
-	downloads map[string]chan struct{}
-	opened    bool
+	mu              sync.Mutex
+	st              model.WaStatus // without settings (read from the config on every use)
+	acct            Account
+	sendWindows     map[string][]time.Time
+	linking         context.CancelFunc
+	linkHow         string
+	lastQR          *model.WaQR
+	histTimer       *time.Timer
+	queues          map[string]*chatQueue
+	notices         map[string]*notice
+	naming          map[string]bool
+	downloads       map[string]chan struct{}
+	downloadCancels map[string]context.CancelFunc
+	opened          bool
+	mediaWake       chan struct{}
+	maintenanceWake chan struct{}
+	maintenanceScan func(func(os.FileInfo)) error // nil uses the filesystem walker
+	asrWake         chan struct{}
+	mediaWrite      chan struct{} // serialize bounded disk writes, independent of ASR
+	activeFiles     map[string]bool
+	mediaSince      int64
 }
 
 // New builds the service; Start connects a linked account.
@@ -106,9 +116,6 @@ func New(o Options) *Service {
 	}
 	if o.Publish == nil {
 		o.Publish = func(model.BusEvent) {}
-	}
-	if o.ChatGap <= 0 {
-		o.ChatGap = ChatGap
 	}
 	if o.NoticeQuiet <= 0 {
 		o.NoticeQuiet = NoticeQuiet
@@ -123,7 +130,10 @@ func New(o Options) *Service {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Service{o: o, log: o.Logger.With("part", "whatsapp"), key: key, ctx: ctx, cancel: cancel,
 		st: model.WaStatus{State: model.WaUnlinked}, queues: map[string]*chatQueue{}, notices: map[string]*notice{},
-		naming: map[string]bool{}, downloads: map[string]chan struct{}{}}
+		naming: map[string]bool{}, downloads: map[string]chan struct{}{}, mediaWake: make(chan struct{}, 1),
+		downloadCancels: map[string]context.CancelFunc{},
+		maintenanceWake: make(chan struct{}, 1),
+		asrWake:         make(chan struct{}, 1), mediaWrite: make(chan struct{}, 1), activeFiles: map[string]bool{}}
 }
 
 // Enabled reports whether the service runs (config.json whatsapp.enabled, default on).
@@ -135,8 +145,24 @@ func (s *Service) Start() error {
 	if !s.Enabled() || s.o.Client == nil {
 		return nil
 	}
-	if times, err := s.o.Store.WaSentSince(s.o.Now().Add(-Window).UnixMilli()); err == nil {
-		s.win.seed(times)
+	s.wg.Add(1)
+	go s.mediaMaintenance()
+	if s.o.AutoMedia {
+		if v, _ := s.o.Store.WaMeta("auto_media_since"); v != "" {
+			fmt.Sscan(v, &s.mediaSince)
+		}
+		if s.mediaSince == 0 {
+			s.mediaSince = s.o.Now().Add(-7 * 24 * time.Hour).UnixMilli()
+			if err := s.o.Store.WaSetMeta("auto_media_since", fmt.Sprint(s.mediaSince)); err != nil {
+				return err
+			}
+		}
+		s.wg.Add(1)
+		go s.mediaWorker()
+		if s.o.Transcribe != nil {
+			s.wg.Add(1)
+			go s.audioWorker()
+		}
 	}
 	if pending, err := s.o.Store.WaPending(); err == nil {
 		for _, m := range pending {
@@ -345,7 +371,9 @@ func (s *Service) Unlink(ctx context.Context) error {
 			s.log.Warn("whatsapp logout", "err", err) // the keys are gone either way
 		}
 	}
+	s.evMu.Lock()
 	s.forget("WhatsApp was unlinked")
+	s.evMu.Unlock()
 	s.mu.Lock()
 	s.st = model.WaStatus{State: model.WaUnlinked}
 	s.mu.Unlock()
@@ -355,8 +383,11 @@ func (s *Service) Unlink(ctx context.Context) error {
 
 // forget drops the account's data (unlinked, or logged out by the phone).
 func (s *Service) forget(note string) {
+	s.cancelMediaDownloads("")
 	s.mu.Lock()
 	s.acct, s.lastQR = Account{}, nil
+	s.mediaSince = s.o.Now().Add(-7 * 24 * time.Hour).UnixMilli()
+	since := s.mediaSince
 	for _, n := range s.notices {
 		n.timer.Stop()
 	}
@@ -370,6 +401,7 @@ func (s *Service) forget(note string) {
 	}
 	_ = s.o.Store.WaSetMeta("linked_at", "")
 	_ = s.o.Store.WaSetMeta("account", "")
+	_ = s.o.Store.WaSetMeta("auto_media_since", fmt.Sprint(since))
 	if s.o.MediaDir != "" {
 		if err := os.RemoveAll(s.o.MediaDir); err != nil {
 			s.log.Warn("whatsapp media", "err", err)
@@ -397,6 +429,10 @@ type SettingsPatch struct {
 	AllowedChats    *[]string `json:"allowed_chats"`
 	NotifyHeadChats *[]string `json:"notify_head_chats"`
 	AgentProfiles   *[]string `json:"agent_profiles"`
+	// ChatAccess replaces the whole per-chat access table (access.go).
+	ChatAccess *map[string]model.WaChatAccess `json:"chat_access"`
+	// PrivateChats replaces the chats the head may not read (access.go).
+	PrivateChats *[]string `json:"private_chats"`
 }
 
 // SetSettings changes the owner's settings and saves them.
@@ -418,7 +454,8 @@ func (s *Service) SetSettings(p SettingsPatch) (model.WaSettings, error) {
 		in   *[]string
 		out  *[]string
 		jids bool
-	}{{p.AllowedChats, &next.AllowedChats, true}, {p.NotifyHeadChats, &next.NotifyHeadChats, true}, {p.AgentProfiles, &next.AgentProfiles, false}}
+	}{{p.AllowedChats, &next.AllowedChats, true}, {p.NotifyHeadChats, &next.NotifyHeadChats, true}, {p.AgentProfiles, &next.AgentProfiles, false},
+		{p.PrivateChats, &next.PrivateChats, true}}
 	for _, l := range lists {
 		if l.in == nil {
 			continue
@@ -441,6 +478,13 @@ func (s *Service) SetSettings(p SettingsPatch) (model.WaSettings, error) {
 			return next, errorf(http.StatusBadRequest, "at most 500 entries")
 		}
 		*l.out = clean
+	}
+	if p.ChatAccess != nil {
+		clean, err := cleanChatAccess(*p.ChatAccess)
+		if err != nil {
+			return next, err
+		}
+		next.ChatAccess = clean
 	}
 	if s.o.SaveConfig == nil {
 		return next, errorf(http.StatusNotImplemented, "settings cannot be saved in this daemon")
@@ -496,6 +540,7 @@ func (s *Service) handle(ev Event) {
 		}
 		s.mu.Unlock()
 		s.publishStatus()
+		s.wakeMedia()
 	case EvDisconnected:
 		s.mu.Lock()
 		changed := s.st.State == model.WaConnected
@@ -543,9 +588,7 @@ func (s *Service) handle(ev Event) {
 // linked: the phone linked this device. A different account than before starts empty.
 func (s *Service) linked(a Account) {
 	if prev, _ := s.o.Store.WaMeta("account"); prev != "" && prev != a.JID {
-		if err := s.o.Store.WaClear(); err != nil {
-			s.log.Error("whatsapp clear", "err", err)
-		}
+		s.forget("WhatsApp account changed")
 	}
 	now := s.o.Now().UnixMilli()
 	_ = s.o.Store.WaSetMeta("account", a.JID)
@@ -651,8 +694,18 @@ func (s *Service) updateChat(u ChatUpdate, hasMessages bool) (model.WaChat, bool
 		return model.WaChat{}, false
 	}
 	if u.Delete {
+		s.cancelMediaDownloads(u.JID)
+		files, err := s.o.Store.WaChatMediaFiles(u.JID)
+		if err != nil {
+			s.log.Warn("whatsapp chat files", "err", err)
+			return model.WaChat{}, false
+		}
 		if err := s.o.Store.WaDeleteChat(u.JID); err != nil {
 			s.log.Warn("whatsapp delete chat", "err", err)
+		} else {
+			for _, file := range files {
+				s.removeFile(file)
+			}
 		}
 		return model.WaChat{}, false
 	}
@@ -810,6 +863,15 @@ func (s *Service) apply(in Incoming, live bool) bool {
 	}
 	if known { // history overlapping live messages, or tmx's own message coming back
 		row.Origin, row.MediaFile = old.Origin, old.MediaFile
+		if row.Media != nil && old.Media != nil {
+			md := *row.Media
+			md.Transcript = old.Media.Transcript
+			md.Expired = old.Media.Expired
+			if row.MediaRef == "" || row.MediaRef == old.MediaRef {
+				md.DownloadRetry, md.TranscribeRetry = old.Media.DownloadRetry, old.Media.TranscribeRetry
+			}
+			row.Media = &md
+		}
 		if model.WaStatusRank(old.Status) > model.WaStatusRank(row.Status) {
 			row.Status = old.Status
 		}
@@ -824,6 +886,7 @@ func (s *Service) apply(in Incoming, live bool) bool {
 		s.log.Warn("whatsapp message", "err", err)
 		return false
 	}
+	s.wakeMedia()
 	c, err := s.o.Store.WaGetChat(m.ChatJID)
 	if errors.Is(err, store.ErrNotFound) {
 		c, err = model.WaChat{JID: m.ChatJID, Kind: kindOf(m.ChatJID, "")}, nil

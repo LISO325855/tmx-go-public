@@ -46,7 +46,7 @@ func (p *fakeVoicePeer) ReviewPeer(context.Context, string, string, string) (str
 }
 
 func TestPeerPendingSurvivesRestart(t *testing.T) {
-	for _, kind := range []string{"dictation", "upload", "recording"} {
+	for _, kind := range []string{"upload", "recording"} {
 		t.Run(kind, func(t *testing.T) {
 			home := t.TempDir()
 			st, err := store.Open(filepath.Join(home, "db"))
@@ -75,11 +75,7 @@ func TestPeerPendingSurvivesRestart(t *testing.T) {
 					time.Sleep(time.Millisecond * 10)
 				}
 			} else {
-				if kind == "dictation" {
-					_, err = s.Dictate(context.Background(), wav, "")
-				} else {
-					_, err = s.TranscribeFile(context.Background(), bytes.NewReader(wav), "")
-				}
+				_, err = s.TranscribeFile(context.Background(), bytes.NewReader(wav), "")
 				var pending PendingError
 				if !errors.As(err, &pending) || pending.ID == "" {
 					t.Fatalf("no pending receipt: %v", err)
@@ -132,7 +128,7 @@ func TestPeerSpoolChecksDiskBeforeSending(t *testing.T) {
 	defer st.Close()
 	p := &fakeVoicePeer{}
 	s := New(Options{Paths: config.Paths{Home: t.TempDir()}, Store: st, Peer: p, Settings: func() config.VoiceConfig { return config.VoiceConfig{ViaPeer: "hosta"} }, DiskFree: func(string) (uint64, error) { return 1 << 30, nil }})
-	_, err = s.Dictate(context.Background(), fallbackWAV(false), "")
+	_, err = s.TranscribeFile(context.Background(), bytes.NewReader(fallbackWAV(false)), "")
 	if err == nil || p.calls.Load() != 0 {
 		t.Fatal("disk reserve ignored", err)
 	}
@@ -152,7 +148,7 @@ func TestPeerRetriesWithoutRestartAndDeleteCleansSpool(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	_, err = s.Dictate(context.Background(), fallbackWAV(false), "")
+	_, err = s.TranscribeFile(context.Background(), bytes.NewReader(fallbackWAV(false)), "")
 	var pending PendingError
 	if !errors.As(err, &pending) {
 		t.Fatal(err)

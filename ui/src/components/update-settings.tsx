@@ -97,6 +97,7 @@ export function UpdateSection() {
                 <p className="[overflow-wrap:anywhere]">{h.text}</p>
                 <p className="mt-0.5 text-xs text-muted-foreground">
                   This is tmx <span className="font-mono">{s.current}</span>
+                  {s.running_flavour ? ` · ${s.running_flavour}` : ""}
                   {s.checked_at ? ` · checked ${relativeTime(s.checked_at)}` : ""}
                   {s.latest_url && s.available && (
                     <>
@@ -107,6 +108,8 @@ export function UpdateSection() {
                     </>
                   )}
                 </p>
+                {s.migration && <p className="mt-1 text-xs text-foreground">{s.migration}</p>}
+                {s.migration_error && <p className="mt-1 text-xs text-state-error">{s.migration_error}</p>}
               </div>
             </div>
             {!off && (

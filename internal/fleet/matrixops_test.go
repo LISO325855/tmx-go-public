@@ -58,8 +58,34 @@ func TestMatrixNewThreadAndState(t *testing.T) {
 	if _, err := f.NewThread(OwnerCaller, NewThreadRequest{Title: "x", Lifecycle: "forever"}); KindOf(err) != KindInvalid {
 		t.Fatalf("bad lifecycle: %v", err)
 	}
-	if _, err := f.NewThread(OwnerCaller, NewThreadRequest{Title: "x", IntentText: "token AbCdEf0123456789AbCdEf0123456789xyz"}); KindOf(err) != KindInvalid {
-		t.Fatalf("a secret in the owner's words: %v", err)
+	// The owner's words are never refused for what they say (17 Nov). His sentence about a
+	// password passes unchanged, and so does a value shaped like a token (no filter, no rewrite);
+	// a long text is taken whole.
+	const prose = "We lost the certificate password and 2FA for the signing portal: nobody knows where it is held"
+	long := strings.Repeat("the whole story, as long as it needs to be. ", 200) // ~9000 characters
+	sp, err := f.NewThread(OwnerCaller, NewThreadRequest{Title: "Signing portal", IntentText: prose + " token AbCdEf0123456789AbCdEf0123456789xyz", Story: long})
+	if err != nil {
+		t.Fatalf("the owner's words were refused: %v", err)
+	}
+	if sp.IntentText != prose+" token AbCdEf0123456789AbCdEf0123456789xyz" {
+		t.Fatalf("intent: %q", sp.IntentText)
+	}
+	if sp.Story != strings.TrimSpace(long) {
+		t.Fatalf("the story was cut: %d of %d characters", len(sp.Story), len(strings.TrimSpace(long)))
+	}
+	for name, text := range map[string]string{
+		"his sentence":     prose,
+		"more than 400":    strings.Repeat("a line that goes on. ", 60),
+		"more than 3 rows": "one\ntwo\nthree\nfour\nfive",
+	} {
+		ent, _, err := f.AddEntry(OwnerCaller, AddEntryRequest{Thread: sp.ID, Kind: "info", Text: text})
+		if err != nil || ent.Text != strings.TrimSpace(text) {
+			t.Fatalf("%s: %q %v", name, ent.Text, err)
+		}
+	}
+	tok, _, err := f.AddEntry(OwnerCaller, AddEntryRequest{Thread: sp.ID, Kind: "info", Text: "the staging api_key: sk-live-abcdefghijklmnop1234, rotate it"})
+	if err != nil || tok.Text != "the staging api_key: sk-live-abcdefghijklmnop1234, rotate it" {
+		t.Fatalf("a token in a log line: %q %v", tok.Text, err)
 	}
 
 	// A lead opens threads under its own project only; a worker not at all.
@@ -81,8 +107,9 @@ func TestMatrixNewThreadAndState(t *testing.T) {
 	if _, err := f.NewThread(lead, NewThreadRequest{Title: "Borrowed", Owner: outsider.ID}); KindOf(err) != KindForbidden {
 		t.Fatalf("lead naming an owner outside its project: %v", err)
 	}
-	if _, err := f.NewThread(OwnerCaller, NewThreadRequest{Title: "token AbCdEf0123456789AbCdEf0123456789xyz"}); KindOf(err) != KindInvalid {
-		t.Fatalf("a secret in the title: %v", err)
+	// A token in a title: the thread is opened with the title as written.
+	if tt, err := f.NewThread(OwnerCaller, NewThreadRequest{Title: "token AbCdEf0123456789AbCdEf0123456789xyz"}); err != nil || tt.Title != "token AbCdEf0123456789AbCdEf0123456789xyz" {
+		t.Fatalf("a token in the title: %q %v", tt.Title, err)
 	}
 	w, err := f.LaunchAgent(lead, LaunchRequest{Name: "shop-worker", ThreadID: th.ID})
 	if err != nil {

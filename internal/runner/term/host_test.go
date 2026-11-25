@@ -7,7 +7,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
+
+	termutil "github.com/charmbracelet/x/term"
 	"testing"
 	"time"
 
@@ -38,10 +42,19 @@ func testHostMain(args []string) int {
 
 // fakeLine is the program in the host: "ready", then "got:<line>" for every line read.
 func fakeLine() {
+	if os.Getenv("TMXG_FAKE_RESIZE") == "1" {
+		fakeResizeLine()
+		return
+	}
 	fmt.Print("ready\r\n")
 	sc := bufio.NewScanner(os.Stdin)
 	for sc.Scan() {
-		fmt.Printf("got:%s\r\n", strings.TrimSpace(sc.Text()))
+		if strings.TrimSpace(sc.Text()) == "draw-86" {
+			rule := strings.Repeat("\u2500", 86)
+			fmt.Print("\x1b[2J\x1b[Hready\r\n" + rule + "\u276f \r\n" + rule + "  \u23f5\u23f5 bypass permissions on (shift+tab to cycle)")
+		} else {
+			fmt.Printf("got:%s\r\n", strings.TrimSpace(sc.Text()))
+		}
 	}
 }
 
@@ -146,4 +159,256 @@ func TestSessionHostOutlivesTheDaemon(t *testing.T) {
 	if _, _, err := New().(runner.Reattacher).Reattach(ctx, spec); !errors.Is(err, host.ErrNoHost) {
 		t.Fatalf("reattach after the end: %v", err)
 	}
+}
+
+// A viewer resized the terminal before a daemon restart. Full-width rules wrap
+// implicitly: replaying at the launch/default width merges the prompt into a
+// rule, falsely detecting a draft and holding owner chat forever.
+func TestReattachRetainsViewerSizeAndDeliversOwnerChat(t *testing.T) {
+	testViewerReattach(t, false)
+}
+
+func testViewerReattach(t *testing.T, legacy bool) {
+	t.Helper()
+	t.Setenv("TMXG_FAKE_LINE", "1")
+	spec := runner.Spec{Harness: model.HarnessShell, Command: os.Args[0], Cwd: t.TempDir(),
+		HostDir: filepath.Join(t.TempDir(), "host"), HostExe: hosttest.Executable(t)}
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	defer cancel()
+	p1, err := New().Start(ctx, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current := p1
+	t.Cleanup(func() {
+		c, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = current.Stop(c)
+	})
+	var out strings.Builder
+	waitOutput(t, p1, &out, "ready")
+	if err := p1.Resize(86, 32); err != nil {
+		t.Fatal(err)
+	}
+	if err := p1.Write([]byte("draw-86\r"), true); err != nil {
+		t.Fatal(err)
+	}
+	waitOutput(t, p1, &out, "shift+tab to cycle")
+	if !p1.(runner.Detacher).Detach() {
+		t.Fatal("detach failed")
+	}
+	for range p1.Events() {
+	}
+	if legacy {
+		host.ClearState(spec.HostDir)
+	}
+	// Reattach as a Claude watcher; the tiny hosted fixture remains our fake.
+	spec.Harness = model.HarnessClaude
+	p2, _, err := New().(runner.Reattacher).Reattach(ctx, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current = p2
+	if legacy && os.Getenv("TMXG_FAKE_DRAFT") == "1" {
+		pp := p2.(*process)
+		if !strings.Contains(pp.w.scr.Text(), "unsent human draft") || pp.w.boxEmpty() {
+			t.Fatal("draft lost after reattach")
+		}
+		return // successful reattach cannot request Fleet's restart fallback
+	}
+	if legacy && strings.Contains(string(p2.Replay()), "ready") {
+		t.Fatal("retained legacy replay reached new process")
+	}
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case ev := <-p2.Events():
+			if ev.Kind == runner.EvState && ev.State == model.StateIdle {
+				goto idle
+			}
+		case <-deadline:
+			t.Fatal("viewer-sized replay never became idle after reattach")
+		}
+	}
+idle:
+	if err := p2.(runner.Interjector).Interject("owner-chat", []string{"owner-id"}); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	waitOutput(t, p2, &out, "got:owner-chat")
+}
+
+// fakeResizeLine redraws from the actual PTY geometry, on both Unix and ConPTY.
+// It does not accept a repaint keystroke: recovery must use only Resize.
+func fakeResizeLine() {
+	var mu sync.Mutex
+	active := false
+	width, _, _ := termutil.GetSize(os.Stdout.Fd())
+	draw := func(cols int) {
+		rule := strings.Repeat("\u2500", cols)
+		draft := ""
+		if os.Getenv("TMXG_FAKE_DRAFT") == "1" {
+			draft = "unsent human draft"
+		}
+		fmt.Print("\x1b[2J\x1b[Hfresh-repaint\r\n" + rule + "\u276f " + draft + "\r\n" + rule + "  ? for shortcuts (shift+tab to cycle)")
+	}
+	fmt.Print("ready\r\n")
+	go func() {
+		for range time.NewTicker(10 * time.Millisecond).C {
+			cols, _, err := termutil.GetSize(os.Stdout.Fd())
+			if err != nil {
+				continue
+			}
+			mu.Lock()
+			if cols != width {
+				width = cols
+				if active {
+					draw(cols)
+				}
+			}
+			mu.Unlock()
+		}
+	}()
+	sc := bufio.NewScanner(os.Stdin)
+	for sc.Scan() {
+		mu.Lock()
+		if strings.TrimSpace(sc.Text()) == "draw-86" {
+			active = true
+			width, _, _ = termutil.GetSize(os.Stdout.Fd())
+			draw(width)
+		} else {
+			fmt.Printf("got:%s\r\n", strings.TrimSpace(sc.Text()))
+		}
+		mu.Unlock()
+	}
+}
+
+func TestLegacyReattachDiscardsReplayAndWaitsForRepaint(t *testing.T) {
+	t.Setenv("TMXG_FAKE_RESIZE", "1")
+	testViewerReattach(t, true)
+}
+
+func TestRepaintWaitIsBoundedWithoutFreshOutput(t *testing.T) {
+	p, _ := newGuardedTestProcess(t)
+	p.done = make(chan struct{})
+	defer close(p.done)
+	// Even an apparently idle state is not sufficient without fresh output.
+	started := time.Now()
+	if err := p.awaitRepaint(context.Background(), 30*time.Millisecond); err == nil {
+		t.Fatal("accepted missing repaint")
+	}
+	if time.Since(started) > time.Second {
+		t.Fatal("repaint wait not bounded")
+	}
+}
+
+func TestLegacySilentHostReturnsRecoveryErrorAndStaysAlive(t *testing.T) {
+	t.Setenv("TMXG_FAKE_LINE", "1")
+	spec := runner.Spec{Harness: model.HarnessShell, Command: os.Args[0], Cwd: t.TempDir(), HostDir: filepath.Join(t.TempDir(), "host"), HostExe: hosttest.Executable(t)}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	p, err := New().Start(ctx, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer host.Stop(spec.HostDir)
+	var out strings.Builder
+	waitOutput(t, p, &out, "ready")
+	p.(runner.Detacher).Detach()
+	for range p.Events() {
+	}
+	host.ClearState(spec.HostDir)
+	spec.Harness = model.HarnessClaude
+	started := time.Now()
+	_, _, err = New().(runner.Reattacher).Reattach(ctx, spec)
+	if !errors.Is(err, runner.ErrHostRepaint) || !errors.Is(err, runner.ErrHostUnknown) {
+		t.Fatalf("wrong recovery error: %v", err)
+	}
+	if runtime.GOOS == "windows" && errors.Is(err, runner.ErrHostSilent) {
+		t.Fatal("ConPTY resize output incorrectly treated as silent")
+	}
+	if elapsed := time.Since(started); elapsed < 20*time.Second || elapsed > 25*time.Second {
+		t.Fatalf("unbounded wait: %v", elapsed)
+	}
+	hc, err := host.Dial(spec.HostDir, host.End)
+	if err != nil {
+		t.Fatalf("host was stopped: %v", err)
+	}
+	hc.Close()
+	var size terminalSize
+	if host.LoadState(spec.HostDir, &size) {
+		t.Fatal("failed repaint saved a trusted size")
+	}
+}
+
+// Repaint is evidence of a live screen, not permission to send chat. A draft
+// intentionally keeps the watcher Starting, and must never trigger a restart.
+func TestRepaintAcceptsDraftWorkingAndMenuBeforeStateTransition(t *testing.T) {
+	for _, tc := range []struct {
+		name, text string
+		state      model.AgentState
+	}{
+		{"draft", claudeBox("the owner's unsent draft"), model.StateStarting},
+		{"mid-turn", "Working (esc to interrupt)\r\n" + claudeBox(""), model.StateWorking},
+		{"menu", menuScreen, model.StateWaiting},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, bp := newGuardedTestProcess(t)
+			p.state = model.StateStarting
+			p.w.ready = false
+			p.done = make(chan struct{})
+			defer close(p.done)
+			p.w.output([]byte(tc.text))
+			before := p.w.scr.Text()
+			if err := p.awaitRepaint(context.Background(), 50*time.Millisecond); err != nil {
+				t.Fatalf("recognized fresh screen rejected: %v", err)
+			}
+			if p.state != model.StateStarting {
+				t.Fatal("repaint check changed lifecycle state")
+			}
+			if p.w.scr.Text() != before {
+				t.Fatal("repaint changed screen or draft")
+			}
+			for i := 0; i < menuSettle; i++ {
+				p.w.evaluate()
+			}
+			if p.state != tc.state {
+				t.Fatalf("normal classification: got %s want %s", p.state, tc.state)
+			}
+			if tc.name == "draft" && p.w.boxEmpty() {
+				t.Fatal("draft lost")
+			}
+			select {
+			case b := <-bp.writes:
+				t.Fatalf("recovery typed into screen: %q", b)
+			default:
+			}
+		})
+	}
+}
+
+func TestRepaintSilenceRequiresNoOutputForEntireWait(t *testing.T) {
+	for _, output := range []string{"", "unrecognized but active terminal"} {
+		t.Run(output, func(t *testing.T) {
+			p, _ := newGuardedTestProcess(t)
+			p.done = make(chan struct{})
+			defer close(p.done)
+			if output != "" {
+				p.w.output([]byte(output))
+			}
+			err := p.awaitRepaint(context.Background(), 30*time.Millisecond)
+			if err == nil {
+				t.Fatal("unrecognized screen accepted")
+			}
+			if errors.Is(err, runner.ErrHostSilent) != (output == "") {
+				t.Fatalf("wrong silence evidence: %v", err)
+			}
+		})
+	}
+}
+
+func TestLegacyReattachPreservesDraftWithoutRestartFallback(t *testing.T) {
+	t.Setenv("TMXG_FAKE_RESIZE", "1")
+	t.Setenv("TMXG_FAKE_DRAFT", "1")
+	testViewerReattach(t, true)
 }

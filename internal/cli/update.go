@@ -7,7 +7,6 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -16,6 +15,7 @@ import (
 
 	"github.com/blackcode-ch/tmx-go/internal/client"
 	"github.com/blackcode-ch/tmx-go/internal/config"
+	"github.com/blackcode-ch/tmx-go/internal/fleet"
 	"github.com/blackcode-ch/tmx-go/internal/update"
 )
 
@@ -24,7 +24,7 @@ const updateUsage = `usage: tmx update                 check; a newer release in
        tmx update now [TAG]       install the newest release (or exactly TAG) now (cuts off turns in progress)
        tmx update install TAG     install exactly TAG once no agent is busy (a published release, newer than this one)
        tmx update status
-       tmx update auto off        automatic installs are off in this version (a lead installs each machine)
+       tmx update auto on|off     install signed releases automatically once no agent is busy
        tmx update keys            the release keys this machine trusts (fingerprints)
        tmx update keys pin ID:BASE64... [--require ed25519[,webauthn]] | --file KEYS.json
                                   replace them (ed25519 keys; --file: {fleet_keys, require} incl. webauthn)
@@ -38,9 +38,9 @@ func cmdUpdate(e *env, args []string) error {
 	if len(args) > 0 {
 		sub = args[0]
 	}
-	// Installing by hand and changing the settings or the token are behind the owner gate (once
-	// it is on): ownerDo waits for the owner's confirmation on this machine and retries.
-	return withOwner(e, func(c *client.Client, cx context.Context) error {
+	// Preserve the caller identity: the API grants the local head only its scoped
+	// update actions; owner actions still use the existing confirmation flow.
+	return withUpdateCaller(e, func(c *client.Client, cx context.Context) error {
 		var st update.Status
 		var err error
 		switch sub {
@@ -60,20 +60,17 @@ func cmdUpdate(e *env, args []string) error {
 				return usageErr(updateUsage)
 			}
 			if err = ownerDo(e, c, cx, http.MethodPost, "/api/update/install", body, &st); err == nil && sub == "now" {
-				st, err = waitUpdate(cx, c)
+				st, err = waitUpdate(cx, c, st)
 			}
 		case "keys":
 			return updateKeys(e, c, cx, args[1:])
 		case "status":
 			err = c.Get(cx, "/api/update", &st)
 		case "auto":
-			if len(args) == 2 && args[1] == "on" {
-				return errors.New("automatic updates are off in this version: a lead installs each machine (tmx update now)")
-			}
-			if len(args) != 2 || args[1] != "off" {
+			if len(args) != 2 || (args[1] != "on" && args[1] != "off") {
 				return usageErr(updateUsage)
 			}
-			err = ownerDo(e, c, cx, http.MethodPut, "/api/update", map[string]any{"auto": false}, &st)
+			err = ownerDo(e, c, cx, http.MethodPut, "/api/update", map[string]any{"auto": args[1] == "on"}, &st)
 		case "channel":
 			if len(args) != 2 {
 				return usageErr(updateUsage)
@@ -104,15 +101,44 @@ func cmdUpdate(e *env, args []string) error {
 	})
 }
 
+// An agent shell must retain its own identity, including for refused owner-only
+// subcommands. Never fall back to the owner token with incomplete agent context.
+func withUpdateCaller(e *env, fn func(*client.Client, context.Context) error) error {
+	c, err := managedAgentClient(true)
+	if err != nil {
+		return err
+	}
+	if c == nil {
+		return withOwner(e, fn)
+	}
+	cx, cancel := ctx()
+	defer cancel()
+	return fn(c, cx)
+}
+
+func managedAgentClient(urlSelectsAgent bool) (*client.Client, error) {
+	url, token := os.Getenv(fleet.EnvURL), os.Getenv(fleet.EnvToken)
+	if token == "" && os.Getenv(fleet.EnvAgent) == "" && (!urlSelectsAgent || url == "") {
+		return nil, nil
+	}
+	if url == "" || token == "" {
+		return nil, fmt.Errorf("this command requires the agent's TMXG_URL and TMXG_AGENT_TOKEN")
+	}
+	return client.New(url, token), nil
+}
+
 // waitUpdate follows an install for up to 15 minutes (downloading, then the restart).
-func waitUpdate(cx context.Context, c *client.Client) (update.Status, error) {
-	var st update.Status
+func waitUpdate(cx context.Context, c *client.Client, st update.Status) (update.Status, error) {
 	deadline := time.Now().Add(15 * time.Minute)
 	for time.Now().Before(deadline) {
-		if err := c.Get(cx, "/api/update", &st); err != nil {
-			// The daemon is restarting onto the new release.
-			return update.Status{State: update.StateInstalling, Latest: st.Latest, Current: st.Current}, nil
+		var next update.Status
+		if err := c.Get(cx, "/api/update", &next); err != nil {
+			// The daemon is restarting onto the new release. Preserve the last
+			// complete status (initially the install response), including settings.
+			st.State = update.StateInstalling
+			return st, nil
 		}
+		st = next
 		switch st.State {
 		case update.StateError, update.StateIdle, update.StateOff:
 			return st, nil
@@ -220,6 +246,9 @@ func updateKeys(e *env, c *client.Client, cx context.Context, args []string) err
 func describeKeys(p update.PinnedKeys) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "trusted release keys (require %s, rotation serial %d):", strings.Join(p.Require, "+"), p.KeysSerial)
+	if p.Origin != "" {
+		fmt.Fprintf(&b, "\n  origin: %s", p.Origin)
+	}
 	for _, k := range p.FleetKeys {
 		fmt.Fprintf(&b, "\n  %s  %s  %s", k.ID, k.Type, keyFingerprint(k.Key))
 	}

@@ -1,6 +1,7 @@
 package api_test
 
 import (
+	"os"
 	"testing"
 
 	"github.com/blackcode-ch/tmx-go/internal/api/apitest"
@@ -10,11 +11,47 @@ import (
 	"github.com/blackcode-ch/tmx-go/internal/slots"
 )
 
+func TestSlotRecoveryWithStaleAgentToken(t *testing.T) {
+	d := apitest.New(t)
+	head := client{t: t, base: d.URL, token: d.AgentToken(t, "head")}
+	stale := client{t: t, base: d.URL, token: "stale-token"}
+	var grant struct {
+		slots.Lease
+		Proof string `json:"recovery_proof"`
+	}
+	if code := head.do("POST", "/api/slots", map[string]any{"pid": os.Getpid(), "command": "test"}, &grant); code != 201 || grant.Proof == "" {
+		t.Fatalf("expected recovery proof on grant, HTTP %d", code)
+	}
+	route := "/api/slots/" + grant.ID
+	if code := stale.do("POST", route+"/renew", nil, nil); code != 401 {
+		t.Fatalf("old token accepted: HTTP %d", code)
+	}
+	const recovery = "/api/slots/recovery"
+	if code := stale.do("POST", recovery, map[string]string{"proof": grant.Proof + "."}, nil); code != 403 {
+		t.Fatalf("altered recovery proof accepted: HTTP %d", code)
+	}
+	body := map[string]string{"proof": grant.Proof}
+	if code := stale.do("POST", recovery, body, nil); code != 200 {
+		t.Fatalf("renew scoped lease: HTTP %d", code)
+	}
+	var view slots.View
+	head.do("GET", "/api/slots", nil, &view)
+	if len(view.Leases) != 1 || view.Leases[0].ID != grant.ID || view.Leases[0].AgentID != grant.AgentID {
+		t.Fatalf("unexpected adopted lease: %+v", view.Leases)
+	}
+	if code := stale.do("DELETE", recovery, body, nil); code != 204 {
+		t.Fatalf("release adopted lease: HTTP %d", code)
+	}
+	if code := stale.do("POST", recovery, body, nil); code != 404 {
+		t.Fatalf("same-boot proof resurrected an ended lease: HTTP %d", code)
+	}
+}
+
 func TestResourcesConfigAndQueue(t *testing.T) {
 	d := apitest.New(t)
 	owner := client{t: t, base: d.URL, token: d.OwnerToken}
 	var v resources.View
-	if owner.do("GET", "/api/resources", nil, &v) != 200 || v.Config.MaxAgents != 8 || v.Config.Slots["heavy"] != 2 {
+	if owner.do("GET", "/api/resources", nil, &v) != 200 || v.Config.MaxAgents != 64 || v.Config.Slots["heavy"] != 2 {
 		t.Fatalf("view: %+v", v.Config)
 	}
 	cfg := v.Config

@@ -3,7 +3,9 @@ import { ArrowUpToLine, Check, CirclePause, Fingerprint, MessageCircleQuestion, 
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { useClassic } from "@/hooks/use-classic";
 import { api, dropApproval } from "@/lib/api";
+import { NOT_APPLICABLE_ANSWER, NOT_APPLICABLE_LABEL, recommendationNote } from "@/lib/card-choices";
 import { cardAnswerKey, clearCardAnswer, saveCardAnswer, useCardAnswers } from "@/lib/card-answers";
 import { PAUSE_LABEL } from "@/lib/resources";
 import { useStore } from "@/lib/store";
@@ -126,6 +128,7 @@ function TerminalMenuActions({ a, busy, decide }: { a: Approval; busy: boolean; 
 }
 
 export function ApprovalBody({ a, agent, compact }: { a: Approval; agent?: Agent; compact?: boolean }) {
+  const classic = useClassic(); // classic: the recommended choice is marked on its button (lib/card-choices.ts)
   const project = useStore((s) => a.card?.project_id ? s.projects[a.card.project_id] : undefined);
   if (a.tool === "owner_recovery_notice") return <p role="alert">{a.description}</p>;
   if (terminalMenuOf(a)) return <TerminalMenuBody a={a} compact={compact} />;
@@ -156,7 +159,9 @@ export function ApprovalBody({ a, agent, compact }: { a: Approval; agent?: Agent
         </p>}
         {a.card?.close_reason && <p className="text-sm">Closed: {a.card.close_reason}</p>}
         {a.card?.context && <p className="whitespace-pre-wrap text-sm">{a.card.context}</p>}
-        {a.card?.recommendation && <p className="text-sm">Recommended: {a.card.recommendation}</p>}
+        {a.card?.recommendation && (classic
+          ? recommendationNote(a.options, a.card.recommendation) && <p className="text-sm">Recommended: {recommendationNote(a.options, a.card.recommendation)}</p>
+          : <p className="text-sm">Recommended: {a.card.recommendation}</p>)}
         {a.card && <p className="text-xs text-muted-foreground">Version {a.version}</p>}
         {a.card?.action && <div className="space-y-1 text-sm">
           {a.card.action.account && <p>Account: {a.card.action.account}</p>}
@@ -228,8 +233,9 @@ const LegacyApprovalActions = forwardRef<ApprovalActionsHandle, { a: Approval; s
     const menu = terminalMenuOf(a);
     const decidable = a.tool !== "owner_recovery_notice" && !menu && (a.kind === "permission" || a.kind === "guard" || a.kind === "whatsapp" || isCompanionSend(a));
     const guarded = a.kind === "guard";
-    const pairing = a.tool === "p2p_invite_create" || a.tool === "p2p_join";
+    const pairing = a.tool === "p2p_invite_create" || a.tool === "p2p_join" || a.tool === "p2p_invite_whatsapp";
     const [always, setAlways] = useState(false);
+    const classic = useClassic();
     const companionQ = isCompanionQuestion(a);
     // The owner gate asks before allowing a guard hold, or a hand-off to Companion with effects.
     const gated = pairing || (gateOn && (guarded || (isCompanionSend(a) && companionEffects(a) !== "none")));
@@ -248,7 +254,11 @@ const LegacyApprovalActions = forwardRef<ApprovalActionsHandle, { a: Approval; s
           useStore.setState((s) => ({ approvals: { ...s.approvals, [result.id]: result } }));
         } else dropApproval(a.id);
         setBusy(false);
+        // "Always" that could not be kept (a command that depends on values only known when it
+        // runs): the daemon allowed it once and says why; show that, not "Allowed always".
+        const onceOnly = request.decision === "allow_always" && typeof result.answer === "string" && result.answer.startsWith("Allowed once, not always: ");
         toast(
+          onceOnly ? result.answer :
           {
             allow_always: request.scope === "any" ? "Allowed always, for any agent" : `Allowed always for agents like ${name}`,
             allow: guarded ? `Allowed once for ${name}` : isCompanionTask(a) ? `Handed ${name}'s task to Companion` : isCompanionMessage(a) ? `Sent ${name}'s message to Companion` : `Allowed for ${name}`,
@@ -331,7 +341,7 @@ const LegacyApprovalActions = forwardRef<ApprovalActionsHandle, { a: Approval; s
       return (
         <div className="space-y-2.5">
           {opts.length > 0 && (
-            <div className="flex flex-wrap gap-1.5">
+            <div className="flex flex-wrap gap-1.5" data-card-choices>
               {opts.map((o, i) => (
                 <Button key={o} variant="outline" size={size} disabled={busy} onClick={() => void decide("answer", { answer: o })} className="h-auto min-h-7 py-1 text-left whitespace-normal">
                   {showKeys && i < 9 && <Kbd className="mr-0.5 hidden h-4 min-w-4 text-[0.625rem] sm:inline-flex">{i + 1}</Kbd>}
@@ -358,6 +368,12 @@ const LegacyApprovalActions = forwardRef<ApprovalActionsHandle, { a: Approval; s
               Send
             </Button>
             {a.card && <Button type="button" size={size} variant="ghost" disabled={busy} onClick={() => void decide("defer")}>Later</Button>}
+            {/* classic: Python's way to close a question that does not apply; the agent is told not to wait */}
+            {classic && !companionQ && (
+              <Button type="button" size={size} variant="ghost" className="text-muted-foreground" disabled={busy} onClick={() => void decide("answer", { answer: NOT_APPLICABLE_ANSWER })}>
+                {NOT_APPLICABLE_LABEL}
+              </Button>
+            )}
             {companionQ && (
               <Button type="button" size={size} variant="ghost" className="text-muted-foreground" disabled={busy} onClick={() => void decide("deny")}>
                 Cancel task
@@ -414,6 +430,11 @@ const LegacyApprovalActions = forwardRef<ApprovalActionsHandle, { a: Approval; s
             <Fingerprint />
             Always, {pairing ? "any head or lead" : "any agent"}
           </Button>
+          {/* Always a plain way out next to the two "Always": allow this one call only. */}
+          <Button size={size} variant="outline" onClick={() => void decide("allow")} disabled={busy} data-allow-once>
+            <Check />
+            Allow once
+          </Button>
           <Button size={size} variant="ghost" onClick={() => setAlways(false)} disabled={busy}>
             Cancel
           </Button>
@@ -428,7 +449,8 @@ const LegacyApprovalActions = forwardRef<ApprovalActionsHandle, { a: Approval; s
           {guarded ? "Allow once" : isCompanionSend(a) ? "Send to Companion" : "Allow"}
           {showKeys && <Kbd className="ml-0.5 hidden h-4 min-w-4 bg-primary-foreground/15 text-[0.625rem] text-primary-foreground/80 sm:inline-flex">A</Kbd>}
         </Button>
-        {guarded && (
+        {/* Offered only when the daemon can remember it: a command with variables or wildcards cannot be (no_always). */}
+        {guarded && !guardOf(a)?.no_always && (
           <Button size={size} variant="outline" onClick={() => setAlways(true)} disabled={busy} title={pairing ? "Stop asking for this pairing tool; head and leads only" : "Stop asking for this exact command"}>
             Allow always…
           </Button>

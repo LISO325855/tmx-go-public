@@ -1,3 +1,6 @@
+import { focusComposer } from "@/lib/composer-focus";
+import { reloadGate } from "@/lib/reload-guard";
+import { clearSubmittedDraft, ReloadSafeDrafts } from "@/lib/composer-draft";
 // Companion 1:1 (#/companion, DESIGN.md "Companion"): the owner's conversation with Companion.
 // tmx's side on the right (the owner's messages, the head's and agents' messages, tasks handed
 // over), Companion on the left (replies, questions, messages to the head), tmx's error notes in
@@ -11,6 +14,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { CompanionAvatar, TaskState } from "@/components/companion/bits";
 import { DictateButton } from "@/components/dictate-button";
+import { DictationInline } from "@/components/dictation-inline";
 import { Markdown } from "@/components/markdown";
 import { EmptyState, PageHeader } from "@/components/page";
 import { useNow } from "@/hooks/use-now";
@@ -21,7 +25,7 @@ import { href, paths } from "@/lib/router";
 import { useStore } from "@/lib/store";
 import { cn } from "@/lib/utils";
 
-const drafts = new Map<string, string>();
+const drafts = new ReloadSafeDrafts("tmx.companion-composer-drafts");
 const DRAFT = "companion";
 const settingsHref = href(paths.settings()) + "?section=companion";
 
@@ -75,7 +79,7 @@ function Time({ at, className }: { at: number; className?: string }) {
 }
 
 /** A message's state under it: a spinner while in flight, nothing once it went through. */
-function MessageState({ state }: { state?: EntryState }) {
+function MessageState({ state, note }: { state?: EntryState; note?: string }) {
   if (!state || state === "completed" || state === "answered") return null;
   if (state === "sending" || state === "working")
     return (
@@ -88,15 +92,15 @@ function MessageState({ state }: { state?: EntryState }) {
     return (
       <span className="flex items-center gap-1 text-2xs text-muted-foreground" data-in-flight>
         <Clock3 className="size-3" />
-        Queued
+        {note || "Queued"}
       </span>
     );
-  const bad = state === "failed" || state === "refused" || state === "unconfirmed";
+  const bad = state === "failed" || state === "refused" || state === "unconfirmed" || state === "ended_without_report";
   const asks = state === "input_required" || state === "awaiting_approval";
   return (
     <span className={cn("flex items-center gap-1 text-2xs", bad ? "text-state-error" : "text-muted-foreground")}>
       {asks && <span className="size-1.5 rounded-full bg-state-waiting" />}
-      {TASK_STATE_LABEL[state] ?? state}
+      {note || TASK_STATE_LABEL[state] || state}
     </span>
   );
 }
@@ -148,7 +152,7 @@ function OurMessage({ e, first, answer }: { e: CompanionEntry; first: boolean; a
         {owner ? e.text : <Markdown text={e.text} className="text-[0.8438rem] leading-relaxed" />}
       </div>
       <div className="flex items-center gap-2">
-        <MessageState state={e.state} />
+        <MessageState state={e.state} note={e.status_note} />
         <Time at={e.at} />
       </div>
     </div>
@@ -171,7 +175,11 @@ function TaskCard({ e }: { e: CompanionEntry }) {
         <p className="mt-1.5 line-clamp-3 text-[0.8125rem] leading-snug [overflow-wrap:anywhere]">{e.text}</p>
         {state && (
           <div className="mt-2 flex items-center gap-3">
-            <TaskState state={state} className="text-2xs" />
+            {e.status_note ? (
+              <span className="text-2xs text-muted-foreground">{e.status_note}</span>
+            ) : (
+              <TaskState state={state} className="text-2xs" />
+            )}
             {state === "awaiting_approval" && (
               <a className="text-2xs text-brand hover:underline" href={href(paths.inbox())}>
                 Decide in Needs you
@@ -399,7 +407,7 @@ function Timeline({ connected }: { connected: boolean }) {
         </div>
       </div>
       {!atBottom && entries.length > 0 && (
-        <div className="pointer-events-none absolute inset-x-0 bottom-2 flex justify-center">
+        <div className="shrink-0 flex justify-center py-2">
           <Button
             variant="outline"
             size="xs"
@@ -438,7 +446,7 @@ function Composer({ connected, loaded }: { connected: boolean; loaded: boolean }
 
   // Answer moves the cursor here.
   useEffect(() => {
-    if (replyTo) ta.current?.focus();
+    if (replyTo) focusComposer(ta.current);
   }, [replyTo]);
 
   const update = (v: string) => {
@@ -447,18 +455,22 @@ function Composer({ connected, loaded }: { connected: boolean; loaded: boolean }
   };
   const canSend = connected && !sending && !!text.trim();
 
-  async function send() {
-    if (!canSend) return;
+  async function send(voiceText?: string, _voiceId?: string, signal?: AbortSignal) {
+    const voice = voiceText !== undefined;
+    if (!voice && !canSend) return;
+    if (voice && !connected) throw new Error("Companion is not connected.");
+    const releaseReload = reloadGate.hold();
     setSending(true);
     try {
-      await sendCompanionMessage(text, replyTo?.taskId);
-      setText("");
-      drafts.delete(DRAFT);
+      await sendCompanionMessage(voiceText ?? text, voice ? undefined : replyTo?.taskId, signal);
+      if (!voice && clearSubmittedDraft(drafts, DRAFT, text)) setText("");
     } catch (e) {
+      if (voice) throw e;
       toast.error((e as Error).message || "The message wasn't sent.");
     } finally {
       setSending(false);
-      ta.current?.focus();
+      releaseReload();
+      if (!voice) focusComposer(ta.current);
     }
   }
 
@@ -480,6 +492,7 @@ function Composer({ connected, loaded }: { connected: boolean; loaded: boolean }
   return (
     <div className="shrink-0 px-4 pt-2 pb-4 md:px-6">
       <div className="mx-auto max-w-[51.25rem]">
+        <DictationInline boxId="companion" />
         <div
           className={cn(
             "relative rounded-xl border border-border-strong bg-card transition-[border-color,box-shadow] duration-150 focus-within:border-ring focus-within:ring-2 focus-within:ring-ring/25",
@@ -520,6 +533,7 @@ function Composer({ connected, loaded }: { connected: boolean; loaded: boolean }
           />
           <div className="flex items-center gap-1 px-2 pb-2">
             <DictateButton
+              onSend={send}
               target={ta}
               value={text}
               draft={{ id: "companion", label: "Companion", path: paths.companion(), drafts, draftKey: DRAFT }}
@@ -570,7 +584,9 @@ export function CompanionPage() {
   const busy = useCompanionChat((s) => s.busy);
   const loaded = useCompanionChat((s) => s.loaded);
   const available = useCompanionChat((s) => s.available);
+  const error = useCompanionChat((s) => s.error);
   const entries = useCompanionChat((s) => s.entries);
+  const known = available === true && loaded && !error;
   useNow(60_000); // day labels
 
   useEffect(() => {
@@ -600,7 +616,7 @@ export function CompanionPage() {
       <PageHeader
         actions={
           <>
-            {loaded && !connected && (
+            {known && !connected && (
               <Button size="sm" variant="outline" asChild>
                 <a href={settingsHref}>
                   <span className="hidden sm:inline">Connect in Settings</span>
@@ -624,11 +640,11 @@ export function CompanionPage() {
         <CompanionAvatar />
         <div className="min-w-0">
           <h1 className="truncate text-[0.875rem] leading-tight font-semibold tracking-tight">Companion</h1>
-          <div className="truncate text-2xs leading-tight text-muted-foreground">{loaded ? <ConnectionLine connected={connected} busy={busy} /> : "Loading…"}</div>
+          <div className="truncate text-2xs leading-tight text-muted-foreground">{known ? <ConnectionLine connected={connected} busy={busy} /> : error ? "Status unavailable" : "Loading…"}</div>
         </div>
       </PageHeader>
       <Timeline connected={connected} />
-      <Composer connected={connected} loaded={loaded} />
+      <Composer connected={known && connected} loaded={known} />
     </div>
   );
 }

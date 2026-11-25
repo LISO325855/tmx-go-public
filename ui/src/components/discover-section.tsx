@@ -14,7 +14,6 @@ import { Section } from "@/components/page";
 import { Truncate } from "@/components/truncate";
 import { api } from "@/lib/api";
 import { absoluteTime, displayPath, relativeTime, slugify } from "@/lib/format";
-import { FALLBACK_HARNESSES } from "@/lib/harness";
 import { useGateAsks } from "@/lib/owner-gate";
 import { navigate, paths } from "@/lib/router";
 import { useStore } from "@/lib/store";
@@ -241,8 +240,8 @@ export function DiscoverSection() {
   useEffect(() => {
     api
       .harnesses()
-      .then((h) => setHarnesses(h?.length ? h : FALLBACK_HARNESSES))
-      .catch(() => setHarnesses(FALLBACK_HARNESSES));
+      .then(setHarnesses)
+      .catch(() => setHarnesses(null));
     void scan();
   }, [scan]);
 
@@ -251,7 +250,8 @@ export function DiscoverSection() {
     <>
       <Section title="Harnesses">
         <div className="divide-y rounded-xl border bg-card">
-          {(harnesses ?? FALLBACK_HARNESSES).map((h) => (
+          {harnesses === null && <p className="px-4 py-3 text-sm text-muted-foreground">Harness status unavailable.</p>}
+          {harnesses?.map((h) => (
             <HarnessRow key={h.name} h={h} />
           ))}
         </div>

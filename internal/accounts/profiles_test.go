@@ -80,8 +80,29 @@ func TestProfilesAddRemoveDefault(t *testing.T) {
 	if _, err := os.Stat(home); err != nil {
 		t.Errorf("home must stay (credentials are not deleted): %v", err)
 	}
-	if err := q.Remove(Codex, DefaultName); !errors.Is(err, ErrIsDefault) {
-		t.Errorf("remove default: %v", err)
+	// The default account is hidden, not removed: off the names, remembered across a reopen,
+	// still what a launch without an account uses, and listed again when added.
+	if err := q.Remove(Codex, DefaultName); err != nil {
+		t.Fatalf("hide default: %v", err)
+	}
+	if slices.Contains(q.Names(Codex), DefaultName) || len(q.HiddenDefaults()) != 1 || q.Default(Codex) != DefaultName || !q.Has(Codex, DefaultName) {
+		t.Fatalf("after hiding: names %v hidden %v", q.Names(Codex), q.HiddenDefaults())
+	}
+	if !slices.Contains(q.Names(Claude), DefaultName) {
+		t.Fatal("hiding Codex's default hid Claude's")
+	}
+	if err := q.Remove(Codex, DefaultName); !errors.Is(err, ErrNoAccount) {
+		t.Errorf("hide twice: %v", err)
+	}
+	r, err := OpenProfiles(q.root)
+	if err != nil || slices.Contains(r.Names(Codex), DefaultName) {
+		t.Fatalf("the hidden default came back after a reopen: %v %v", r.Names(Codex), err)
+	}
+	if err := r.Add(Codex, DefaultName); err != nil || !slices.Contains(r.Names(Codex), DefaultName) || len(r.HiddenDefaults()) != 0 {
+		t.Fatalf("show again: %v %v", err, r.Names(Codex))
+	}
+	if err := r.Add(Codex, DefaultName); !errors.Is(err, ErrExists) {
+		t.Errorf("add default while listed: %v", err)
 	}
 }
 
@@ -134,7 +155,7 @@ func TestHomeEnv(t *testing.T) {
 	cases := map[string][]string{
 		"claude":      {"CLAUDE_CONFIG_DIR=/h"},
 		"codex":       {"CODEX_HOME=/h"},
-		"antigravity": {"HOME=/h", "USERPROFILE=/h"},
+		"antigravity": {"HOME=/h", "USERPROFILE=/h", "APPDATA=" + filepath.Join("/h", "AppData", "Roaming"), "LOCALAPPDATA=" + filepath.Join("/h", "AppData", "Local"), "XDG_CONFIG_HOME=" + filepath.Join("/h", ".config")},
 		"gemini":      {"GEMINI_CLI_HOME=/h", "GEMINI_FORCE_FILE_STORAGE=true"},
 		"opencode":    nil,
 	}

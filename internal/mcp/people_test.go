@@ -16,21 +16,21 @@ func TestPersonTools(t *testing.T) {
 		t.Fatal(err)
 	}
 	cs := session(t, d, "head")
-	out, isErr := call(t, cs, "tmx_person_propose", map[string]any{"person": "sam", "title": "Ask for the invoice", "draft": "Hi Sam"})
+	out, isErr := call(t, cs, "promise_propose", map[string]any{"person": "sam", "title": "Ask for the invoice", "draft": "Hi Sam"})
 	if isErr || !strings.Contains(out, "nothing was sent") {
 		t.Fatalf("propose: %s", out)
 	}
 	id := regexp.MustCompile(`Stored as (\S+)`).FindStringSubmatch(out)[1]
-	if out, _ := call(t, cs, "tmx_person_outbox", nil); !strings.Contains(out, "Ask for the invoice") {
+	if out, _ := call(t, cs, "promise_list", nil); !strings.Contains(out, "Ask for the invoice") {
 		t.Fatalf("outbox: %s", out)
 	}
-	if out, isErr := call(t, cs, "tmx_person_ask_close", map[string]any{"id": id}); isErr || !strings.Contains(out, "done") {
+	if out, isErr := call(t, cs, "promise_close", map[string]any{"id": id}); isErr || !strings.Contains(out, "done") {
 		t.Fatalf("close: %s", out)
 	}
-	if out, _ := call(t, cs, "tmx_person_outbox", nil); out != "Nothing." {
+	if out, _ := call(t, cs, "promise_list", nil); out != "Nothing." {
 		t.Fatalf("outbox after close: %s", out)
 	}
-	if out, isErr := call(t, cs, "tmx_person_draft_withdraw", map[string]any{"id": id}); isErr || !strings.Contains(out, "dropped") {
+	if out, isErr := call(t, cs, "promise_drop", map[string]any{"id": id}); isErr || !strings.Contains(out, "dropped") {
 		t.Fatalf("withdraw: %s", out)
 	}
 }

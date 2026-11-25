@@ -30,6 +30,7 @@ func TestApprovalActionLifecycle(t *testing.T) {
 		t.Run(verdict, func(t *testing.T) {
 			e := newEnv(t)
 			f := e.started()
+			holdRules(t, f, "p2p-invite-create") // Allowed by default: held here for the card's lifecycle
 			var logs approvalLog
 			f.log = slog.New(slog.NewTextHandler(&logs, nil))
 			notified := make(chan struct{}, 1)

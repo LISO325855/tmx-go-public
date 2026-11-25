@@ -41,7 +41,7 @@ func TestScopeEnv(t *testing.T) {
 func TestServiceAccounts(t *testing.T) {
 	root := t.TempDir()
 	p, _ := OpenProfiles(root)
-	s := New(Options{Dir: t.TempDir(), Every: -1, Profiles: p,
+	s := New(Options{Dir: t.TempDir(), NodeHome: root, Every: -1, Profiles: p,
 		LookPath: func(model.Harness) (string, error) { return "", ErrNotInstalled }})
 	defer s.Close()
 	if err := s.AddAccount("codex", "work"); err != nil {
@@ -77,8 +77,45 @@ func TestServiceAccounts(t *testing.T) {
 	if _, err := s.Login("codex", "work"); !errors.Is(err, ErrNotInstalled) {
 		t.Errorf("login %v", err)
 	}
-	if err := s.RemoveAccount("codex", DefaultName); !errors.Is(err, ErrIsDefault) {
-		t.Errorf("remove default %v", err)
+	// Remove on the default card hides it (the harness's own sign-in stays): off the list,
+	// named in the payload's hidden list, and back in its place when "default" is added again.
+	before, launchDefault := len(s.Payload().Accounts), p.Default(Codex)
+	if err := s.RemoveAccount("codex", DefaultName); err != nil {
+		t.Fatalf("hide the default card: %v", err)
+	}
+	pl := s.Payload()
+	if len(pl.Accounts) != before-1 || len(pl.Hidden) != 1 || pl.Hidden[0].Harness != "codex" || pl.Hidden[0].Label != "Codex" {
+		t.Fatalf("after hiding: %d cards, hidden %+v", len(pl.Accounts), pl.Hidden)
+	}
+	for _, a := range pl.Accounts {
+		if a.Harness == "codex" && a.Name == DefaultName {
+			t.Fatal("the hidden default card is still listed")
+		}
+	}
+	if err := s.RemoveAccount("codex", DefaultName); !errors.Is(err, ErrUnknown) && !errors.Is(err, ErrNoAccount) {
+		t.Errorf("hide twice: %v", err)
+	}
+	if p.Default(Codex) != launchDefault || !p.Has(Codex, DefaultName) {
+		t.Fatal("hiding changed what launches use")
+	}
+	if err := s.AddAccount("codex", DefaultName); err != nil {
+		t.Fatalf("show the default card again: %v", err)
+	}
+	pl = s.Payload()
+	if len(pl.Accounts) != before || len(pl.Hidden) != 0 {
+		t.Fatalf("after showing again: %d cards, hidden %+v", len(pl.Accounts), pl.Hidden)
+	}
+	first := -1
+	for i, a := range pl.Accounts {
+		if a.Harness == "codex" && first < 0 {
+			first = i
+			if a.Name != DefaultName {
+				t.Fatalf("the default card is not first among Codex's: %+v", pl.Accounts)
+			}
+		}
+	}
+	if err := s.AddAccount("codex", DefaultName); !errors.Is(err, ErrExists) {
+		t.Errorf("add the default account while it is listed: %v", err)
 	}
 	if err := s.RemoveAccount("codex", "work"); err != nil {
 		t.Fatal(err)

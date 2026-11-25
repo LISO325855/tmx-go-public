@@ -24,7 +24,7 @@ var effectWords = []struct {
 }{
 	{model.EffectsMoney, wordRx(`money|pay|payment|paid|invoice|iban|bank|price|pricing|refund|charge|purchase|buy|order|subscription|` +
 		`billing|budget|cost|eur|chf|usd|[$€£]`)},
-	{model.EffectsOutward, wordRx(`e-?mail|send|message|reply|post|publish|deploy|tweet|share|invite|client|customer|outside|public|` +
+	{model.EffectsOutward, wordRx(`e-?mail|send|message|reply to|reply on|post|publish|deploy|tweet|share|invite|client|customer|outside|public|` +
 		`announce|submit|legal|tax|contract|sign`)},
 	{model.EffectsAccount, wordRx(`account|password|passkey|key|token|secret|credential|login|log in|sign in|sign up|signin|signup|2fa|permission|` +
 		`access|delete|remove|disable|revoke|admin|iam`)},
@@ -38,9 +38,16 @@ func wordRx(alts string) *regexp.Regexp {
 
 var (
 	signInRx = regexp.MustCompile(`\bsign[ -]?(?:in|up)\b`)
+	// Direct instructions can be relayed verbatim. Questions, quoted examples and
+	// background discussion remain on the approval path.
+	directOrderRx = regexp.MustCompile(`(?i)^(?:please[ \t]+)?(?:send|e-?mail|reply to|reply on|post|publish|deploy|tweet|share|invite|announce|submit|sign|pay|refund|charge|purchase|buy|order)[ \t]+[^?\r\n]+$`)
 	// Addresses are names too: URLs, domains, e-mail addresses and paths are left out.
 	addressRx = regexp.MustCompile(`\S*(?:://|[./@\\])\S*\pL\S*`)
 )
+
+func NeedsTaskApproval(effects string) bool {
+	return effects == model.EffectsOutward || effects == model.EffectsMoney
+}
 
 // ClassifyEffects returns none | account | outward | money for a spec. The do-not-touch list
 // is not read (as in v2): it only names what Companion must leave alone.
@@ -89,8 +96,8 @@ func EffectsLabel(e string) string {
 // Limits of a spec (Companion takes up to 50k characters; tmx keeps tasks short).
 const (
 	MaxGoal  = 500
-	MaxText  = 12 << 10
-	MaxSteps = 30
+	MaxText  = 384 << 10 // the rendered text of a task or message; 12 KB until 17 Nov
+	MaxSteps = 3000      // a storage ceiling (30 until 17 Nov)
 )
 
 // CheckSpec trims a spec and refuses an empty or oversized one.
@@ -105,8 +112,6 @@ func CheckSpec(s model.CompanionSpec) (model.CompanionSpec, error) {
 	switch {
 	case s.Goal == "":
 		return s, fmt.Errorf("the task needs a goal")
-	case len(s.Goal) > MaxGoal:
-		return s, fmt.Errorf("the goal is longer than %d characters; put details in context or steps", MaxGoal)
 	case len(s.Steps) > MaxSteps:
 		return s, fmt.Errorf("at most %d steps", MaxSteps)
 	}
@@ -130,9 +135,10 @@ func cleanLines(in []string) []string {
 
 // RenderInfo is who a task is from, for its first line.
 type RenderInfo struct {
-	Machine string // this machine's name
-	Agent   string // the agent that asked (agent origin) or gets the outcome (owner origin)
-	Origin  string // owner | agent
+	Machine    string // this machine's name
+	Agent      string // the agent that asked (agent origin) or gets the outcome (owner origin)
+	Origin     string // owner | agent
+	OwnerOrder bool
 }
 
 // Render turns a spec into the exact text Companion receives: one clear instruction (goal,
@@ -141,8 +147,10 @@ type RenderInfo struct {
 // before it is sent; it never changes afterwards.
 func Render(s model.CompanionSpec, effects string, info RenderInfo) string {
 	var b strings.Builder
-	if info.Origin == "agent" {
-		fmt.Fprintf(&b, "Task from tmx on %s, asked by its agent %q and approved by the owner in tmx: %s\n", info.Machine, info.Agent, s.Goal)
+	if info.OwnerOrder {
+		fmt.Fprintf(&b, "Task from tmx on %s, relayed by its agent %q. Owner's order (verbatim):\n%s\n", info.Machine, info.Agent, s.Goal)
+	} else if info.Origin == "agent" {
+		fmt.Fprintf(&b, "Task from tmx on %s, asked by its agent %q: %s\n", info.Machine, info.Agent, s.Goal)
 	} else {
 		fmt.Fprintf(&b, "Task from the owner, sent through tmx on %s: %s\n", info.Machine, s.Goal)
 	}
@@ -168,7 +176,7 @@ func Render(s model.CompanionSpec, effects string, info RenderInfo) string {
 		fmt.Fprintf(&b, "Effects: %s (tmx's classification). Ask your owner before any step your own rules gate.\n", effects)
 	}
 	b.WriteString("Report back what you did and what you found, or ask if anything is unclear.")
-	out := Scrub(b.String())
+	out := b.String()
 	if len(out) > MaxText {
 		out = out[:MaxText] + "…"
 	}
@@ -199,7 +207,9 @@ var longRunRx = regexp.MustCompile(`[A-Za-z0-9+_-]{32,}={0,2}`)
 
 const removed = "[removed by tmx]"
 
-// Scrub replaces secret-looking strings with "[removed by tmx]".
+// Scrub replaces secret-looking strings with "[removed by tmx]". tmx no longer applies it to what
+// an agent or the owner writes (the owner, 17 Nov: no silent rewrites); it stays for callers that
+// want a scrubbed copy for a log.
 func Scrub(s string) string {
 	for i, rx := range secretRx {
 		if i == 5 { // keep the word, drop the value

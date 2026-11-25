@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/blackcode-ch/tmx-go/internal/config"
@@ -19,7 +20,7 @@ func TestPublicReleaseInstall(t *testing.T) {
 		for _, failure := range []string{"", "bad signature", "missing signature", "missing checksum", "bad checksum", "wrong repository", "wrong tag", "unlisted binary"} {
 			t.Run(platform+"/"+failure, func(t *testing.T) {
 				key, pub := newKey(t)
-				tag := "fleet-v1.2.0"
+				tag := "fleet-v1.0.3-303-gabcd1234"
 				tg := target{path: filepath.Join(t.TempDir(), "tmxg"), goos: platform, goarch: "amd64"}
 				name := tg.asset(tag)
 				payload := []byte("binary " + tag)
@@ -66,12 +67,12 @@ func TestPublicReleaseInstall(t *testing.T) {
 					http.NotFound(w, r)
 				}))
 				defer srv.Close()
-				rel = release{TagName: tag}
+				rel = release{TagName: tag, Prerelease: true}
 				for n := range files {
 					rel.Assets = append(rel.Assets, asset{Name: n, URL: srv.URL + "/assets/" + n})
 				}
-				writeExe(t, tg.path, "fleet-v1.1.0")
-				u := New(Options{Paths: config.Paths{Home: t.TempDir()}, Version: "fleet-v1.1.0", Executable: tg.path,
+				writeExe(t, tg.path, "fleet-v1.0.3-302-g1fe312ef")
+				u := New(Options{Paths: config.Paths{Home: t.TempDir()}, Version: "fleet-v1.0.3-302-g1fe312ef", Executable: tg.path,
 					GOOS: platform, GOARCH: "amd64", APIBase: srv.URL,
 					Settings: func() config.UpdateConfig {
 						return config.UpdateConfig{Repo: config.PublicUpdateRepo, FleetPublicKey: pub}
@@ -91,7 +92,7 @@ func TestPublicReleaseInstall(t *testing.T) {
 						t.Fatal("invalid release staged")
 					}
 					b, _ := os.ReadFile(tg.path)
-					if string(b) != "binary fleet-v1.1.0" {
+					if string(b) != "binary fleet-v1.0.3-302-g1fe312ef" {
 						t.Fatal("invalid release changed executable")
 					}
 					return
@@ -112,7 +113,7 @@ func TestPublicReleaseInstall(t *testing.T) {
 					t.Fatalf("backups: %v", backups)
 				}
 				b, err = os.ReadFile(backups[0])
-				if err != nil || string(b) != "binary fleet-v1.1.0" {
+				if err != nil || string(b) != "binary fleet-v1.0.3-302-g1fe312ef" {
 					t.Fatalf("backup: %q %v", b, err)
 				}
 			})
@@ -120,8 +121,12 @@ func TestPublicReleaseInstall(t *testing.T) {
 	}
 }
 
-func TestUpdateRepositoryDefaultUnchanged(t *testing.T) {
-	if got := (*config.UpdateConfig)(nil).Resolved().Repo; got != "blackcode-ch/tmx-go" {
+func TestUpdateRepositoryDefaultForBuild(t *testing.T) {
+	want := config.DefaultUpdateRepo
+	if strings.HasPrefix(config.Version, "fleet-v") {
+		want = config.PublicUpdateRepo
+	}
+	if got := (*config.UpdateConfig)(nil).Resolved().Repo; got != want {
 		t.Fatal(got)
 	}
 }

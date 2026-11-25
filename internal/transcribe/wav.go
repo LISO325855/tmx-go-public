@@ -2,6 +2,7 @@ package transcribe
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -9,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/blackcode-ch/tmx-go/internal/hiddenexec"
 )
 
 // WAV files: enough of RIFF to find the PCM data, measure it and cut a long file into parts
@@ -216,7 +219,7 @@ func quietCut(f *os.File, w wavInfo, at, span int64) int64 {
 	return bestAt / fb * fb
 }
 
-// audioKind names the format of a file by its first bytes ("" = not one the engine reads).
+// audioKind names supported file formats by their first bytes; AAC/MP4 need conversion.
 func audioKind(head []byte) string {
 	switch {
 	case len(head) >= 12 && string(head[0:4]) == "RIFF" && string(head[8:12]) == "WAVE":
@@ -225,8 +228,37 @@ func audioKind(head []byte) string {
 		return "flac"
 	case bytes.HasPrefix(head, []byte("OggS")):
 		return "ogg"
+	case len(head) >= 12 && string(head[4:8]) == "ftyp" && binary.BigEndian.Uint32(head[:4]) >= 12:
+		return "m4a"
+	case len(head) >= 2 && head[0] == 0xff && head[1]&0xf6 == 0xf0:
+		return "aac"
 	case bytes.HasPrefix(head, []byte("ID3")), len(head) >= 2 && head[0] == 0xFF && head[1]&0xE0 == 0xE0:
 		return "mp3"
 	}
 	return ""
+}
+
+// convertAAC uses the same ffmpeg discovery as the voice worker. whisper.cpp
+// cannot decode MP4/AAC itself. The caller owns both temporary files.
+func (s *Service) convertAAC(ctx context.Context, input string) (string, error) {
+	ff := s.ffmpeg()
+	if ff == "" {
+		return "", fmt.Errorf("%w: M4A/AAC files require ffmpeg on the transcription host", ErrInvalid)
+	}
+	out := input + ".wav"
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+	defer cancel()
+	cmd := hiddenexec.CommandContext(ctx, ff, "-nostdin", "-v", "error", "-y", "-i", input, "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", out)
+	if err := cmd.Run(); err != nil {
+		os.Remove(out)
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		return "", fmt.Errorf("%w: ffmpeg could not decode the M4A/AAC file", ErrInvalid)
+	}
+	if _, err := readWAV(out); err != nil {
+		os.Remove(out)
+		return "", fmt.Errorf("%w: ffmpeg did not produce a valid WAV", ErrInvalid)
+	}
+	return out, nil
 }

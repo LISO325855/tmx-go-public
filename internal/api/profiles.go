@@ -10,12 +10,12 @@ import (
 // profileRoutes: agent profiles (DESIGN.md "Profiles") and editing an agent after launch.
 func (s *Server) profileRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/profiles", s.listProfiles)
-	mux.HandleFunc("POST /api/profiles", s.ownerOnly(s.createProfile))
+	mux.HandleFunc("POST /api/profiles", s.managers(s.createProfile))
 	mux.HandleFunc("GET /api/profiles/{slug}", s.getProfile)
-	mux.HandleFunc("PUT /api/profiles/{slug}", s.ownerOnly(s.putProfile))
-	mux.HandleFunc("DELETE /api/profiles/{slug}", s.ownerOnly(s.deleteProfile))
-	mux.HandleFunc("POST /api/profiles/{slug}/reset", s.ownerOnly(s.resetProfile))
-	mux.HandleFunc("PATCH /api/agents/{id}", s.ownerOnly(s.patchAgent))
+	mux.HandleFunc("PUT /api/profiles/{slug}", s.managers(s.putProfile))
+	mux.HandleFunc("DELETE /api/profiles/{slug}", s.managers(s.deleteProfile))
+	mux.HandleFunc("POST /api/profiles/{slug}/reset", s.managers(s.resetProfile))
+	mux.HandleFunc("PATCH /api/agents/{id}", s.managers(s.patchAgent))
 }
 
 func (s *Server) listProfiles(w http.ResponseWriter, r *http.Request) {
@@ -33,10 +33,10 @@ func (s *Server) getProfile(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) createProfile(w http.ResponseWriter, r *http.Request) {
 	var p model.Profile
-	if !decode(w, r, &p) || !s.gateProfile(w, r, "", p) {
+	c, _ := caller(r)
+	if !decode(w, r, &p) || c.Owner && !s.gateProfile(w, r, "", p) {
 		return
 	}
-	c, _ := caller(r)
 	out, err := s.f.CreateProfile(c, p)
 	if err != nil {
 		writeErr(w, err)
@@ -46,11 +46,16 @@ func (s *Server) createProfile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) putProfile(w http.ResponseWriter, r *http.Request) {
+	c, _ := caller(r)
 	var p model.Profile
-	if !decode(w, r, &p) || !s.gateProfile(w, r, r.PathValue("slug"), p) {
+	if !decode(w, r, &p) {
 		return
 	}
-	c, _ := caller(r)
+	// The owner's change passes the owner gate (his own confirmation). The head's asks nothing
+	// of him (the owner, 17 Nov 22:18: "none of it reaches him as a prompt").
+	if c.Owner && !s.gateProfile(w, r, r.PathValue("slug"), p) {
+		return
+	}
 	out, err := s.f.UpdateProfile(c, r.PathValue("slug"), p)
 	if err != nil {
 		writeErr(w, err)

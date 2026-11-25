@@ -61,6 +61,7 @@ func TestAgentStopEndsTwoTools(t *testing.T) {
 
 func TestProcessRequestExpiresAndCannotReplay(t *testing.T) {
 	f := newEnv(t).started()
+	holdRules(t, f, "elevation") // Allowed by default: the owner holds it here
 	id := f.HeadID()
 	held := ProcessRequest{Purpose: "red command", Command: "sudo", Args: []string{"true"}}
 	result, err := f.RequestProcess(AgentCaller(id), held)

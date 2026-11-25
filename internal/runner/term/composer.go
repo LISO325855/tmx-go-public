@@ -9,6 +9,39 @@ import (
 
 var codexFooter = regexp.MustCompile(`(?i)(\d+% (?:context )?left|\? for shortcuts|\s·\s(?:[A-Za-z]:\\|~|/))`)
 
+// boxEmpty is emptyComposer for the watcher's screen, and also true when the input
+// box holds nothing but its placeholder: text the harness drew as a hint (screen.LinesTyped).
+// OpenCode shows an example on its home composer. Claude Code shows a hint after a turn ("❯  Claude Code", "❯  <the session's
+// first words>"); taken as a draft, the agent never counted as back at its input box: no end of
+// turn, state working for ever, mail never delivered (hosta-go, 17 Nov). What a person typed is
+// drawn as text and still counts as a draft.
+func (w *watcher) boxEmpty() bool {
+	all, typed := w.scr.LinesTyped()
+	if emptyComposer(strings.Join(all, "\n"), w.info.Name) {
+		return true
+	}
+	if w.info.Name == model.HarnessOpenCode {
+		for i, line := range all {
+			if strings.HasPrefix(strings.TrimSpace(line), "┃  Ask anything…") {
+				if text := strings.TrimSpace(typed[i]); text == "" || text == "┃" {
+					all[i] = "┃"
+				}
+			}
+		}
+		return emptyComposer(strings.Join(all, "\n"), w.info.Name)
+	}
+	if w.info.Name != model.HarnessClaude {
+		return false
+	}
+	changed := false
+	for i, l := range all {
+		if t := strings.TrimSpace(l); (strings.HasPrefix(t, "❯") || strings.HasPrefix(t, "│ ❯")) && typed[i] != l {
+			all[i], changed = typed[i], true
+		}
+	}
+	return changed && emptyComposer(strings.Join(all, "\n"), w.info.Name)
+}
+
 // emptyComposer requires positive evidence of an empty input box. Silence, a
 // footer alone, and a prompt quoted in a response are not that evidence. Keep
 // wrapped rows: a blank first row does not make a multiline draft empty.
@@ -68,7 +101,7 @@ func emptyComposer(text string, h model.Harness) bool {
 	case model.HarnessOpenCode:
 		for i := len(lines) - 1; i > 0; i-- {
 			if strings.HasPrefix(trim(lines[i]), "┃  Build ") || strings.HasPrefix(trim(lines[i]), "┃  Plan ") {
-				if len(lines)-i > 4 || !strings.Contains(strings.Join(lines[i+1:], "\n"), "tab agents") {
+				if !strings.Contains(strings.Join(lines[i+1:min(i+4, len(lines))], "\n"), "tab agents") {
 					return false
 				}
 				seen := false

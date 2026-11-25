@@ -304,3 +304,123 @@ func TestParseAgyStatus(t *testing.T) {
 		t.Fatal("garbage read")
 	}
 }
+
+// The real print-mode /usage of agy (Windows, 17 Nov 2026): TAB-separated lines inside the
+// JSON answer's "response".
+func TestParseAgyUsageTabFormat(t *testing.T) {
+	now := time.Date(2026, 11, 17, 14, 0, 0, 0, time.UTC)
+	resp := "Gemini Models\tWeekly Limit Remaining\t100%\t2026-11-24T13:57:20Z\n" +
+		"Gemini Models\tFive Hour Limit Remaining\t75%\t2026-11-17T18:57:20Z\n" +
+		"Claude and GPT models\tWeekly Limit Remaining\t100%\t2026-11-24T13:57:20Z\n" +
+		"Claude and GPT models\tFive Hour Limit Remaining\t100%\t2026-11-17T18:57:20Z\n" +
+		"Gemini 4 Argon\tGemini 4 Argon Weekly Limit\t100%\t2026-11-24T13:57:20Z\n"
+	doc, _ := json.Marshal(map[string]string{"status": "SUCCESS", "response": resp})
+	limits, signedOut, ok := parseAgyUsage(doc, now)
+	if !ok || signedOut || len(limits) != 5 {
+		t.Fatalf("ok %v signedOut %v limits %+v", ok, signedOut, limits)
+	}
+	want := []struct {
+		label string
+		used  float64
+	}{
+		{"Gemini Models · Weekly Limit", 0},
+		{"Gemini Models · Five Hour Limit", 25},
+		{"Claude and GPT models · Weekly Limit", 0},
+		{"Claude and GPT models · Five Hour Limit", 0},
+		{"Gemini 4 Argon Weekly Limit", 0},
+	}
+	ids := map[string]bool{}
+	for i, w := range want {
+		l := limits[i]
+		if l.Label != w.label || l.UsedPercent != w.used || l.ResetsAt == 0 || l.ID == "" || ids[l.ID] {
+			t.Errorf("limit %d: %+v, want %q used %v with a reset time and its own id", i, l, w.label, w.used)
+		}
+		ids[l.ID] = true
+	}
+	if got := time.UnixMilli(limits[1].ResetsAt).UTC().Format(time.RFC3339); got != "2026-11-17T18:57:20Z" {
+		t.Errorf("reset time %s", got)
+	}
+	// A "used" limit counts up; a line without a percentage is not a limit; plain prose is not this format.
+	if l := agyTabLimits("Models\tWeekly Limit Used\t30%"); len(l) != 1 || l[0].UsedPercent != 30 {
+		t.Errorf("used: %+v", l)
+	}
+	for _, text := range []string{"Models\tWeekly\tsoon", "Sure! Usage is a word.", "a\tb", ""} {
+		if l := agyTabLimits(text); len(l) != 0 {
+			t.Errorf("%q read as limits: %+v", text, l)
+		}
+	}
+}
+
+// agySignedIn reads only the sign-in file under agy's home (no fake harness needed: this one
+// also runs on Windows).
+func TestAgySignedInFile(t *testing.T) {
+	home, account := t.TempDir(), t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	user := &scope{Service: &Service{}}
+	named := &scope{Service: &Service{}, home: HomeEnv(Antigravity, account)}
+	write := func(dir, content string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Join(dir, ".gemini"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, ".gemini", "google_accounts.json"), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if agySignedIn(user) || agySignedIn(named) {
+		t.Fatal("no file reads as signed in")
+	}
+	for content, want := range map[string]bool{
+		``:                                      false,
+		`   `:                                   false,
+		`{}`:                                    false,
+		`{"active":null,"old":["a@b.example"]}`: false,
+		`{"active":""}`:                         false,
+		`{"active":"a@b.example","old":[]}`:     true,
+		`{"accounts":[{"id":"1"}]}`:             true, // another shape: present and not empty
+		`not json but not empty`:                true,
+	} {
+		write(home, content)
+		if got := agySignedIn(user); got != want {
+			t.Errorf("%q: %v, want %v", content, got, want)
+		}
+	}
+	// Each account has its own home: the user's sign-in says nothing about the named account.
+	write(home, `{"active":"a@b.example"}`)
+	if !agySignedIn(user) || agySignedIn(named) {
+		t.Fatal("the named account read the user's sign-in file")
+	}
+	write(account, `{"active":"c@d.example"}`)
+	if !agySignedIn(named) {
+		t.Fatal("the named account's own sign-in file is not seen")
+	}
+	if r := agyByFile(named); !r.known || !r.connected || r.note != agyNoQuota || r.err != "" {
+		t.Fatalf("agyByFile signed in: %+v", r)
+	}
+	// The card shows the active address, each account its own; anything that is not an
+	// address is not shown.
+	if got := agyActiveEmail(named); got != "c@d.example" {
+		t.Fatalf("the named account's address: %q", got)
+	}
+	if got := agyActiveEmail(user); got != "a@b.example" {
+		t.Fatalf("the user's address: %q", got)
+	}
+	for content, want := range map[string]string{
+		`{"active":" e@f.example "}`:             "e@f.example",
+		`{"active":"not an address"}`:            "",
+		`{"active":"x@y.example <script>"}`:      "",
+		`{"active":null,"old":["a@b.example"]}`:  "",
+		`{"accounts":[{"email":"a@b.example"}]}`: "",
+		`not json`:                               "",
+	} {
+		write(account, content)
+		if got := agyActiveEmail(named); got != want {
+			t.Errorf("%q: address %q, want %q", content, got, want)
+		}
+	}
+	write(account, `{"active":null}`)
+	if r := agyByFile(named); !r.known || r.connected || r.err != "" {
+		t.Fatalf("agyByFile signed out: %+v", r)
+	}
+}

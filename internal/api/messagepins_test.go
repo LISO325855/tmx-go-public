@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/blackcode-ch/tmx-go/internal/api/apitest"
+	"github.com/blackcode-ch/tmx-go/internal/fleet"
 	"github.com/blackcode-ch/tmx-go/internal/model"
 )
 
@@ -28,11 +29,16 @@ func TestMessagePinsSharedClientsAndPermissions(t *testing.T) {
 	if status := agent.do("GET", "/api/message-pins", nil, &pins); status != 200 || len(pins) != 1 {
 		t.Fatalf("agent: %d %+v", status, pins)
 	}
-	if status := agent.do("POST", "/api/message-pins", p, nil); status != 403 {
-		t.Fatalf("agent pin: %d", status)
+	// Pins are the owner's and the head's; a worker pins and changes nothing (17 Nov).
+	if _, err := d.Fleet.LaunchAgent(fleet.OwnerCaller, fleet.LaunchRequest{Name: "w1", ProjectID: workerProject(t, d)}); err != nil {
+		t.Fatal(err)
 	}
-	if status := agent.do("PATCH", "/api/message-pins/"+id, map[string]string{"state": "done"}, nil); status != 403 {
-		t.Fatalf("agent done: %d", status)
+	worker := client{t: t, base: d.URL, token: d.AgentToken(t, "w1")}
+	if status := worker.do("POST", "/api/message-pins", p, nil); status != 403 {
+		t.Fatalf("worker pin: %d", status)
+	}
+	if status := worker.do("PATCH", "/api/message-pins/"+id, map[string]string{"state": "done"}, nil); status != 403 {
+		t.Fatalf("worker done: %d", status)
 	}
 	p.Source = "private"
 	p.AgentID = ""

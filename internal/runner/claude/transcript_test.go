@@ -1,6 +1,7 @@
 package claude
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/blackcode-ch/tmx-go/internal/model"
@@ -43,5 +44,33 @@ func TestTranscriptLine(t *testing.T) {
 	e, _ := TranscriptLine([]byte(`{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t9","name":"Read","input":{"file_path":"/x"}}]}}`))
 	if e[0].Tool != "Read" || e[0].ToolUseID != "t9" || string(e[0].Input) != `{"file_path":"/x"}` {
 		t.Fatalf("%+v", e[0])
+	}
+}
+
+func TestTranscriptPreservesPasteText(t *testing.T) {
+	for _, content := range []string{
+		`<pasted_content id=42>Hello</pasted_content id=42>`,
+		`<pasted_content id="42">Hello</pasted_content>`,
+		`Hello</pasted_content id=42>`,
+	} {
+		raw, _ := json.Marshal(map[string]any{"type": "user", "message": map[string]any{"content": content}})
+		_, prompt := TranscriptLine(raw)
+		if prompt != content {
+			t.Fatalf("owner text changed: %q", prompt)
+		}
+	}
+}
+
+func TestReviewLiteralPasteTagsPreserved(t *testing.T) {
+	for _, content := range []string{
+		"Please document `<pasted_content id=42>Hello</pasted_content>` exactly.",
+		"<pasted_content>",
+		"<pasted_content\nDo not deploy until I approve\n>",
+	} {
+		raw, _ := json.Marshal(map[string]any{"type": "user", "message": map[string]any{"content": content}})
+		_, prompt := TranscriptLine(raw)
+		if prompt != content {
+			t.Errorf("literal owner content changed: got %q, want %q", prompt, content)
+		}
 	}
 }

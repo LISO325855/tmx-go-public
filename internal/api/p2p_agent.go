@@ -39,6 +39,7 @@ type AgentP2PResult struct {
 	Preview    string              `json:"preview"`
 	Invite     *p2p.Invite         `json:"invite,omitempty"`
 	Joined     *chat.JoinResult    `json:"joined,omitempty"`
+	Sent       *InviteSent         `json:"sent,omitempty"` // p2p_invite_whatsapp: the receipt, never the link
 	Error      string              `json:"error,omitempty"`
 }
 
@@ -51,6 +52,7 @@ type p2pAction struct {
 	invite    AgentP2PInviteRequest
 	ttl       time.Duration
 	link      string
+	target    fleet.InviteTarget // p2p_invite_whatsapp: the person as the owner approved them
 	result    AgentP2PResult
 	finished  chan struct{}
 }
@@ -176,7 +178,7 @@ func (s *Server) startP2P(w http.ResponseWriter, r *http.Request, a *p2pAction) 
 			count++
 		}
 	}
-	if count >= 32 {
+	if count >= 3200 { // a ceiling on the in-memory registry (32 until 17 Nov)
 		s.p2pActions.Unlock()
 		writeError(w, 429, "too many recent pairing requests; wait for existing requests to expire")
 		return
@@ -259,7 +261,9 @@ func (s *Server) executeP2P(ctx context.Context, a *p2pAction, ap model.Approval
 		return
 	}
 	var err error
-	if a.tool == fleet.ToolP2PInvite {
+	if a.tool == fleet.ToolP2PInviteWA {
+		err = s.executeInviteWA(a)
+	} else if a.tool == fleet.ToolP2PInvite {
 		req := chat.InviteRequest{Kind: p2p.InviteDM, TTLMs: a.ttl.Milliseconds(), MaxUses: a.invite.MaxUses}
 		if a.invite.Kind == "group" {
 			var group model.Chat

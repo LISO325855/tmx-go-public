@@ -8,6 +8,7 @@ import { Switch } from "@/components/ui/switch";
 import { Section } from "@/components/page";
 import { api } from "@/lib/api";
 import { reachabilityLabel, savedVsLiveBanner, shouldPollP2P } from "@/lib/p2p-format";
+import { useStore } from "@/lib/store";
 import type { P2PPeerRow, P2PStatus } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -16,16 +17,22 @@ function Card({ children, className }: { children: React.ReactNode; className?: 
 }
 
 export function P2PSection() {
+  const connected = useStore((s) => s.conn === "open");
   const [status, setStatus] = useState<P2PStatus | null>(null);
-  const [peers, setPeers] = useState<P2PPeerRow[]>([]);
+  const [peers, setPeers] = useState<P2PPeerRow[] | null>(null);
   const [busy, setBusy] = useState(false);
   const [restarting, setRestarting] = useState(false);
 
   useEffect(() => {
+    if (!connected) {
+      setStatus(null);
+      setPeers(null);
+      return;
+    }
     let active = true;
     const load = () => {
-      void api.getP2P().then((s) => { if (active) setStatus(s); }, () => {});
-      void api.getP2PPeers().then((p) => { if (active) setPeers(p); }, () => { if (active) setPeers([]); });
+      void api.getP2P().then((s) => { if (active) setStatus(s); }, () => { if (active) setStatus(null); });
+      void api.getP2PPeers().then((p) => { if (active) setPeers(p); }, () => { if (active) setPeers(null); });
     };
     load();
     const onFocus = () => load();
@@ -37,13 +44,13 @@ export function P2PSection() {
       window.removeEventListener("focus", onFocus);
       document.removeEventListener("visibilitychange", onVisible);
     };
-  }, []);
+  }, [connected]);
 
   useEffect(() => {
     if (!shouldPollP2P(status)) return;
     let active = true;
     const timer = setInterval(() => {
-      void api.getP2P().then((s) => { if (active) setStatus(s); }, () => {});
+      void api.getP2P().then((s) => { if (active) setStatus(s); }, () => { if (active) setStatus(null); });
     }, 5000);
     return () => { active = false; clearInterval(timer); };
     // Only re-arm when restart_to_apply itself flips, not on every status refresh.
@@ -156,7 +163,7 @@ export function P2PSection() {
             )}
           </div>
         )}
-        {status.enabled && (
+        {status.enabled && peers !== null && (
           <div className="px-4 py-3">
             <div className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
               <Users className="size-3.5" />

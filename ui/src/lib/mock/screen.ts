@@ -21,9 +21,14 @@ export class MockScreen {
 
   route(method: string, parts: string[], body: unknown): unknown {
     const [res, id, action] = parts;
-    if (res !== "agents" || action !== "mode" || method !== "POST") return NOT_MINE;
+    if (res !== "agents" || method !== "POST" || (action !== "mode" && action !== "keys" && action !== "type")) return NOT_MINE;
     const a = this.w.agents.get(id);
     if (!a) throw new ApiError(404, `No agent named "${id}".`);
+    // keys / type (the key row under the terminal, "Paste only"): the owner's input into a running agent
+    if (action === "keys" || action === "type") {
+      if (!isRunning(a.state)) throw new ApiError(409, `${a.name} is not running`);
+      return { ok: true };
+    }
     return this.setMode(a, (body as { mode: Mode }).mode);
   }
 

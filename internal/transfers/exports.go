@@ -34,7 +34,8 @@ const (
 	// ExportTTL is how long a ticket waits for its target (Python EXPORT_TTL_S).
 	ExportTTL = 24 * time.Hour
 	// MaxFile is the largest file a copy takes (Python max_file_own).
-	MaxFile = 4 << 30
+	// 4 GB until 17 Nov. The free-space reserve at both ends is what protects the disks.
+	MaxFile = 1 << 40
 )
 
 // Errors.

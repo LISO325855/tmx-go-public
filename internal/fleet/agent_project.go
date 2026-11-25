@@ -148,8 +148,8 @@ func (f *Fleet) UpdateAgentProject(c Caller, id string, patch map[string]json.Ra
 			target = &pp.Confirm
 		case "what", "status", "architecture", "notes":
 			var value string
-			if err := json.Unmarshal(raw, &value); err != nil || len(value) > 16000 {
-				return AgentProjectView{}, errf(KindInvalid, "%s must be text of at most 16000 bytes", key)
+			if err := json.Unmarshal(raw, &value); err != nil || len(value) > 256<<10 { // a storage ceiling (16000 bytes until 17 Nov)
+				return AgentProjectView{}, errf(KindInvalid, "%s must be text of at most 256 KB", key)
 			}
 			rec.Brief[key] = append(json.RawMessage(nil), raw...)
 			continue
@@ -165,8 +165,8 @@ func (f *Fleet) UpdateAgentProject(c Caller, id string, patch map[string]json.Ra
 			continue
 		case "key_files", "decisions", "run":
 			var rows []map[string]string
-			if err := json.Unmarshal(raw, &rows); err != nil || len(rows) > 40 {
-				return AgentProjectView{}, errf(KindInvalid, "%s must be a list of at most 40 text objects", key)
+			if err := json.Unmarshal(raw, &rows); err != nil || len(rows) > 4000 { // 40 until 17 Nov
+				return AgentProjectView{}, errf(KindInvalid, "%s must be a list of at most 4000 text objects", key)
 			}
 			rec.Brief[key] = append(json.RawMessage(nil), raw...)
 			continue
@@ -175,8 +175,8 @@ func (f *Fleet) UpdateAgentProject(c Caller, id string, patch map[string]json.Ra
 				Nodes []map[string]string `json:"nodes"`
 				Links []map[string]string `json:"links"`
 			}
-			if err := json.Unmarshal(raw, &diagram); err != nil || len(diagram.Nodes) > 20 || len(diagram.Links) > 40 {
-				return AgentProjectView{}, errf(KindInvalid, "diagram must contain at most 20 nodes and 40 links")
+			if err := json.Unmarshal(raw, &diagram); err != nil || len(diagram.Nodes) > 2000 || len(diagram.Links) > 4000 { // 20 and 40 until 17 Nov
+				return AgentProjectView{}, errf(KindInvalid, "diagram must contain at most 2000 nodes and 4000 links")
 			}
 			rec.Brief[key] = append(json.RawMessage(nil), raw...)
 			continue

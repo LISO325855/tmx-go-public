@@ -72,7 +72,9 @@ type Patterns struct {
 	AtPrompt   *regexp.Regexp
 	UsageLimit *regexp.Regexp
 	// MenuCursor: the characters that highlight a menu option; "" = any known cursor.
-	MenuCursor string
+	NumberedDialogs bool           // generic Claude dialogs need numbered options and frame/navigation evidence
+	UnnumberedMenu  *regexp.Regexp // known startup gates with cursor-only lists
+	MenuCursor      string
 	// RowMenu: a footer that marks a menu drawn as one row of options selected with
 	// left/right arrows (opencode's permission prompt).
 	RowMenu *regexp.Regexp
@@ -89,13 +91,14 @@ func Rx(expr string) *regexp.Regexp {
 func match(rx *regexp.Regexp, s string) bool { return rx != nil && rx.MatchString(s) }
 
 var (
-	menuLine   = regexp.MustCompile(`^\s*(?:[│|]\s*)?(?P<cursor>[›❯>➜▶●]\s*)?(?P<num>\d{1,2})[.)]\s+(?P<label>\S.*?)\s*(?:[│|]\s*)?$`)
-	cursorLine = regexp.MustCompile(`^(?P<indent>\s*)(?P<cursor>[›❯>➜▶])\s+(?P<label>\S.*?)\s*$`)
-	boxMark    = regexp.MustCompile(`^\s*│?\s*[›❯>](\s|$)`)
-	ruleLine   = regexp.MustCompile(`^[─━═\-_╭╮╰╯ ]+$`)
-	dashedRule = regexp.MustCompile(`^[╌╍┄┅┈┉ ]+$`)
-	tryAgainAt = regexp.MustCompile(`(?i)try again at (.+?)(?:\.(?:\s|$)|$)`)
-	spaces     = regexp.MustCompile(`\s+`)
+	menuLine       = regexp.MustCompile(`^\s*(?:[│|]\s*)?(?P<cursor>[›❯>➜▶●]\s*)?(?P<num>\d{1,2})[.)]\s+(?P<label>\S.*?)\s*(?:[│|]\s*)?$`)
+	cursorLine     = regexp.MustCompile(`^(?P<indent>\s*)(?P<cursor>[›❯>➜▶])\s+(?P<label>\S.*?)\s*$`)
+	boxMark        = regexp.MustCompile(`^\s*│?\s*[›❯>](\s|$)`)
+	ruleLine       = regexp.MustCompile(`^[─━═\-_╭╮╰╯ ]+$`)
+	dashedRule     = regexp.MustCompile(`^[╌╍┄┅┈┉ ]+$`)
+	tryAgainAt     = regexp.MustCompile(`(?i)try again at (.+?)(?:\.(?:\s|$)|$)`)
+	menuNavigation = regexp.MustCompile(`(?i)(enter to (select|confirm)|esc to cancel)`)
+	spaces         = regexp.MustCompile(`\s+`)
 )
 
 const (
@@ -331,11 +334,33 @@ func Classify(lines []string, p *Patterns, quiet time.Duration) (result Detectio
 		return Detection{State: Idle}
 	}
 	choices, selected, first := ParseMenu(tail, p.MenuCursor)
+	menuEvidence := true
+	if p.NumberedDialogs {
+		menuEvidence = false
+		if first >= 0 {
+			numbered := menuLine.MatchString(tail[first])
+			framed := false
+			for _, line := range tail[:first] {
+				if ruleLine.MatchString(strings.TrimSpace(line)) && strings.ContainsAny(line, "\u2500\u2501\u2550") {
+					framed = true
+				}
+			}
+			navigation := menuNavigation.MatchString(strings.Join(tail[first:], "\n"))
+			menuEvidence = numbered && (framed || navigation) && (selected != 0 || (navigation && match(p.Question, screen)))
+			// Captured trust/theme/default-mode gates are genuinely unnumbered.
+			if !numbered && selected != 0 && match(p.UnnumberedMenu, QuestionText(tail, first)) {
+				menuEvidence = true
+			}
+		}
+		if !menuEvidence {
+			choices, selected, first = nil, 0, -1
+		}
+	}
 	for _, c := range []struct {
 		st State
 		rx *regexp.Regexp
 	}{{Locked, p.Locked}, {Trust, p.Trust}, {Approval, p.Approval}, {Question, p.Question}} {
-		if match(c.rx, screen) {
+		if menuEvidence && match(c.rx, screen) {
 			prompt := lastParagraph(tail)
 			if first >= 0 {
 				prompt = QuestionText(tail, first)

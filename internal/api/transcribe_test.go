@@ -109,7 +109,7 @@ func TestDictationAndFiles(t *testing.T) {
 	if st := owner.do("POST", "/api/transcribe", map[string]string{"data": base64.StdEncoding.EncodeToString(testWAV(2))}, &res); st != http.StatusOK {
 		t.Fatalf("dictation: %d", st)
 	}
-	if res.Text != "hello from the fake engine" || res.Language != "en" || len(res.Segments) != 1 || res.Segments[0].ToMS != 1500 {
+	if res.Text != "Hello from the fake engine" || res.Language != "en" || len(res.Segments) != 1 || res.Segments[0].ToMS != 1500 {
 		t.Fatalf("%+v", res)
 	}
 	if st := owner.do("POST", "/api/transcribe", map[string]string{"data": "not base64!"}, nil); st != http.StatusBadRequest {
@@ -226,6 +226,39 @@ func TestVoiceSettingsAPI(t *testing.T) {
 	}
 	if len(st.Models) != 3 || st.Models[0].Name != "base-q5_1" || st.Models[0].Size != 59707625 {
 		t.Fatalf("models: %+v", st.Models)
+	}
+}
+
+func TestVoiceRemoteSettingsAPI(t *testing.T) {
+	d := apitest.New(t)
+	owner := client{t, d.URL, d.OwnerToken}
+	if st := owner.do("PUT", "/api/voice", map[string]any{"remote_url": "not-a-url"}, nil); st != http.StatusBadRequest {
+		t.Fatalf("bad remote_url: %d", st)
+	}
+	var st struct {
+		Settings struct {
+			RemoteURL   string `json:"remote_url"`
+			RemoteModel string `json:"remote_model"`
+			IdleUnloadS int    `json:"idle_unload_s"`
+		} `json:"settings"`
+	}
+	// remote_url alone: remote_model defaults to large-v3-turbo (brief's update from tmx-lead).
+	if code := owner.do("PUT", "/api/voice", map[string]any{"remote_url": "http://fae:8010"}, &st); code != http.StatusOK {
+		t.Fatalf("remote_url alone: %d", code)
+	}
+	if st.Settings.RemoteURL != "http://fae:8010" || st.Settings.RemoteModel != "large-v3-turbo" {
+		t.Fatalf("%+v", st.Settings)
+	}
+	// No cap: idle_unload_s never had one in config.json either.
+	body := map[string]any{"remote_url": "http://fae:8010", "remote_model": "large-v3-turbo", "idle_unload_s": 100000}
+	if code := owner.do("PUT", "/api/voice", body, &st); code != http.StatusOK {
+		t.Fatalf("put: %d", code)
+	}
+	if st.Settings.RemoteURL != "http://fae:8010" || st.Settings.RemoteModel != "large-v3-turbo" || st.Settings.IdleUnloadS != 100000 {
+		t.Fatalf("%+v", st.Settings)
+	}
+	if st2 := owner.do("PUT", "/api/voice", map[string]any{"remote_url": ""}, nil); st2 != http.StatusOK {
+		t.Fatalf("clearing remote_url: %d", st2)
 	}
 }
 

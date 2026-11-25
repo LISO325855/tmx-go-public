@@ -226,7 +226,7 @@ func TestNumberedReplyIsNotAMenu(t *testing.T) {
 	if d := screen.Classify(reply, p, 10*time.Second); d.State == screen.Dialog {
 		t.Fatal("a numbered reply without a cursor became a dialog")
 	}
-	if d := classify(t, model.HarnessClaude, []string{"Pick one:", "❯ 1. Yes", "  2. No"}); d.State != screen.Dialog {
+	if d := classify(t, model.HarnessClaude, []string{"────────", "Pick one:", "❯ 1. Yes", "  2. No"}); d.State != screen.Dialog {
 		t.Fatal(d.State)
 	}
 }

@@ -89,8 +89,11 @@ func (f *Fleet) Policy() model.Policy {
 // models, permission mode, project creation and launch rights (a level in can_launch means
 // its built-in profile; custom profiles already allowed for a level that stays are kept).
 func (f *Fleet) SetPolicy(c Caller, p model.Policy) (model.Policy, error) {
-	if !c.Owner {
-		return model.Policy{}, errf(KindForbidden, "only the owner can change the policy")
+	f.mu.Lock()
+	err := f.manageNodeLocked(c, "change the policy")
+	f.mu.Unlock()
+	if err != nil {
+		return model.Policy{}, err
 	}
 	if err := validatePolicy(p); err != nil {
 		return model.Policy{}, err
@@ -164,8 +167,9 @@ func (f *Fleet) isDescendantLocked(target *agentRec, ancestorID string) bool {
 	return false
 }
 
-// authorizeActLocked: start/stop/restart/interrupt. The owner may act on anyone; a head or
-// lead on its own subtree; nobody on itself.
+// authorizeActLocked: start/stop/restart/interrupt. The owner may act on anyone; the head on
+// anyone but itself (17 Nov: node-wide, not only its own subtree); a lead on the agents of a
+// project it leads and on its own subtree; nobody on itself; a worker on nobody.
 func (f *Fleet) authorizeActLocked(c Caller, target *agentRec) error {
 	if c.Owner || c.Peer != "" {
 		return nil
@@ -180,7 +184,10 @@ func (f *Fleet) authorizeActLocked(c Caller, target *agentRec) error {
 	if me.a.Level == model.LevelWorker {
 		return errf(KindForbidden, "workers cannot start or stop other agents")
 	}
-	if !f.isDescendantLocked(target, me.a.ID) {
+	if isHead(me) {
+		return nil
+	}
+	if isHead(target) || !(f.isDescendantLocked(target, me.a.ID) || f.leadsProjectLocked(me, target.a.ProjectID)) {
 		return errf(KindForbidden, "%s is not in %s's part of the tree", target.a.Name, me.a.Name)
 	}
 	return nil

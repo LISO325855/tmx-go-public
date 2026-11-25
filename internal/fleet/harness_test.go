@@ -175,8 +175,10 @@ func TestLaunchHarnessesAndModes(t *testing.T) {
 		t.Fatalf("pi: %+v %v", pi, err)
 	}
 	oc, err := f.LaunchAgent(OwnerCaller, LaunchRequest{ProjectID: workerProject(t, f), Name: "oc1", Harness: model.HarnessOpenCode})
-	if err != nil || oc.Mode != model.ModeTerminal || !strings.HasPrefix(oc.SessionID, "ses") ||
-		e.term.Last(oc.ID).Spec.SessionID != oc.SessionID || e.term.Last(oc.ID).Spec.Model != "" {
+	// A new opencode conversation has no id yet and must NOT be launched with -s (opencode 1.19:
+	// "Session not found", exit 1); the runner reads the id back from opencode's database.
+	if err != nil || oc.Mode != model.ModeTerminal || oc.SessionID != "" ||
+		e.term.Last(oc.ID).Spec.SessionID != "" || e.term.Last(oc.ID).Spec.Model != "" {
 		t.Fatalf("opencode: %+v %v", oc, err)
 	}
 	if _, err := f.LaunchAgent(OwnerCaller, LaunchRequest{ProjectID: workerProject(t, f), Name: "oc", Harness: model.HarnessOpenCode, Mode: model.ModeChat}); KindOf(err) != KindInvalid {
@@ -224,52 +226,38 @@ func TestInstructionsGoInFrontForHarnessesWithoutSystemPrompt(t *testing.T) {
 	}
 }
 
-func TestTerminalMailWaitsForIdleAndQuietTyping(t *testing.T) {
+func TestTerminalMailImmediateForEverySourceAndState(t *testing.T) {
 	e := newUnguardedEnv(t)
 	f := e.started()
 	a, _ := f.LaunchAgent(OwnerCaller, LaunchRequest{ProjectID: workerProject(t, f), Name: "tui", Harness: model.HarnessClaude, Mode: model.ModeTerminal})
+	peer, _ := f.LaunchAgent(OwnerCaller, LaunchRequest{ProjectID: workerProject(t, f), Name: "peer"})
 	p := e.term.Last(a.ID)
-	p.State(model.StateWorking)
-	eventually(t, "working", func() bool { x, _ := f.Agent("tui"); return x.State == model.StateWorking })
-	if _, err := f.SendOwner("tui", "hello", ""); err != nil {
-		t.Fatal(err)
+	for _, state := range []model.AgentState{model.StateWorking, model.StateIdle, model.StateStarting, model.StateWaiting} {
+		f.mu.Lock()
+		f.agents[a.ID].a.State = state
+		f.agents[a.ID].humanInputAt = time.Now()
+		f.mu.Unlock()
+		before := len(p.Sent())
+		if _, err := f.SendMessage(AgentCaller(peer.ID), SendRequest{To: a.ID, Body: "agent first"}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.SendOwner(a.ID, "owner second", ""); err != nil {
+			t.Fatal(err)
+		}
+		p.State(model.StateIdle)
+		eventually(t, "terminal owner mail after interrupt", func() bool { return len(p.Sent()) == before+2 })
+		sent := p.Sent()
+		if len(sent) != before+2 || !strings.Contains(sent[before], "agent first") || !strings.Contains(sent[before+1], "owner second") {
+			t.Fatalf("state %s: %q", state, sent)
+		}
 	}
-	time.Sleep(50 * time.Millisecond)
-	if len(p.Sent()) != 0 {
-		t.Fatal("typed into a busy terminal")
-	}
-	p.State(model.StateIdle)
-	eventually(t, "delivered when idle", func() bool { return len(p.Sent()) == 1 })
-	if !strings.Contains(p.Sent()[0], "hello") {
-		t.Fatal(p.Sent())
-	}
-	// a human typed a moment ago: wait
-	p.State(model.StateWorking)
-	eventually(t, "working", func() bool { x, _ := f.Agent("tui"); return x.State == model.StateWorking })
-	_ = f.TerminalInput(OwnerCaller, "tui", []byte("draft"))
-	p.State(model.StateIdle)
-	_, _ = f.SendOwner("tui", "second", "")
-	time.Sleep(100 * time.Millisecond)
-	if len(p.Sent()) != 1 {
-		t.Fatal("typed over a human")
-	}
-	f.mu.Lock()
-	f.agents[a.ID].humanInputAt = time.Now().Add(-TypingQuiet)
-	f.mu.Unlock()
-	f.tryDeliver(a.ID)
-	eventually(t, "delivered after the quiet", func() bool { return len(p.Sent()) == 2 })
-
-	// a shell never gets agent mail typed into it
+	// Agent mail must still never execute as a shell command.
 	sh, _ := f.LaunchAgent(OwnerCaller, LaunchRequest{Name: "sh", Harness: model.HarnessShell})
-	sp := e.term.Last(sh.ID)
-	sp.State(model.StateIdle)
-	w, _ := f.LaunchAgent(OwnerCaller, LaunchRequest{ProjectID: workerProject(t, f), Name: "w"})
-	if _, err := f.SendMessage(AgentCaller(w.ID), SendRequest{To: "sh", Body: "rm -rf /"}); err != nil {
+	if _, err := f.SendMessage(AgentCaller(peer.ID), SendRequest{To: sh.ID, Body: "shell command"}); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(50 * time.Millisecond)
-	if len(sp.Sent()) != 0 {
-		t.Fatal("mail typed into a shell")
+	if len(e.term.Last(sh.ID).Sent()) != 0 {
+		t.Fatal("agent mail reached shell")
 	}
 }
 
@@ -350,3 +338,37 @@ func TestConfiguredHeadHarness(t *testing.T) {
 		}
 	}
 }
+
+// A physically absent process retains mail until delivery can resume.
+func TestQueuedMailForAnIdleAgentIsDeliveredByTheBackstop(t *testing.T) {
+	e := newUnguardedEnv(t)
+	f := e.started()
+	a, _ := f.LaunchAgent(OwnerCaller, LaunchRequest{ProjectID: workerProject(t, f), Name: "tui", Harness: model.HarnessClaude, Mode: model.ModeTerminal})
+	peer, _ := f.LaunchAgent(OwnerCaller, LaunchRequest{ProjectID: workerProject(t, f), Name: "peer"})
+	p := e.term.Last(a.ID)
+	p.State(model.StateWorking)
+	eventually(t, "working", func() bool { x, _ := f.Agent("tui"); return x.State == model.StateWorking })
+	f.mu.Lock()
+	f.agents[a.ID].proc = nil
+	f.mu.Unlock()
+	if _, err := f.SendMessage(AgentCaller(peer.ID), SendRequest{To: "tui", Body: "waiting mail"}); err != nil {
+		t.Fatal(err)
+	}
+	// The agent became idle without the delivery that normally follows.
+	f.mu.Lock()
+	f.agents[a.ID].a.State = model.StateIdle
+	f.agents[a.ID].proc = p
+	f.mu.Unlock()
+	if len(p.Sent()) != 0 {
+		t.Fatal("delivered before the check")
+	}
+	f.deliverWaiting()
+	eventually(t, "delivered by the check", func() bool { return len(p.Sent()) == 1 })
+	f.deliverWaiting()
+	time.Sleep(50 * time.Millisecond)
+	if len(p.Sent()) != 1 {
+		t.Fatalf("delivered twice: %q", p.Sent())
+	}
+}
+
+// A typing hold must expire during a long tool call, without an idle event.

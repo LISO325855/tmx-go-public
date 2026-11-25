@@ -29,9 +29,10 @@ const (
 
 // Headers of the Python pair-token API.
 const (
-	HeaderToken    = "X-TMX-Token"
-	HeaderFrom     = "X-TMX-From"
-	HeaderOnBehalf = "X-TMX-On-Behalf"
+	HeaderToken         = "X-TMX-Token"
+	HeaderFrom          = "X-TMX-From"
+	HeaderOnBehalf      = "X-TMX-On-Behalf"
+	HeaderVerifiedAgent = "X-TMX-Verified-Agent"
 )
 
 // Session is one agent on a peer, as its /api/sessions lists it (a subset; display only).
@@ -52,6 +53,65 @@ type Session struct {
 	QueuedMessages int      `json:"queued_messages,omitempty"`
 }
 
+// DaemonGo is what a Go daemon answers as "daemon" in GET /api/sessions. A Python daemon has no
+// such field. It tells the owner's window which launch body that machine takes (Go's
+// fleet.LaunchRequest or Python's), nothing more: it grants nothing.
+const DaemonGo = "go"
+
+// System is a machine's own reading, as GET /api/sessions carries it under "system". The field
+// names are the Python daemons' (sysmon.snapshot), so a Go and a Python machine read each other
+// the same way; disk_free_mb and disk_total_mb are Go's additions (a Python peer leaves them
+// out). Every field is optional: a machine that has not measured something yet sends null or
+// nothing, never a made-up zero.
+type System struct {
+	CPUPercent   *float64 `json:"cpu_percent,omitempty"` // all cores, 0-100
+	CPUs         int      `json:"cpus,omitempty"`
+	Memory       *Memory  `json:"memory,omitempty"`
+	DiskWriteMBs *float64 `json:"disk_write_mb_s,omitempty"` // every program
+	DiskFreeMB   *int64   `json:"disk_free_mb,omitempty"`    // the workspace's volume
+	DiskTotalMB  *int64   `json:"disk_total_mb,omitempty"`
+	IOOverloaded bool     `json:"io_overloaded,omitempty"` // the disk guard holds work back now
+}
+
+// Memory is System's memory reading (MiB).
+type Memory struct {
+	TotalMB     int64 `json:"total_mb"`
+	AvailableMB int64 `json:"available_mb"`
+}
+
+// sane returns s with every number outside what a machine can report dropped: a peer's reading
+// is display data, never trusted to be well-formed. The result shares nothing with s; nil when
+// nothing usable is left.
+func (s *System) sane() *System {
+	if s == nil {
+		return nil
+	}
+	const maxMB = 1 << 40 // 2^60 bytes: beyond any machine or volume
+	out := System{IOOverloaded: s.IOOverloaded}
+	if v := s.CPUPercent; v != nil && *v >= 0 && *v <= 100 {
+		c := *v
+		out.CPUPercent = &c
+	}
+	if s.CPUs > 0 && s.CPUs <= 4096 {
+		out.CPUs = s.CPUs
+	}
+	if m := s.Memory; m != nil && m.TotalMB > 0 && m.TotalMB <= maxMB && m.AvailableMB >= 0 && m.AvailableMB <= m.TotalMB {
+		out.Memory = &Memory{TotalMB: m.TotalMB, AvailableMB: m.AvailableMB}
+	}
+	if v := s.DiskWriteMBs; v != nil && *v >= 0 && *v <= 1<<20 {
+		w := *v
+		out.DiskWriteMBs = &w
+	}
+	if f, t := s.DiskFreeMB, s.DiskTotalMB; f != nil && t != nil && *t > 0 && *t <= maxMB && *f >= 0 && *f <= *t {
+		free, total := *f, *t
+		out.DiskFreeMB, out.DiskTotalMB = &free, &total
+	}
+	if out == (System{}) {
+		return nil
+	}
+	return &out
+}
+
 // Status is what this daemon last saw of a peer.
 type Status struct {
 	Supervisor *SupervisorRef `json:"supervisor"`
@@ -60,6 +120,9 @@ type Status struct {
 	OK         bool           `json:"ok"`
 	Error      string         `json:"error,omitempty"`
 	Commit     string         `json:"commit,omitempty"`
+	Version    string         `json:"version,omitempty"` // the peer's tmx version, when it says
+	Daemon     string         `json:"daemon,omitempty"`  // DaemonGo, or "" for a Python daemon (it does not say)
+	System     *System        `json:"system,omitempty"`  // its last machine reading (stale when !OK)
 	Paired     bool           `json:"paired"`
 	Seen       int64          `json:"seen,omitempty"` // Unix ms of the last good reading
 	Sessions   []Session      `json:"sessions"`       // the last good reading (stale when !OK)
@@ -75,12 +138,16 @@ type SupervisorRef struct {
 type Client struct {
 	machine string
 	peers   map[string]config.Peer
+	peersMu sync.RWMutex
 	tokens  *Tokens
 	http    *http.Client
 	log     *slog.Logger
 
 	mu     sync.Mutex
 	status map[string]Status
+
+	stateMu    sync.Mutex
+	fleetState FleetState // fleetstate.go: the last state block read from a Python peer
 }
 
 // New returns a Client for cfg's peers (none outside the production profile).
@@ -117,7 +184,7 @@ func (c *Client) Machine() string { return c.machine }
 
 // Known reports whether host is a configured peer (fleet.PeerSender).
 func (c *Client) Known(host string) bool {
-	_, ok := c.peers[strings.ToLower(host)]
+	_, ok := c.lookup(host)
 	return ok
 }
 
@@ -134,6 +201,7 @@ func (c *Client) Statuses() []Status {
 			v := *s.Supervisor
 			s.Supervisor = &v
 		}
+		s.System = s.System.sane() // a copy: the caller never shares the poller's pointers
 		out = append(out, s)
 	}
 	c.mu.Unlock()
@@ -156,7 +224,15 @@ func (e Refused) Error() string { return fmt.Sprintf("refused (HTTP %d): %s", e.
 // retired fleet-wide) and decodes a JSON answer into out. Unreachable, 5xx and unreadable
 // answers wrap fleet.ErrPeerUnreachable; 3xx/4xx are Refused.
 func (c *Client) do(ctx context.Context, peer config.Peer, method, path string, body, out any, timeout time.Duration) (int, error) {
-	tok := c.tokens.For(peer.Name)
+	return c.doWithToken(ctx, peer, method, path, body, out, timeout, c.tokens.For(peer.Name))
+}
+
+func (c *Client) doWithToken(ctx context.Context, peer config.Peer, method, path string, body, out any, timeout time.Duration, tok string) (int, error) {
+	return c.doAttested(ctx, peer, method, path, body, out, timeout, tok, "")
+}
+
+// Only Send supplies an attested local agent; arbitrary remote relay bodies cannot.
+func (c *Client) doAttested(ctx context.Context, peer config.Peer, method, path string, body, out any, timeout time.Duration, tok, verifiedAgent string) (int, error) {
 	if tok == "" {
 		return 0, Refused{0, "not paired with " + peer.Name + " (tmx peers import-python)"}
 	}
@@ -177,6 +253,9 @@ func (c *Client) do(ctx context.Context, peer config.Peer, method, path string, 
 	req.Header.Set(HeaderToken, tok)
 	req.Header.Set(HeaderFrom, c.machine)
 	req.Header.Set(HeaderOnBehalf, "daemon")
+	if verifiedAgent != "" {
+		req.Header.Set(HeaderVerifiedAgent, verifiedAgent)
+	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -211,7 +290,7 @@ func (c *Client) do(ctx context.Context, peer config.Peer, method, path string, 
 // the same ID. The Python daemon answers 202 when it quarantined the message (this machine is
 // not attested there yet): a refusal the owner fixes on that machine.
 func (c *Client) Send(host string, m fleet.PeerOutbound) error {
-	peer, ok := c.peers[strings.ToLower(host)]
+	peer, ok := c.lookup(host)
 	if !ok {
 		return Refused{404, "no peer machine " + host}
 	}
@@ -219,7 +298,11 @@ func (c *Client) Send(host string, m fleet.PeerOutbound) error {
 		ID    string `json:"id"`
 		State string `json:"state"`
 	}
-	code, err := c.do(context.Background(), peer, http.MethodPost, "/api/messages/incoming", m, &res, sendTimeout)
+	verified := ""
+	if m.VerifiedSender == m.Sender && model.ValidName(m.Sender) && !fleet.ReservedAgentName(m.Sender) && m.SenderHost == c.machine {
+		verified = m.VerifiedSender
+	}
+	code, err := c.doAttested(context.Background(), peer, http.MethodPost, "/api/messages/incoming", m, &res, sendTimeout, c.tokens.For(peer.Name), verified)
 	if err != nil {
 		return err
 	}
@@ -229,11 +312,9 @@ func (c *Client) Send(host string, m fleet.PeerOutbound) error {
 	return nil
 }
 
-// Run reads every peer's agents every pollEvery until ctx ends.
+// Run reads every peer's agents every pollEvery until ctx ends, even when
+// initially empty so live additions are discovered. Callers must cancel ctx.
 func (c *Client) Run(ctx context.Context) {
-	if len(c.peers) == 0 {
-		return
-	}
 	poll := time.NewTicker(pollEvery)
 	defer poll.Stop()
 	c.PollAll(ctx)
@@ -250,7 +331,7 @@ func (c *Client) Run(ctx context.Context) {
 // PollAll reads every peer's /api/sessions once.
 func (c *Client) PollAll(ctx context.Context) {
 	var wg sync.WaitGroup
-	for _, peer := range c.peers {
+	for _, peer := range c.peerSnapshot() {
 		wg.Add(1)
 		go func(peer config.Peer) {
 			defer wg.Done()
@@ -265,6 +346,9 @@ func (c *Client) poll(ctx context.Context, peer config.Peer) {
 		Supervisor json.RawMessage `json:"supervisor"`
 		Host       string          `json:"host"`
 		Commit     string          `json:"commit"`
+		Version    string          `json:"version"`
+		Daemon     string          `json:"daemon"`
+		System     json.RawMessage `json:"system"`
 		Sessions   []Session       `json:"sessions"`
 	}
 	_, err := c.do(ctx, peer, http.MethodGet, "/api/sessions", nil, &res, sessionTimeout)
@@ -273,13 +357,28 @@ func (c *Client) poll(ctx context.Context, peer config.Peer) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	st := c.status[peer.Name]
+	st, exists := c.status[peer.Name]
+	if !exists || st.URL != peer.URL {
+		return
+	}
 	if err != nil {
 		st.OK, st.Error = false, clean(err.Error(), 300)
 		c.status[peer.Name] = st
 		return
 	}
 	st.OK, st.Error, st.Commit, st.Seen = true, "", clean(res.Commit, 64), time.Now().UnixMilli()
+	st.Version = clean(res.Version, 64)
+	st.Daemon = ""
+	if res.Daemon == DaemonGo {
+		st.Daemon = DaemonGo
+	}
+	// The reading is optional and its shape is the peer's own: one that does not parse (an
+	// older daemon, a field of another type) only leaves the machine without numbers.
+	var sys System
+	st.System = nil
+	if len(res.System) > 0 && json.Unmarshal(res.System, &sys) == nil {
+		st.System = sys.sane()
+	}
 	st.Supervisor = nil
 	var supervisor SupervisorRef
 	if json.Unmarshal(res.Supervisor, &supervisor) != nil {
@@ -345,6 +444,8 @@ func clean(s string, n int) string {
 
 // Names lists the configured peers, sorted.
 func (c *Client) Names() []string {
+	c.peersMu.RLock()
+	defer c.peersMu.RUnlock()
 	out := make([]string, 0, len(c.peers))
 	for n := range c.peers {
 		out = append(out, n)
@@ -355,7 +456,7 @@ func (c *Client) Names() []string {
 
 // Call sends one request to a configured peer with its pair token (the owner PIN sync).
 func (c *Client) Call(ctx context.Context, host, method, path string, body, out any) error {
-	peer, ok := c.peers[strings.ToLower(host)]
+	peer, ok := c.lookup(host)
 	if !ok {
 		return Refused{0, "unknown peer " + clean(host, 40)}
 	}
@@ -372,7 +473,12 @@ func (c *Client) Call(ctx context.Context, host, method, path string, body, out 
 // network failure leaves the old token the one still in use on both sides, never a token only
 // one side believes is current. Returns the new token's fingerprint.
 func (c *Client) RotateWith(ctx context.Context, host string) (string, error) {
-	peer, ok := c.peers[strings.ToLower(host)]
+	edit := MutationMutex(c.tokens.path)
+	edit.Lock()
+	peer, ok := c.lookup(host)
+	original := c.tokens.For(peer.Name)
+	generation := c.tokens.Generation(peer.Name)
+	edit.Unlock()
 	if !ok {
 		return "", Refused{0, "unknown peer " + clean(host, 40)}
 	}
@@ -383,14 +489,23 @@ func (c *Client) RotateWith(ctx context.Context, host string) (string, error) {
 	var res struct {
 		Fingerprint string `json:"fingerprint"`
 	}
-	if _, err := c.do(ctx, peer, http.MethodPost, "/api/peers/pair-token", map[string]string{"token": fresh}, &res, sendTimeout); err != nil {
+	if _, err := c.doWithToken(ctx, peer, http.MethodPost, "/api/peers/pair-token", map[string]string{"token": fresh}, &res, sendTimeout, original); err != nil {
 		return "", err
 	}
 	want := Fingerprint(fresh)
 	if res.Fingerprint != want {
 		return "", Refused{0, peer.Name + " confirmed a different token than the one sent: nothing stored locally"}
 	}
-	fp, err := c.tokens.Store(peer.Name, fresh, "rotated-by-"+c.machine)
+	edit.Lock()
+	defer edit.Unlock()
+	current, known := c.lookup(peer.Name)
+	if !known || current != peer {
+		return "", ErrStalePair
+	}
+	fp, err := c.tokens.StoreIfCurrentLocked(peer.Name, fresh, "rotated-by-"+c.machine, original, generation)
+	if err == ErrStalePair {
+		return "", err
+	}
 	if err != nil {
 		// peer.Name already has the new token (it just confirmed storing it); saving our own
 		// copy failed (a disk error, ctx cancelled after the peer replied). The two sides now

@@ -160,53 +160,40 @@ func graceLine(st gate.Status) string {
 	return line + " (locked now; a restart locks it too)"
 }
 
+// cmdGuard shows the command guard: what every rule does to an agent's call. The guard has no
+// on/off switch; each rule is set in Settings > Safety (Blocked, Held for me, Allowed).
 func cmdGuard(e *env, args []string) error {
-	fs := newFlags("guard")
-	forKind := fs.String("for", "", "only for this kind of agent (head, lead, worker)")
-	pos, err := parse(fs, args)
-	if err != nil {
-		return err
-	}
-	sub := "status"
-	if len(pos) > 0 {
-		sub = pos[0]
+	const usage = "usage: tmx guard [status]"
+	switch {
+	case len(args) == 0 || (len(args) == 1 && args[0] == "status"):
+	case args[0] == "on" || args[0] == "off":
+		return usageErr("the guard has no on/off switch any more: every agent starts with it. Set what each rule does in Settings > Safety (Blocked, Held for me, Allowed).\n%s", usage)
+	default:
+		return usageErr(usage)
 	}
 	return withOwner(e, func(c *client.Client, cx context.Context) error {
 		var info api.SafetyInfo
 		if err := c.Get(cx, "/api/safety", &info); err != nil {
 			return err
 		}
-		s := info.Guard
-		switch sub {
-		case "status":
-		case "on", "off":
-			next := guard.Settings{Enabled: s.Enabled, OffFor: []string{}}
-			for _, k := range s.OffFor {
-				if k != *forKind {
-					next.OffFor = append(next.OffFor, k)
-				}
+		by := map[guard.Outcome][]string{}
+		for _, r := range info.Rules {
+			if r.Switchable {
+				by[r.State] = append(by[r.State], r.Name)
 			}
-			switch {
-			case *forKind == "":
-				next = guard.Settings{Enabled: sub == "on", OffFor: []string{}}
-			case sub == "off":
-				next.OffFor = append(next.OffFor, *forKind)
+		}
+		fmt.Fprintln(e.out, "dangerous-command guard: on for every agent (no on/off switch; rules are set in Settings > Safety)")
+		for _, g := range []struct {
+			state guard.Outcome
+			label string
+		}{{guard.Block, "blocked"}, {guard.Hold, "held for you"}, {guard.Allow, "allowed"}} {
+			names := "none"
+			if len(by[g.state]) > 0 {
+				names = strings.Join(by[g.state], "; ")
 			}
-			if err := ownerDo(e, c, cx, http.MethodPut, "/api/safety/guard", next, &s); err != nil {
-				return err
-			}
-		default:
-			return usageErr("usage: tmx guard [status|on|off] [--for head|lead|worker]")
+			fmt.Fprintf(e.out, "  %s: %s\n", g.label, names)
 		}
-		state := "on"
-		if !s.Enabled {
-			state = "off"
-		}
-		fmt.Fprintf(e.out, "dangerous-command guard: %s", state)
-		if s.Enabled && len(s.OffFor) > 0 {
-			fmt.Fprintf(e.out, " (off for %s)", strings.Join(s.OffFor, ", "))
-		}
-		fmt.Fprintln(e.out, "\n  applies to chat-mode Claude agents started from now on (restart running agents)")
+		fmt.Fprintln(e.out, "  an agent the guard cannot check (a harness without a guard, or Claude settings with disableAllHooks) still starts, with a warning in its timeline")
 		return nil
 	})
 }

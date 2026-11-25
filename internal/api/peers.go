@@ -30,7 +30,7 @@ import (
 // their own dedicated handlers.
 
 // peerProtocolPaths are the Python-wire-shaped routes: their own handlers, Python's reply shape.
-var peerProtocolPaths = map[string]bool{"/api/sessions": true, "/api/messages/incoming": true, "/api/peers/pair-token": true, "/api/gate/pin/record": true, "/api/peer/summarize-local": true}
+var peerProtocolPaths = map[string]bool{"/api/sessions": true, "/api/messages/incoming": true, "/api/peers/pair-token": true, "/api/gate/pin/record": true, "/api/peer/summarize-local": true, "/api/peer/dictate": true}
 
 var wireIDRx = regexp.MustCompile(`^[0-9a-f]{12,32}$`)
 
@@ -38,7 +38,10 @@ type peerCtxKey struct{}
 
 // peerCaller is an authenticated peer machine (always by its pair token).
 type peerCaller struct {
-	name string
+	name       string
+	credential string
+	current    string
+	generation uint64
 }
 
 func peerOf(r *http.Request) peerCaller {
@@ -62,8 +65,9 @@ func (s *Server) peerProtocolRoutes() http.Handler {
 	mux.HandleFunc("GET /api/sessions", s.peerSessions)
 	mux.HandleFunc("POST /api/messages/incoming", s.peerIncoming)
 	mux.HandleFunc("POST /api/peers/pair-token", s.peerPairToken)
-	mux.HandleFunc("GET /api/gate/pin/record", s.peerPinRecord)            // ownerpin.go
-	mux.HandleFunc("POST /api/gate/pin/record", s.peerPinAdopt)            // ownerpin.go
+	mux.HandleFunc("GET /api/gate/pin/record", s.peerPinRecord) // ownerpin.go
+	mux.HandleFunc("POST /api/gate/pin/record", s.peerPinAdopt) // ownerpin.go
+	mux.HandleFunc("POST /api/peer/dictate", s.peerDictate)
 	mux.HandleFunc("POST /api/peer/summarize-local", s.peerSummarizeLocal) // summaries.go
 	return mux
 }
@@ -93,19 +97,15 @@ func (s *Server) servePeer(w http.ResponseWriter, r *http.Request, next http.Han
 		tok, _ = strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
 		tok = strings.TrimSpace(tok)
 	}
-	if tok == "" || !s.peers.Known(from) {
-		writeError(w, http.StatusUnauthorized, "missing or invalid peer token")
-		return
-	}
-	// Pair tokens only: the fleet token was retired fleet-wide on 1 Nov 2026 (the Python daemons
-	// refuse it too), so a machine joins through its own pair token (tmx peers import-python).
+	// Snapshot authentication and the current pair in the same mutation transaction.
+	s.peerEditMu.Lock()
 	owner, ok := s.peers.Tokens().Identify(tok)
-	if !ok {
+	current := s.peers.Tokens().For(from)
+	generation := s.peers.Tokens().Generation(from)
+	known := s.peers.Known(from)
+	s.peerEditMu.Unlock()
+	if tok == "" || !known || !ok || owner != from {
 		writeError(w, http.StatusUnauthorized, "missing or invalid peer token")
-		return
-	}
-	if owner != from {
-		writeError(w, http.StatusUnauthorized, "this token belongs to another machine")
 		return
 	}
 	// On-behalf is informational for ordinary reads and agent-operation routes (any value ->
@@ -124,12 +124,23 @@ func (s *Server) servePeer(w http.ResponseWriter, r *http.Request, next http.Han
 	if ob != "" && ob != "daemon" && ob != "operator" {
 		s.log.Debug("p2p: peer call with an unrecognised on-behalf", "peer", from, "on_behalf", ob, "path", r.URL.Path)
 	}
-	if peerProtocolPaths[r.URL.Path] || transferProtocolPath(r.URL.Path) {
-		c := peerCaller{name: from}
+	// POST /api/sessions is a launch (agent_controls.go), an ordinary agent operation like the
+	// others a peer reaches below: only GET on that path is the Python-shaped roster.
+	launch := r.Method == http.MethodPost && r.URL.Path == "/api/sessions"
+	if (peerProtocolPaths[r.URL.Path] && !launch) || transferProtocolPath(r.URL.Path) {
+		c := peerCaller{name: from, credential: tok, current: current, generation: generation}
 		s.peerMux.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), peerCtxKey{}, c)))
 		return
 	}
 	next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKey{}, fleet.PeerCaller(from))))
+}
+
+// relayedForOther reports whether a peer's request is relayed for someone other than the
+// machine itself or its operator (X-TMX-On-Behalf "agent:<name>", "device:<id>", anything
+// else): the one distinction a few routes make although the caller is a PeerCaller either way.
+func relayedForOther(r *http.Request) bool {
+	ob := strings.ToLower(strings.TrimSpace(r.Header.Get(peers.HeaderOnBehalf)))
+	return ob != "" && ob != "daemon" && ob != "operator"
 }
 
 // ownerMaterialRoute reports whether r reads or writes owner-controlled material (the PIN
@@ -170,41 +181,56 @@ func buildCommit() string {
 	return ""
 }
 
-// peerSessions is GET /api/sessions in the Python daemon's shape: this machine's agents.
+// peerSessions serves the established Python-shaped roster for peers and
+// other callers. Companion's local link gets a smaller roster by default.
 func (s *Server) peerSessions(w http.ResponseWriter, r *http.Request) {
-	snap, err := s.f.Snapshot()
+	caller, _ := caller(r)
+	if caller.Companion && wantsSessionStream(r) {
+		s.companionSessionStream(w, r)
+		return
+	}
+	roster, err := s.sessionRoster(caller.Companion && r.URL.Query().Get("scope") != "all")
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
-	host := snap.Machine
-	if s.peers != nil {
-		host = s.peers.Machine()
-	}
-	projects := map[string]string{}
-	for _, p := range snap.Projects {
-		projects[p.ID] = p.Name
-	}
-	agents := snap.Agents
-	if snap.Head != nil {
-		agents = append([]model.Agent{*snap.Head}, agents...)
-	}
-	seen := map[string]bool{}
-	rows := make([]map[string]any, 0, len(agents))
-	for _, a := range agents {
-		if seen[a.ID] {
-			continue
+	if caller.Companion {
+		if err := roster.page(r); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
 		}
-		seen[a.ID] = true
-		rows = append(rows, map[string]any{
-			"name": a.Name, "host": host, "id": a.ID, "adapter": string(a.Harness), "state": pythonState(a.State),
-			"title": a.Role, "role": a.Role, "queued_messages": a.Queued, "managed": true,
-			"rooms": []string{}, "tier": string(a.Level), "cwd": a.Cwd, "project": projects[a.ProjectID],
-			"conversation_id": a.SessionID, "started_at": float64(a.CreatedAt) / 1000,
-		})
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"host": host, "commit": buildCommit(), "version": s.f.Version(),
-		"sessions": rows, "supervisor": s.supervisorRef(host), "system": map[string]any{}})
+	writeJSON(w, http.StatusOK, roster)
+}
+
+// peerSystem is this machine's own reading for its peers (GET /api/sessions "system"), in the
+// Python daemons' field names (peers.System). Empty until the sampler has measured once, or
+// when resource control is not running: never a made-up zero.
+func (s *Server) peerSystem() peers.System {
+	var out peers.System
+	if s.res == nil {
+		return out
+	}
+	sample := s.res.View().Sample
+	if sample.At == 0 {
+		return out
+	}
+	m := sample.Machine
+	const mb = 1 << 20
+	cpu := min(max(m.CPU, 0), 100)
+	out.CPUPercent, out.CPUs, out.IOOverloaded = &cpu, m.Cores, m.Saturated
+	if m.MemTotal > 0 {
+		out.Memory = &peers.Memory{TotalMB: int64(m.MemTotal / mb), AvailableMB: int64(min(m.MemFree, m.MemTotal) / mb)}
+	}
+	if m.DiskWriteRate >= 0 { // -1 = this build cannot measure it
+		w := m.DiskWriteRate / mb
+		out.DiskWriteMBs = &w
+	}
+	if m.DiskTotal > 0 {
+		free, total := int64(min(m.DiskFree, m.DiskTotal)/mb), int64(m.DiskTotal/mb)
+		out.DiskFreeMB, out.DiskTotalMB = &free, &total
+	}
+	return out
 }
 
 // peerIncoming is POST /api/messages/incoming: a peer hands over mail for an agent here.
@@ -221,7 +247,7 @@ func (s *Server) peerIncoming(w http.ResponseWriter, r *http.Request) {
 		Urgent     bool    `json:"urgent"`
 		SHA256     string  `json:"sha256"`
 	}
-	if !decodeMax(w, r, &b, fleet.MaxBodyBytes*2+4096) {
+	if !decodeMax(w, r, &b, fleet.MaxPeerBodyBytes*2+4096) {
 		return
 	}
 	p := peerOf(r)
@@ -246,14 +272,34 @@ func (s *Server) peerIncoming(w http.ResponseWriter, r *http.Request) {
 	}
 	in := fleet.PeerInbound{Peer: p.name, ID: b.ID, Sender: strings.ToLower(b.Sender), SenderHost: p.name,
 		To: b.To, Body: b.Body, Urgent: b.Urgent}
+	// The attestation is a daemon-generated header, never a JSON claim or relay
+	// on-behalf label. The sending Go daemon sets it only for its own agent record.
+	if values := r.Header.Values(peers.HeaderVerifiedAgent); len(values) == 1 && values[0] == in.Sender &&
+		r.Header.Get(peers.HeaderOnBehalf) == "daemon" && b.SHA256 != "" && !fleet.ReservedAgentName(in.Sender) {
+		s.peerEditMu.Lock()
+		// The lock stays held through QueuePeer below.
+		who, valid := s.peers.Tokens().Identify(p.credential)
+		current := subtle.ConstantTimeCompare([]byte(p.credential), []byte(p.current)) == 1 && s.peers.Known(p.name) && valid && who == p.name && s.peers.Tokens().For(p.name) == p.current && s.peers.Tokens().Generation(p.name) == p.generation
+		if !current {
+			s.peerEditMu.Unlock()
+			writeError(w, http.StatusConflict, "peer relationship changed while receiving mail")
+			return
+		}
+		in.VerifiedSender = in.Sender
+		in.VerifiedGeneration = s.peers.Tokens().CredentialGeneration(p.name)
+	}
 	if b.ReplyTo != nil {
 		in.ReplyTo = *b.ReplyTo
 	}
-	m, _, err := s.f.DeliverPeer(in)
+	m, _, err := s.f.QueuePeer(in)
+	if in.VerifiedSender != "" {
+		s.peerEditMu.Unlock()
+	}
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
+	s.f.DeliverQueuedPeer(m)
 	writeJSON(w, http.StatusCreated, map[string]any{"id": b.ID, "state": string(m.State)})
 }
 
@@ -278,7 +324,14 @@ func (s *Server) peerPairToken(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "role: full")
 		return
 	}
-	fp, err := s.peers.Tokens().Store(p.name, b.Token, p.name)
+	s.peerEditMu.Lock()
+	defer s.peerEditMu.Unlock()
+	who, valid := s.peers.Tokens().Identify(p.credential)
+	if !s.peers.Known(p.name) || !valid || who != p.name {
+		writeError(w, http.StatusConflict, "peer relationship changed; stale rotation refused")
+		return
+	}
+	fp, err := s.peers.Tokens().StoreIfCurrentLocked(p.name, b.Token, p.name, p.current, p.generation)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -308,6 +361,10 @@ func (s *Server) peerRotate(w http.ResponseWriter, r *http.Request) {
 	}
 	fp, err := s.peers.RotateWith(r.Context(), name)
 	if err != nil {
+		if errors.Is(err, peers.ErrStalePair) {
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
 		var refused peers.Refused
 		if errors.As(err, &refused) {
 			writeError(w, http.StatusBadGateway, err.Error())

@@ -17,7 +17,8 @@ func TestTmxProcessNameIsNotACommand(t *testing.T) {
 			t.Errorf("%q: got %s/%s (%s)", c, v.Outcome, v.Rule, v.Detail)
 		}
 	}
-	// A real invocation still counts.
+	// A real invocation still counts (tmx-cli is Allowed by default: held here to see it).
+	ctx.States[RuleTmxCLI] = Hold
 	if v := CheckCommand(ctx, ShellPowerShell, `& C:\Users\user\Documents\tmxgo-trial\bin\tmx-go.exe approve k2`); v.Rule != RuleTmxCLI {
 		t.Fatalf("real tmx-go call: %+v", v)
 	}

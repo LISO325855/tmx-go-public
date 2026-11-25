@@ -1,6 +1,7 @@
 package fleet
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -9,8 +10,10 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"time"
 
+	"github.com/blackcode-ch/tmx-go/internal/claudeext"
 	"github.com/blackcode-ch/tmx-go/internal/codexguard"
 	"github.com/blackcode-ch/tmx-go/internal/config"
 	"github.com/blackcode-ch/tmx-go/internal/model"
@@ -34,6 +37,9 @@ const (
 func (f *Fleet) StartAgent(c Caller, idOrName string) (model.Agent, error) {
 	id, err := f.authorizeAct(c, idOrName)
 	if err != nil {
+		return model.Agent{}, err
+	}
+	if err := f.agentStartsShell(c, id); err != nil {
 		return model.Agent{}, err
 	}
 	if err := f.startAgentOpts(id, "", startOpts{deliberate: true}); err != nil {
@@ -72,6 +78,9 @@ func (f *Fleet) RestartAgentWith(c Caller, idOrName string, o RestartOptions) (m
 	if err != nil {
 		return model.Agent{}, err
 	}
+	if err := f.agentStartsShell(c, id); err != nil {
+		return model.Agent{}, err
+	}
 	keep := f.holdsCapacity(id) // a running agent keeps its place
 	f.mu.Lock()
 	if r := f.agents[id]; r != nil {
@@ -83,18 +92,38 @@ func (f *Fleet) RestartAgentWith(c Caller, idOrName string, o RestartOptions) (m
 	if err != nil {
 		return model.Agent{}, err
 	}
-	f.stopProcess(f.ctx, id, true)
+	// An explicit restart may end an unknown hosted agent; daemon shutdown
+	// must still leave such hosts alone.
+	f.stopProcessChecked(f.ctx, id, true, true, nil)
+	f.mu.Lock()
+	r := f.agents[id]
+	if r != nil && (r.hostUnknown || r.hostStopping) {
+		why := r.a.Error
+		f.mu.Unlock()
+		return model.Agent{}, errf(KindConflict, "restart could not stop the session host: %s", why)
+	}
+	f.mu.Unlock()
 	prompt := ""
 	if o.Fresh {
 		if err := f.freshenSessionLocked(id); err != nil {
 			return model.Agent{}, err
 		}
-		prompt = o.Prompt
+		f.mu.Lock()
+		prompt = f.agentPromptLocked(c, o.Prompt)
+		f.mu.Unlock()
 	}
 	if err := f.startAgentOpts(id, prompt, startOpts{StartOptions: StartOptions{Force: keep}, deliberate: true}); err != nil {
 		return model.Agent{}, err
 	}
 	return f.Agent(id)
+}
+
+// agentPromptLocked renders an authenticated local agent's launch or restart text as mail.
+func (f *Fleet) agentPromptLocked(c Caller, text string) string {
+	if c.AgentID == "" || text == "" {
+		return text
+	}
+	return f.mailLineLocked(model.Message{From: c.AgentID, Body: runner.PlainText(text)})
 }
 
 // freshenSessionLocked clears an agent's session identity so its next start begins a brand-new
@@ -137,15 +166,17 @@ func (f *Fleet) InterruptAgent(c Caller, idOrName string) (model.Agent, error) {
 	return f.Agent(id)
 }
 
-// RemoveAgent stops and deletes an agent and everything below it (owner only). The head
+// RemoveAgent stops and deletes an agent and everything below it: the owner, the head, or a
+// lead for an agent of its own project (manage.go). The head
 // cannot be removed.
 func (f *Fleet) RemoveAgent(c Caller, idOrName string) error {
-	if !c.Owner {
-		return errf(KindForbidden, "only the owner can remove agents")
-	}
 	f.mu.Lock()
 	r, err := f.resolveLocked(idOrName)
 	if err != nil {
+		f.mu.Unlock()
+		return err
+	}
+	if err := f.manageAgentLocked(c, r, "remove an agent"); err != nil {
 		f.mu.Unlock()
 		return err
 	}
@@ -183,6 +214,7 @@ func (f *Fleet) removeOne(id string) {
 		return
 	}
 	delete(f.agents, id)
+	f.opts.Rules.Forget(id) // rules.go: the commit its instructions were built from
 	if r.token != "" {
 		delete(f.tokens, r.token)
 	}
@@ -225,6 +257,7 @@ func (f *Fleet) authorizeAct(c Caller, idOrName string) (string, error) {
 func (f *Fleet) startAgent(id, prompt string) error { return f.startAgentOpts(id, prompt, startOpts{}) }
 
 func (f *Fleet) startAgentOpts(id, prompt string, o startOpts) error {
+	ext := f.profileServers(id) // before mu: it may run claude
 	f.mu.Lock()
 	r, ok := f.agents[id]
 	if !ok {
@@ -234,6 +267,10 @@ func (f *Fleet) startAgentOpts(id, prompt string, o startOpts) error {
 	if f.closed {
 		f.mu.Unlock()
 		return errf(KindConflict, "the daemon is shutting down")
+	}
+	if r.accountSwitch && !o.accountSwitch {
+		f.mu.Unlock()
+		return errf(KindConflict, "a Claude account switch is already in progress")
 	}
 	if o.recovery != nil {
 		if r != o.recovery || !r.recovery.pending || r.recovery.generation != o.recoveryGeneration || r.a.Desired != "running" || r.proc != nil || r.starting {
@@ -256,10 +293,11 @@ func (f *Fleet) startAgentOpts(id, prompt string, o startOpts) error {
 		return err
 	}
 	if o.reattach || r.hostUnknown {
-		if ok, err := f.reattachLocked(r); ok || err != nil {
+		if ok, err := f.reattachLocked(r, ext); ok || err != nil {
 			return err // f.mu released
 		}
 	}
+	prompt = shellStartCommand(r.a, prompt) // a new shell process runs its start command again
 	wasShelved, wasDone := r.a.ShelvedAt, r.a.DoneAt
 	if o.deliberate {
 		r.recovery.cancel(true)
@@ -284,8 +322,10 @@ func (f *Fleet) startAgentOpts(id, prompt string, o startOpts) error {
 	}
 	r.token = config.NewToken()
 	f.tokens[r.token] = id
-	spec, err := f.specLocked(r)
+	f.dropPhantomSessionLocked(r) // resume_fallback.go: nothing to resume yet
+	spec, err := f.specLocked(r, ext)
 	if err != nil {
+		f.deleteCodexGuardAuth(id)
 		r.a.State, r.a.Error = model.StateError, err.Error()
 		f.saveAgentLocked(r)
 		f.mu.Unlock()
@@ -297,6 +337,8 @@ func (f *Fleet) startAgentOpts(id, prompt string, o startOpts) error {
 	}
 	r.starting, r.stopping = true, false
 	r.a.Desired, r.a.State, r.a.Error = "running", model.StateStarting, ""
+	r.updateActivity, r.updateIdleAt = time.Now(), time.Time{}
+	r.updateTurnActivity = r.updateActivity
 	f.saveAgentLocked(r)
 	f.mu.Unlock()
 
@@ -305,13 +347,17 @@ func (f *Fleet) startAgentOpts(id, prompt string, o startOpts) error {
 	f.mu.Lock()
 	r.starting = false
 	if f.agents[id] != r { // removed while starting
+		if proc == nil && f.agents[id] == nil {
+			f.deleteCodexGuardAuth(id)
+		}
 		f.mu.Unlock()
 		if proc != nil {
-			f.drainAndStop(proc)
+			f.drainAndStop(id, proc)
 		}
 		return errf(KindNotFound, "the agent was removed while starting")
 	}
 	if err != nil {
+		f.deleteCodexGuardAuth(id)
 		r.a.State, r.a.Error = model.StateError, "start failed: "+err.Error()
 		f.appendLocked(r, model.TimelineEntry{Kind: model.EntryError, Text: r.a.Error, IsError: true})
 		f.saveAgentLocked(r)
@@ -319,6 +365,7 @@ func (f *Fleet) startAgentOpts(id, prompt string, o startOpts) error {
 		return errf(KindInternal, "%s", r.a.Error)
 	}
 	r.proc, r.done = proc, make(chan struct{})
+	r.procStarted = model.Now()
 	r.instructionsDue = r.sessionConfirmed // a resumed conversation: see instructionsLocked
 	r.a.PID = proc.PID()
 	f.saveAgentLocked(r)
@@ -351,6 +398,10 @@ func (f *Fleet) stopProcess(ctx context.Context, id string, keepDesired bool) {
 // check runs under the same lock as stop admission: fresh activity, protection,
 // or a new runner cannot race an automatic shelving decision.
 func (f *Fleet) stopProcessIf(ctx context.Context, id string, keepDesired bool, check func(*agentRec) bool) {
+	f.stopProcessChecked(ctx, id, keepDesired, !keepDesired, check)
+}
+
+func (f *Fleet) stopProcessChecked(ctx context.Context, id string, keepDesired, stopUnknown bool, check func(*agentRec) bool) {
 	f.mu.Lock()
 	r, ok := f.agents[id]
 	if !ok || (check != nil && !check(r)) {
@@ -362,11 +413,12 @@ func (f *Fleet) stopProcessIf(ctx context.Context, id string, keepDesired bool, 
 		r.a.Desired = "stopped"
 	}
 	f.beforeStopLocked(r)
+	f.stopHoldsLocked(id) // guard.go: a hook waiting on a hold would keep the harness from exiting
 	// Serialize ownership transfers with stop. This also covers already-exited agents.
 	f.processes.StopOwner(id)
 	proc, done := r.proc, r.done
 	if proc == nil {
-		if r.hostUnknown && !keepDesired {
+		if r.hostUnknown && stopUnknown {
 			// Its host may still run the agent: the owner's stop ends it there (hosting.go).
 			// No start meanwhile (hostStopping): it could make a second copy.
 			r.hostUnknown, r.hostStopping = false, true
@@ -378,11 +430,11 @@ func (f *Fleet) stopProcessIf(ctx context.Context, id string, keepDesired bool, 
 		if !r.starting && r.a.State != model.StateStopped && r.a.State != model.StateError {
 			r.a.State = model.StateStopped
 		}
-		f.saveAgentLocked(r)
-		f.mu.Unlock()
-		if !keepDesired {
+		if !r.starting && !r.hostUnknown && !r.hostStopping && !r.detaching {
 			f.deleteCodexGuardAuth(id)
 		}
+		f.saveAgentLocked(r)
+		f.mu.Unlock()
 		return
 	}
 	r.stopping = true
@@ -399,9 +451,8 @@ func (f *Fleet) stopProcessIf(ctx context.Context, id string, keepDesired bool, 
 	case <-time.After(stopWaitMax):
 		f.log.Warn("agent event loop did not end after stop", "agent", id)
 	}
-	if !keepDesired {
-		f.deleteCodexGuardAuth(id)
-	}
+	// Confirmed exit cleanup runs in handleExit under mu. A timed-out Stop
+	// must not delete credentials from a still-running or replacement process.
 }
 
 // deleteCodexGuardAuth removes a stopped (or soon-to-be-removed) agent's isolated copy of the
@@ -409,26 +460,110 @@ func (f *Fleet) stopProcessIf(ctx context.Context, id string, keepDesired bool, 
 // SyncOwnerAuth makes a fresh one at the next launch or resume. A no-op for agents that never
 // had Windows Codex parity set up.
 func (f *Fleet) deleteCodexGuardAuth(id string) {
+	f.deleteProfileMCPAuth(id)
 	home := filepath.Join(f.opts.Paths.AgentDir(id), "codex-guard", "home")
+	if err := codexguard.DeleteOwnerAuth(filepath.Join(f.opts.Paths.AgentDir(id), "codex-profile")); err != nil {
+		f.log.Warn("delete codex profile auth copy", "agent", id, "err", err)
+	}
 	if err := codexguard.DeleteOwnerAuth(home); err != nil {
 		f.log.Warn("delete codex-guard auth copy", "agent", id, "err", err)
 	}
 }
 
 // drainAndStop stops a process nobody tracks (its agent vanished) and drains its events.
-func (f *Fleet) drainAndStop(proc runner.Process) {
+func (f *Fleet) drainAndStop(id string, proc runner.Process) {
 	go func() {
 		for range proc.Events() {
 		}
+		f.mu.Lock()
+		if f.agents[id] == nil {
+			f.deleteCodexGuardAuth(id)
+		}
+		f.mu.Unlock()
 	}()
 	ctx, cancel := context.WithTimeout(context.Background(), stopGrace)
 	defer cancel()
 	_ = proc.Stop(ctx)
 }
 
+// extServers are the Claude Code MCP servers an agent's profile adds: their configs, and the
+// ids Claude Code does not have (any more).
+type extServers struct {
+	ids     []string
+	configs map[string]json.RawMessage
+	missing []string
+}
+
+// profileServers reads profile selection under mu and asks Claude Code outside it.
+func (f *Fleet) profileServers(id string) extServers {
+	f.mu.Lock()
+	var ids []string
+	if r, ok := f.agents[id]; ok {
+		ids = slices.Clone(f.profileForLocked(r.a).MCPServers)
+	}
+	f.mu.Unlock()
+	out := extServers{ids: ids, configs: map[string]json.RawMessage{}}
+	if len(ids) == 0 {
+		return out
+	}
+	if f.opts.ClaudeExt == nil {
+		out.missing = ids
+		return out
+	}
+	inv := f.opts.ClaudeExt.Inventory(f.ctx, false)
+	for _, sid := range ids {
+		if c, ok := inv.Config(sid); ok {
+			out.configs[sid] = c
+		} else {
+			out.missing = append(out.missing, sid)
+		}
+	}
+	return out
+}
+
+// The two per-agent values a profile server's config may name: tmx fills them when it copies
+// the config into the agent's mcp.json, so one server entry serves every agent of a profile
+// (e.g. "env": {"COMPANION_MCP_AGENT": "${TMXG_AGENT_NAME}"}).
+const (
+	fillAgentName = "${TMXG_AGENT_NAME}"
+	fillAgentID   = "${TMXG_AGENT_ID}"
+)
+
+// filledFor returns ext with the agent's name and id filled into the servers' configs.
+func (ext extServers) filledFor(a model.Agent) extServers {
+	if len(ext.configs) == 0 {
+		return ext
+	}
+	esc := func(s string) []byte {
+		b, _ := json.Marshal(s)
+		return b[1 : len(b)-1] // the configs are JSON: the value goes inside a string
+	}
+	name, id := esc(a.Name), esc(a.ID)
+	out := ext
+	out.configs = make(map[string]json.RawMessage, len(ext.configs))
+	for sid, c := range ext.configs {
+		c = bytes.ReplaceAll(c, []byte(fillAgentName), name)
+		out.configs[sid] = bytes.ReplaceAll(c, []byte(fillAgentID), id)
+	}
+	return out
+}
+
 // specLocked builds the runner.Spec and writes the agent's mcp.json.
-func (f *Fleet) specLocked(r *agentRec) (runner.Spec, error) {
+func (f *Fleet) specLocked(r *agentRec, ext extServers) (runner.Spec, error) {
+	r.a.MCPWarnings = nil
+	defer func() {
+		p := f.decorate(f.profileForLocked(r.a))
+		f.bus.Publish(model.BusEvent{Type: model.EvProfileUpdated, Data: p})
+	}()
 	a := r.a
+	for _, sid := range ext.missing {
+		f.mcpWarningLocked(r, sid+" not available for "+string(a.Harness)+" agents: Claude Code has no MCP server "+sid+".")
+	}
+	if a.Harness == model.HarnessShell {
+		for _, sid := range ext.ids {
+			f.mcpWarningLocked(r, sid+" not available for shell agents: this harness has no MCP client.")
+		}
+	}
 	if err := f.launchAdmissionLocked(a); err != nil {
 		return runner.Spec{}, err
 	}
@@ -446,11 +581,40 @@ func (f *Fleet) specLocked(r *agentRec) (runner.Spec, error) {
 	if f.hostedLocked(a) {
 		spec.HostDir, spec.HostExe, spec.HostToken = f.hostDir(a.ID), f.opts.HostExecutable, r.token
 	}
+	if a.Harness != model.HarnessShell {
+		suffix := ""
+		if a.Harness == model.HarnessClaude {
+			if p := projectMemoryFor(a.Cwd).prompt(); p != "" {
+				suffix = "\n" + p
+			}
+		}
+		var err error
+		spec.SystemPrompt, spec.SystemPromptFile, err = f.agentInstructionsLocked(a, suffix)
+		if err != nil {
+			return runner.Spec{}, err
+		}
+	}
 	if a.Harness != model.HarnessClaude {
 		spec.Env = append(spec.Env, f.accountEnvLocked(a)...)
 		spec = f.harnessSpecLocked(r, spec)
+		if a.Harness != model.HarnessShell {
+			spec.ProfileMCP = f.profileStdioLocked(r, ext.filledFor(a))
+			if err := f.otherMCPConfigLocked(r, &spec); err != nil {
+				f.mcpWarningLocked(r, "Profile MCP tools not available for "+string(a.Harness)+" agents: config could not be written.")
+				return runner.Spec{}, err
+			}
+		}
 		if err := f.guardSpecLocked(r, &spec); err != nil {
 			return runner.Spec{}, err
+		}
+		if a.Harness == model.HarnessCodex && spec.CodexGuardHome == "" {
+			if err := f.codexProfileHomeLocked(r, &spec, len(ext.ids) > 0); err != nil {
+				f.mcpWarningLocked(r, "Profile MCP tools not available for codex agents: private config or authentication setup failed.")
+				return runner.Spec{}, err
+			}
+		}
+		if a.Harness == model.HarnessCodex && spec.CodexGuardHome != "" {
+			f.carryCodexRolloutLocked(r, codexAgentHome(spec.CodexGuardHome)) // codex_carry.go
 		}
 		return spec, nil
 	}
@@ -487,12 +651,19 @@ func (f *Fleet) specLocked(r *agentRec) (runner.Spec, error) {
 			}
 		}
 	}
-	spec.SystemPrompt = f.systemPromptLocked(a)
+	// The project's CLAUDE.md (project_memory.go): the agent is told to read it. Claude is
+	// never started with the "project" setting source: that also applies the folder's
+	// settings, skills, commands and agents, and settings reload while Claude runs.
+	spec.ProjectSource = false
 	// Files the owner attaches land in uploads/<id>; claude may read them without asking.
 	if up := filepath.Join(f.opts.Paths.UploadsDir(), a.ID); os.MkdirAll(up, 0o700) == nil {
 		spec.AddDirs = append(spec.AddDirs, up)
 	}
-	path, err := f.writeMCPConfig(a.ID, env)
+	if len(ext.missing) > 0 {
+		f.appendLocked(r, model.TimelineEntry{Kind: model.EntrySystem, Text: "Claude Code has no MCP server " +
+			strings.Join(ext.missing, ", ") + " (the profile " + prof.Name + " adds it); started without it."})
+	}
+	path, err := f.writeMCPConfig(a.ID, env, ext.filledFor(a))
 	if err != nil {
 		return runner.Spec{}, err
 	}
@@ -527,10 +698,12 @@ func newUUID() string {
 	return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:]
 }
 
-// writeMCPConfig writes agents/<id>/mcp.json: the tmx binary itself as stdio server "tmx".
-// The file holds the agent's token, so it is a secret file (private to the user), and is
-// rewritten (new token) on every start.
-func (f *Fleet) writeMCPConfig(id string, env []string) (string, error) {
+// writeMCPConfig writes agents/<id>/mcp.json: the tmx binary itself as stdio server "tmxg",
+// then the Claude Code servers the profile adds (a plugin's under its own name unless that is
+// taken or reserved). The tmxg entry is always written and never replaced. The file holds the
+// agent's token (and maybe the servers' secrets), so it is a secret file (private to the user),
+// and is rewritten (new token) on every start.
+func (f *Fleet) writeMCPConfig(id string, env []string, ext extServers) (string, error) {
 	envMap := map[string]string{}
 	for _, kv := range env {
 		for i := 0; i < len(kv); i++ {
@@ -540,9 +713,13 @@ func (f *Fleet) writeMCPConfig(id string, env []string) (string, error) {
 			}
 		}
 	}
-	cfg := map[string]any{"mcpServers": map[string]any{
+	servers := map[string]any{
 		"tmxg": map[string]any{"type": "stdio", "command": f.opts.Executable, "args": []string{"mcp"}, "env": envMap},
-	}}
+	}
+	for key, c := range ext.namedConfigs() {
+		servers[key] = c
+	}
+	cfg := map[string]any{"mcpServers": servers}
 	b, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return "", err
@@ -553,4 +730,28 @@ func (f *Fleet) writeMCPConfig(id string, env []string) (string, error) {
 	}
 	path := filepath.Join(dir, "mcp.json")
 	return path, config.WriteSecretFile(path, b)
+}
+
+// namedConfigs shares Claude's collision and reserved-name rules with other harnesses.
+func (ext extServers) namedConfigs() map[string]json.RawMessage {
+	servers := map[string]json.RawMessage{}
+	for _, sid := range ext.ids {
+		c, ok := ext.configs[sid]
+		if !ok {
+			continue
+		}
+		key := sid
+		if rest, ok := strings.CutPrefix(sid, claudeext.PluginPrefix); ok {
+			_, srv, _ := strings.Cut(rest, ":")
+			key = srv
+			if _, taken := servers[key]; taken || claudeext.Reserved(key) || slices.Contains(ext.ids, key) {
+				key = strings.ReplaceAll(rest, ":", "-")
+			}
+		}
+		if _, taken := servers[key]; taken || claudeext.Reserved(key) {
+			continue
+		}
+		servers[key] = c
+	}
+	return servers
 }

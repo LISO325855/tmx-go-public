@@ -95,16 +95,18 @@ type Service struct {
 	o   Options
 	log *slog.Logger
 
-	mu        sync.Mutex
-	running   string          // the recording whose summary Claude writes now ("" = none)
-	again     map[string]bool // a new transcription began while its summary ran: once more after
-	voiceWait map[string]bool // recordings to transcribe once voice is set up (no summary wanted)
-	setupAt   time.Time       // when voice was last set up for a recording (zero: not since the last new one)
-	dropped   map[string]bool // optional claude flags this claude does not know
+	mu            sync.Mutex
+	runningCancel context.CancelFunc // cancels the current report at its final deadline
+	running       string             // the recording whose summary Claude writes now ("" = none)
+	again         map[string]bool    // a new transcription began while its summary ran: once more after
+	voiceWait     map[string]bool    // recordings to transcribe once voice is set up (no summary wanted)
+	setupAt       time.Time          // when voice was last set up for a recording (zero: not since the last new one)
+	dropped       map[string]bool    // optional claude flags this claude does not know
 
-	peerSlot           chan struct{}     // ServePeer: one peer generate at a time
-	wroteBy            string            // the model that wrote the latest answer (wrote)
-	madeHere           map[string]string // FinishedHere: why the daemon made the report, not its worker
+	peerSlot           chan struct{}              // ServePeer: one peer generate at a time
+	wroteBy            string                     // the model that wrote the latest answer (wrote)
+	missingAttempts    map[string]transcriptRetry // failed initial enqueues, by recording
+	lateResends        map[string]int64           // queued events from the watcher's final resends
 	wakeWatch, wakeRun chan struct{}
 	ctx                context.Context
 	cancel             context.CancelFunc
@@ -132,7 +134,8 @@ func New(o Options) *Service {
 		o.CheckEvery = 10 * time.Second
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Service{o: o, log: o.Logger, again: map[string]bool{}, voiceWait: map[string]bool{}, dropped: map[string]bool{}, madeHere: map[string]string{},
+	return &Service{o: o, log: o.Logger, again: map[string]bool{}, voiceWait: map[string]bool{}, dropped: map[string]bool{},
+		missingAttempts: map[string]transcriptRetry{}, lateResends: map[string]int64{},
 		wakeWatch: make(chan struct{}, 1), wakeRun: make(chan struct{}, 1), peerSlot: make(chan struct{}, 1), ctx: ctx, cancel: cancel}
 }
 
@@ -144,12 +147,21 @@ func (s *Service) Start() error {
 	} else if n > 0 {
 		s.log.Info("summaries: removed those of deleted recordings", "n", n)
 	}
-	cut, err := s.o.Store.SummariesIn(model.SummaryRunning)
+	cut, err := s.o.Store.SummariesIn(model.SummaryRunning, model.SummaryTranscribing)
 	if err != nil {
 		return err
 	}
 	for _, x := range cut {
-		x.State, x.UpdatedAt = model.SummaryQueued, s.now()
+		switch {
+		case x.AwaitingWorker:
+			x.AwaitingWorker, x.Note = false, ""
+			x.MadeHere = "the daemon restarted before the report worker asked to make it"
+		case x.State == model.SummaryRunning:
+			x.State = model.SummaryQueued
+		default:
+			continue
+		}
+		x.UpdatedAt = s.now()
 		if err := s.o.Store.PutSummary(x); err != nil {
 			return err
 		}
@@ -295,34 +307,76 @@ func (s *Service) Configure(p SettingsPatch) (Settings, error) {
 // Finished is the recorder's hook: a recording is done. It queues the transcription (when that is
 // automatic) and the summary (when that is), and returns at once.
 func (s *Service) Finished(r model.Recording) {
+	s.finished(r, "", 0)
+}
+
+// FinishedHere hands the report to the same pipeline when its worker could
+// not finish. An existing report keeps its place in the pipeline.
+func (s *Service) FinishedHere(r model.Recording, why string) {
+	s.finished(r, why, 0)
+}
+
+// FinishReport queues or continues a recording-worker report with a durable final deadline.
+func (s *Service) FinishReport(r model.Recording, why string, deadline time.Time) {
+	s.finished(r, why, deadline.UnixMilli())
+}
+
+// ReserveReport persists the deadline before the worker starts. It enters the
+// pipeline when the worker asks, when it falls back, or on daemon startup.
+func (s *Service) ReserveReport(r model.Recording, deadline time.Time) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, err := s.o.Store.GetSummary(r.ID); !errors.Is(err, store.ErrNotFound) {
+		return false, err
+	}
+	now := s.now()
+	x := model.RecordingSummary{RecordingID: r.ID, State: model.SummaryTranscribing,
+		CreatedAt: now, UpdatedAt: now, DeadlineAt: deadline.UnixMilli(), AwaitingWorker: true,
+		Note: "Waiting for the report worker to start."}
+	if err := s.saveLocked(x); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (s *Service) finished(r model.Recording, why string, deadline int64) {
 	if r.State != model.RecordingDone {
 		return // live, interrupted or failed recordings are left alone (Summarize does them by hand)
 	}
-	auto := s.settings().AutoOn()
+	auto := s.settings().AutoOn() || deadline != 0
 	autoTr := s.o.Voice != nil && s.o.Voice.AutoTranscribe()
 	if !auto && !autoTr {
 		return
 	}
 	s.mu.Lock()
-	s.setupAt = time.Time{} // a new recording may try setting voice up again
 	if auto {
-		if _, err := s.requestLocked(r.ID, false); err != nil {
-			s.log.Warn("summaries: queue", "id", r.ID, "err", err)
+		x, err := s.o.Store.GetSummary(r.ID)
+		switch {
+		case errors.Is(err, store.ErrNotFound):
+			s.setupAt = time.Time{} // a new recording may try setting voice up again
+			if _, err = s.requestLocked(r.ID, false, deadline, why); err != nil {
+				s.log.Warn("summaries: queue", "id", r.ID, "err", err)
+			}
+		case err != nil:
+			s.log.Warn("summaries: read", "id", r.ID, "err", err)
+		case x.AwaitingWorker && x.State.Pending():
+			s.setupAt = time.Time{}
+			x.AwaitingWorker, x.Note, x.MadeHere, x.UpdatedAt = false, "", why, s.now()
+			if err := s.saveLocked(x); err != nil {
+				s.log.Warn("summaries: start reserved report", "id", r.ID, "err", err)
+			}
+		case deadline != 0 && x.State.Pending() && !x.Requested && x.DeadlineAt == 0:
+			x.DeadlineAt = deadline
+			if err := s.saveLocked(x); err != nil {
+				s.log.Warn("summaries: save report deadline", "id", r.ID, "err", err)
+			}
 		}
 	} else {
+		s.setupAt = time.Time{}
 		s.voiceWait[r.ID] = true
 	}
 	s.mu.Unlock()
 	s.kick()
-}
-
-// FinishedHere is Finished when the daemon makes the report itself because its worker could not (recworker):
-// the report says so ("Made by the daemon: <why>.").
-func (s *Service) FinishedHere(r model.Recording, why string) {
-	s.mu.Lock()
-	s.madeHere[r.ID] = why
-	s.mu.Unlock()
-	s.Finished(r)
 }
 
 // Summarize (re)makes a recording's summary on the owner's request: it transcribes what is not
@@ -342,7 +396,7 @@ func (s *Service) Summarize(id string) (model.RecordingSummary, error) {
 		return model.RecordingSummary{}, &fleet.Error{Kind: fleet.KindConflict, Msg: "Claude is writing this summary now; wait for it"}
 	}
 	s.setupAt = time.Time{}
-	x, err := s.requestLocked(id, true)
+	x, err := s.requestLocked(id, true, 0, "")
 	s.mu.Unlock()
 	if err != nil {
 		return x, err
@@ -353,7 +407,7 @@ func (s *Service) Summarize(id string) (model.RecordingSummary, error) {
 
 // requestLocked puts a recording's summary in line: it waits for the transcripts first. The
 // previous summary's text stays until the new one replaces it.
-func (s *Service) requestLocked(id string, requested bool) (model.RecordingSummary, error) {
+func (s *Service) requestLocked(id string, requested bool, deadline int64, why string) (model.RecordingSummary, error) {
 	now := s.now()
 	x, err := s.o.Store.GetSummary(id)
 	switch {
@@ -362,7 +416,8 @@ func (s *Service) requestLocked(id string, requested bool) (model.RecordingSumma
 	case err != nil:
 		return x, err
 	}
-	x.State, x.Error, x.Note, x.Requested, x.UpdatedAt = model.SummaryTranscribing, "", "", requested, now
+	x.State, x.Error, x.Note, x.Requested, x.UpdatedAt, x.DeadlineAt = model.SummaryTranscribing, "", "", requested, now, deadline
+	x.AwaitingWorker, x.MadeHere = false, why
 	return x, s.saveLocked(x)
 }
 
@@ -389,8 +444,16 @@ func (s *Service) Observe(ev model.BusEvent) {
 		if !ok {
 			return
 		}
-		if t.State == model.TranscriptQueued {
-			s.retranscribed(id)
+		switch t.State {
+		case model.TranscriptQueued, model.TranscriptDone, model.TranscriptFailed:
+			s.mu.Lock()
+			resendAt := s.lateResends[t.Source]
+			delete(s.lateResends, t.Source)
+			s.mu.Unlock()
+			if t.State == model.TranscriptQueued &&
+				(resendAt == 0 || t.CreatedAt < resendAt || t.UpdatedAt != t.CreatedAt) {
+				s.retranscribed(id)
+			}
 		}
 		s.kickWatch()
 	case model.EvVoiceStatus:
@@ -409,6 +472,13 @@ func (s *Service) Observe(ev model.BusEvent) {
 		s.mu.Lock()
 		delete(s.voiceWait, id)
 		delete(s.again, id)
+		delete(s.missingAttempts, id)
+		for source := range s.lateResends {
+			recording, _, _ := ParseSource(source)
+			if recording == id {
+				delete(s.lateResends, source)
+			}
+		}
 		s.mu.Unlock()
 		if err := s.o.Store.DeleteSummary(id); err != nil {
 			s.log.Warn("summaries: delete", "id", id, "err", err)
@@ -432,13 +502,16 @@ func (s *Service) retranscribed(id string) {
 		if x.State == model.SummaryTranscribing {
 			return
 		}
+		if !x.State.Pending() {
+			x.DeadlineAt = 0
+		}
 		x.State, x.Error, x.UpdatedAt = model.SummaryTranscribing, "", s.now()
 		if err := s.saveLocked(x); err != nil {
 			s.log.Warn("summaries: save", "id", id, "err", err)
 		}
 	case errors.Is(err, store.ErrNotFound) && s.settings().AutoOn():
 		if r, err := s.o.Recordings.Get(id); err == nil && r.State == model.RecordingDone {
-			if _, err := s.requestLocked(id, false); err != nil {
+			if _, err := s.requestLocked(id, false, 0, ""); err != nil {
 				s.log.Warn("summaries: queue", "id", id, "err", err)
 			}
 		}
@@ -459,29 +532,6 @@ func (s *Service) Get(id string) (model.RecordingSummary, error) {
 		return x, nil
 	}
 	return x, err
-}
-
-// Fail marks a recording's report failed with reason (internal/recworker: its worker failed or ran out of
-// time). A summary being written right now, or already finished, is left alone: that outcome is the truth.
-// It reports whether the summary was marked.
-func (s *Service) Fail(id, reason string) (bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.running == id {
-		return false, nil
-	}
-	x, err := s.o.Store.GetSummary(id)
-	switch {
-	case errors.Is(err, store.ErrNotFound):
-		x = model.RecordingSummary{RecordingID: id, CreatedAt: s.now()}
-	case err != nil:
-		return false, err
-	case !x.State.Pending():
-		return false, nil
-	}
-	delete(s.voiceWait, id)
-	x.State, x.Error, x.Note, x.UpdatedAt = model.SummaryFailed, reason, "", s.now()
-	return true, s.saveLocked(x)
 }
 
 // Attach fills each recording's Summary and SummaryState (lists and reads of recordings).

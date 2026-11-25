@@ -2,7 +2,6 @@ package companion_test
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -202,76 +201,27 @@ func TestHeadAnswersCompanionsQuestion(t *testing.T) {
 	}
 }
 
-func TestHeadMessageThatActsWaitsForOwner(t *testing.T) {
+// A money word in the head's message makes no card (it did until 17 Nov): the message is a
+// conversation, Companion is told not to act because of it, and it goes at once.
+func TestHeadMessageWithMoneyWordsGoesAtOnce(t *testing.T) {
 	d, f := connected(t)
 	head := d.Fleet.HeadID()
 	task, err := d.Companion.SendHeadMessage(head, "Please pay the electricity invoice today", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if task.State != model.CompanionAwaitingApproval || task.Effects != model.EffectsMoney || task.ApprovalID == "" {
+	if task.State != model.CompanionQueued || task.Effects != model.EffectsMoney || task.ApprovalID != "" {
 		t.Fatalf("message: %+v", task)
 	}
-	ap, err := d.Fleet.ApprovalByID(task.ApprovalID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var in model.CompanionApprovalInput
-	if err := json.Unmarshal(ap.Input, &in); err != nil {
-		t.Fatal(err)
-	}
-	if ap.Kind != model.ApprovalCompanion || ap.Tool != model.ToolCompanionMessage || ap.AgentID != head ||
-		ap.Question != "Please pay the electricity invoice today" || in.Text != task.Text || in.TaskID != task.ID || in.Effects != model.EffectsMoney {
-		t.Fatalf("approval: %+v %+v", ap, in)
-	}
-	time.Sleep(50 * time.Millisecond)
-	if f.SentCount() != 0 {
-		t.Fatal("a message waiting for the owner reached Companion")
-	}
-	if _, err := d.Fleet.Decide(fleet.OwnerCaller, ap.ID, fleet.DecideRequest{Decision: "allow"}); err != nil {
-		t.Fatal(err)
+	if aps, _ := d.Fleet.Approvals(model.ApprovalPending); len(aps) != 0 {
+		t.Fatalf("a card was made: %+v", aps)
 	}
 	task = waitState(t, d, task.ID, model.CompanionWorking)
 	if got := f.Snapshot(task.RemoteID).Texts; len(got) != 1 || got[0] != task.Text {
-		t.Fatalf("Companion got %q, the owner saw %q", got, task.Text)
+		t.Fatalf("Companion got %q, want %q", got, task.Text)
 	}
-	f.Complete(task.RemoteID, "I can't pay from a message; ask the owner.")
-	waitState(t, d, task.ID, model.CompanionCompleted)
-	companionMail(t, d, "head", "I can't pay from a message")
-	if got, _ := d.Fleet.ApprovalByID(ap.ID); got.State != model.ApprovalAllowed {
-		t.Fatalf("approval after allow: %s", got.State)
-	}
-
-	// Outward words alone are everyday chat: no approval (Companion's own gate guards sending).
-	// Use an independent service: this allowed chat may send before cancellation, and
-	// must not change the send count used below to check denial of the money request.
-	chatDaemon, _ := connected(t)
-	chat, err := chatDaemon.Companion.SendHeadMessage(chatDaemon.Fleet.HeadID(), "Did you send the contract to the client?", "")
-	if err != nil || chat.Effects != model.EffectsOutward || chat.State != model.CompanionQueued || chat.ApprovalID != "" {
-		t.Fatalf("outward chat: %+v %v", chat, err)
-	}
-	if _, err := chatDaemon.Companion.Cancel(chat.ID, ""); err != nil {
-		t.Fatal(err)
-	}
-
-	// Denied: a note to the head, nothing sent.
-	task, err = d.Companion.SendHeadMessage(head, "Buy the contract template for the client", "")
-	if err != nil || task.Effects != model.EffectsMoney {
-		t.Fatalf("second: %+v %v", task, err)
-	}
-	if _, err := d.Fleet.Decide(fleet.OwnerCaller, task.ApprovalID, fleet.DecideRequest{Decision: "deny", Message: "not now"}); err != nil {
-		t.Fatal(err)
-	}
-	task = waitState(t, d, task.ID, model.CompanionDenied)
-	note := companionMail(t, d, "head", "The owner declined to send your message to Companion. Their note: not now")
-	if !strings.HasPrefix(note.Body, "[Companion · your message got no reply: denied] Your message: Buy the contract template for the client") {
-		t.Fatalf("deny note: %q", note.Body)
-	}
-	if f.SentCount() != 1 {
-		t.Fatalf("a denied message reached Companion (%d sends)", f.SentCount())
-	}
-	if got, _ := d.Fleet.ApprovalByID(task.ApprovalID); got.State != model.ApprovalDenied {
-		t.Fatalf("approval after deny: %s", got.State)
+	if !strings.Contains(task.Text, "don't act in the owner's apps") {
+		t.Fatalf("the message lost its note: %q", task.Text)
 	}
 }
 
@@ -287,11 +237,13 @@ func TestHeadMessageLimitsAndRights(t *testing.T) {
 		}
 		ids = append(ids, task.ID)
 	}
-	if _, err := d.Companion.SendHeadMessage(head, "one more", ""); status(err) != http.StatusTooManyRequests ||
-		!strings.Contains(err.Error(), "waiting to go out") {
-		t.Fatalf("over the queue cap: %v", err)
+	// No limit on how many wait (the owner, 17 Nov): one more than the former cap is taken.
+	extra, err := d.Companion.SendHeadMessage(head, "one more", "")
+	if err != nil {
+		t.Fatalf("over the former queue cap: %v", err)
 	}
-	// Cancelled ones no longer wait, but still count for the rate (20 per 10 minutes).
+	ids = append(ids, extra.ID)
+	// Nor on how many go out in ten minutes: send up to the former rate, then one more.
 	for sent := companion.MaxHeadPending; ; {
 		for _, id := range ids {
 			if _, err := d.Companion.Cancel(id, ""); err != nil {
@@ -311,9 +263,8 @@ func TestHeadMessageLimitsAndRights(t *testing.T) {
 			sent++
 		}
 	}
-	if _, err := d.Companion.SendHeadMessage(head, "the 21st", ""); status(err) != http.StatusTooManyRequests ||
-		!strings.Contains(err.Error(), "in the last 10 minutes") {
-		t.Fatalf("over the rate: %v", err)
+	if _, err := d.Companion.SendHeadMessage(head, "the 21st", ""); err != nil {
+		t.Fatalf("over the former rate: %v", err)
 	}
 
 	// Other agents: only the head talks with Companion.
@@ -321,7 +272,7 @@ func TestHeadMessageLimitsAndRights(t *testing.T) {
 	if _, err := d.Companion.SendHeadMessage(worker, "hello", ""); status(err) != http.StatusForbidden || !strings.Contains(err.Error(), "only the head") {
 		t.Fatalf("a worker's message: %v", err)
 	}
-	_, err := d.Fleet.SendMessage(fleet.AgentCaller(worker), fleet.SendRequest{To: model.CompanionParty, Body: "hello"})
+	_, err = d.Fleet.SendMessage(fleet.AgentCaller(worker), fleet.SendRequest{To: model.CompanionParty, Body: "hello"})
 	if err == nil || !strings.Contains(err.Error(), "only the head talks with Companion") || !strings.Contains(err.Error(), "companion_task") {
 		t.Fatalf("a worker's send to companion: %v", err)
 	}
@@ -515,26 +466,27 @@ func TestLinkRateCountsOnlyCompanionsMessages(t *testing.T) {
 			t.Fatalf("link message %d: %v", i, err)
 		}
 	}
-	if _, err := d.Fleet.CompanionMessage("one too many"); err == nil || !strings.Contains(err.Error(), "Companion sent 20 messages") {
-		t.Fatalf("over the link's rate: %v", err)
+	if _, err := d.Fleet.CompanionMessage("one more"); err != nil { // no rate since 17 Nov
+		t.Fatalf("beyond the link's former rate: %v", err)
 	}
 	msgs, err := d.Fleet.CompanionLinkMessages(5)
-	if err != nil || len(msgs) != 5 || msgs[4].Body != "Note 19 from the owner's assistant" {
+	if err != nil || len(msgs) != 5 || msgs[4].Body != "one more" || msgs[3].Body != "Note 19 from the owner's assistant" {
 		t.Fatalf("link messages: %+v %v", msgs, err)
 	}
 }
 
 // --- helpers ---
 
-func TestLinkMessagesShareQueueCapacityWithReplies(t *testing.T) {
+// A full mailbox refuses nothing (no queue limit since 17 Nov).
+func TestLinkMessagesAreTakenWhateverIsWaiting(t *testing.T) {
 	d := apitest.New(t)
 	for range fleet.MaxQueued {
 		if _, err := d.Fleet.DeliverCompanion(d.Fleet.HeadID(), companion.ReplyLabel+" reply"); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if _, err := d.Fleet.CompanionMessage("no room"); fleet.KindOf(err) != fleet.KindTooMany || !strings.Contains(err.Error(), "messages waiting") {
-		t.Fatalf("full queue: %v", err)
+	if _, err := d.Fleet.CompanionMessage("still room"); err != nil {
+		t.Fatalf("with %d waiting: %v", fleet.MaxQueued, err)
 	}
 }
 

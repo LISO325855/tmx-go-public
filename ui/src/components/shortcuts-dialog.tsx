@@ -1,4 +1,5 @@
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { useClassic } from "@/hooks/use-classic";
 import { Kbd } from "@/components/ui/kbd";
 import { MOD, ui, useUI } from "@/lib/ui";
 
@@ -43,6 +44,8 @@ const GROUPS: { title: string; items: [string, string[]][] }[] = [
 
 export function ShortcutsDialog() {
   const open = useUI((s) => s.shortcuts);
+  const classic = useClassic();
+  if (classic) return null;
   return (
     <Dialog open={open} onOpenChange={(v) => ui.openShortcuts(v)}>
       <DialogContent className="sm:max-w-[35rem]" onOpenAutoFocus={(e) => e.preventDefault()}>

@@ -81,7 +81,7 @@ func (f *Fleet) auditApprovalEvent(ev model.BusEvent) {
 			return
 		}
 		f.log.Info("approval created", "approval_id", ap.ID, "agent_id", ap.AgentID, "tool", ap.Tool)
-		if ap.Deferred {
+		if !notifiesOwner(ap) {
 			return
 		}
 		select {
@@ -93,6 +93,24 @@ func (f *Fleet) auditApprovalEvent(ev model.BusEvent) {
 		notified, seen := f.st.ApprovalDelivery(ap.ID)
 		f.log.Info("approval resolved", "approval_id", ap.ID, "state", ap.State, "notified", notified, "seen", seen != 0)
 	}
+}
+
+// notifiesOwner: a card that is created alerts the owner's phone only if it is a new, open
+// request made now. Never a card put aside for later or a record that is already decided
+// (imported history). An open card of the owner's own import (the CLI, the UI, a paired
+// machine acting for the owner: model.ImportOrigin.ImportedBy is the owner) does not alert
+// either: the owner is migrating, and an import of a hundred cards must not send a hundred
+// pushes. An open card an AGENT brings in through an import is that agent's question to the
+// owner and alerts like any other: an import must not be a way to put a card into Needs you
+// quietly.
+func notifiesOwner(ap model.Approval) bool {
+	if ap.Deferred || ap.State != model.ApprovalPending {
+		return false
+	}
+	if ap.Card == nil || ap.Card.Origin == nil {
+		return true
+	}
+	return ap.Card.Origin.ImportedBy != model.Owner
 }
 
 // MarkApprovalSeen is called only by the owner UI when a card is visible.

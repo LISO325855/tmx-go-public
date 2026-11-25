@@ -3,6 +3,13 @@ package model
 // ReminderParty is the From of mail the reminder scheduler delivers.
 const ReminderParty = "reminder"
 
+// RulesParty is the From of mail tmx itself sends the head when the fleet rules change or a
+// commit of them is refused (internal/fleet/rules.go).
+const RulesParty = "rules"
+
+// EvRulesChanged is the bus event of a decision about the rules source (data: rules.Event).
+const EvRulesChanged = "rules.changed"
+
 // Person is someone without their own tmx (a teammate, an external partner contact or a
 // client), see docs/PEOPLE_PROMISES.md. Channels hold personal data: only the owner sees them;
 // agents get PublicPerson.

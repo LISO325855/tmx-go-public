@@ -1,5 +1,6 @@
 import { useMemo } from "react";
-import { CircleDot, FolderClosed, Gauge, Inbox, Keyboard, LayoutGrid, ListChecks, MessageCircle, MessageSquare, Moon, Plus, Settings, Sparkles, Square, Sun, Waypoints } from "lucide-react";
+import { Boxes, CircleDot, FolderClosed, Gauge, Inbox, Keyboard, LayoutGrid, ListChecks, MessageCircle, MessageSquare, Moon, Plus, Settings, Smartphone, Sparkles, Square, Sun, WandSparkles, Waypoints } from "lucide-react";
+import { isComputerWindow } from "@/lib/onboarding-rules";
 import { useCompanionSetUp } from "@/lib/companion";
 import { isLinked, sortedWaChats, useWa } from "@/lib/whatsapp";
 import { WaAvatar } from "./whatsapp/wa-bits";
@@ -15,8 +16,11 @@ import { ui, useUI } from "@/lib/ui";
 import { agentModelLabel, STATE_LABEL } from "@/lib/format";
 import { agentLabel } from "@/lib/profiles";
 import { StateDot } from "./state";
+import { useClassic } from "@/hooks/use-classic";
 
 export function CommandPalette() {
+  const classic = useClassic();
+  const transport = useStore((s) => s.transport);
   const open = useUI((s) => s.palette);
   const agents = useStore((s) => s.agents);
   const profiles = useStore((s) => s.profiles);
@@ -52,7 +56,7 @@ export function CommandPalette() {
             <LayoutGrid /> Home <CommandShortcut>G O</CommandShortcut>
           </CommandItem>
           <CommandItem value="needs you inbox approvals" onSelect={() => go(paths.inbox())}>
-            <Inbox /> Needs you
+            <Inbox /> {classic ? "Your turn" : "Needs you"}
             {pending > 0 && <span className="tabular text-xs text-muted-foreground">{pending} pending</span>}
             <CommandShortcut>G I</CommandShortcut>
           </CommandItem>
@@ -61,7 +65,7 @@ export function CommandPalette() {
           </CommandItem>
           {headId && (
             <CommandItem value="talk to the head" onSelect={() => go(paths.agent(headId))}>
-              <MessageSquare /> Talk to the head <CommandShortcut>G H</CommandShortcut>
+              <MessageSquare /> {classic ? "Talk to the Architect" : "Talk to the head"} <CommandShortcut>G H</CommandShortcut>
             </CommandItem>
           )}
           <CommandItem value="recordings screen microphone audio video" onSelect={() => go(paths.recordings())}>
@@ -72,12 +76,15 @@ export function CommandPalette() {
               <Sparkles /> Companion
             </CommandItem>
           )}
+          <CommandItem value="resources whatsapp mail phone sms companion accounts devices storage what agents can use" onSelect={() => go(paths.resources())}>
+            <Boxes /> Resources
+          </CommandItem>
           <CommandItem value="usage ai accounts quota limits connect claude codex antigravity" onSelect={() => go(paths.usage())}>
-            <Gauge /> Usage
+            <Gauge /> {classic ? "Usage and accounts" : "Usage"}
           </CommandItem>
-          <CommandItem value="features ordered status works partial missing evidence" onSelect={() => go(paths.features())}>
+          {!classic && <CommandItem value="features ordered status works partial missing evidence" onSelect={() => go(paths.features())}>
             <ListChecks /> Features
-          </CommandItem>
+          </CommandItem>}
           {wa && (
             <CommandItem value="whatsapp chats messages link" onSelect={() => go(paths.whatsapp())}>
               <MessageCircle /> {isLinked(wa) ? "WhatsApp" : "Link WhatsApp…"}
@@ -88,6 +95,18 @@ export function CommandPalette() {
           </CommandItem>
         </CommandGroup>
         <CommandGroup heading="Actions">
+          {/* classic: Python's "+ Agent", within reach of Ctrl K (the form asks for the project) */}
+          {classic && (
+            <CommandItem value="new agent create start launch add" onSelect={() => ui.openNewAgent(true)}>
+              <Plus /> New agent
+            </CommandItem>
+          )}
+          {window.location.protocol !== "https:" && (
+            <CommandItem value="connect a phone pair scan qr" onSelect={() => ui.openConnectPhone(true)}>
+              <Smartphone />
+              Connect a phone
+            </CommandItem>
+          )}
           <CommandItem value="new project create" onSelect={() => ui.openNewProject(true)}>
             <Plus /> New project <CommandShortcut>C</CommandShortcut>
           </CommandItem>
@@ -121,7 +140,12 @@ export function CommandPalette() {
           >
             {resolved === "dark" ? <Sun /> : <Moon />} {resolved === "dark" ? "Switch to light theme" : "Switch to dark theme"}
           </CommandItem>
-          <CommandItem
+          {isComputerWindow(transport) && (
+            <CommandItem value="set up tmx onboarding welcome whatsapp phone companion setup" onSelect={() => ui.openOnboarding(true)}>
+              <WandSparkles /> Set up tmx…
+            </CommandItem>
+          )}
+          {!classic && <CommandItem
             value="keyboard shortcuts help"
             onSelect={() => {
               ui.openPalette(false);
@@ -129,7 +153,7 @@ export function CommandPalette() {
             }}
           >
             <Keyboard /> Keyboard shortcuts <CommandShortcut>?</CommandShortcut>
-          </CommandItem>
+          </CommandItem>}
         </CommandGroup>
         {agentList.length > 0 && (
           <CommandGroup heading="Agents">
@@ -150,7 +174,7 @@ export function CommandPalette() {
             })}
           </CommandGroup>
         )}
-        {boards.length > 0 && (
+        {!classic && boards.length > 0 && (
           <CommandGroup heading="Chat boards">
             {boards.map((c) => (
               <CommandItem key={c.id} value={`board chat topics ${c.name} ${c.id}`} onSelect={() => go(paths.chatBoard(c.id))}>

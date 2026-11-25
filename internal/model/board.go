@@ -47,6 +47,14 @@ type Thread struct {
 	IntentSource string  `json:"intent_source,omitempty"`
 	CanvasX      float64 `json:"canvas_x,omitempty"`
 	CanvasY      float64 `json:"canvas_y,omitempty"`
+
+	// The Board view of the Matrix (the owner, 17 Nov 2026: one row per thread with how far it is
+	// and what it waits for). Progress is the agents' own estimate, 0-100; nil = never reported.
+	// ProgressWhy is the one line that came with it: where the thread stands. Blocker is what it
+	// waits for: what stops it (blocked) or what the owner has to do (waiting_on_owner).
+	Progress    *int   `json:"progress,omitempty"`
+	ProgressWhy string `json:"progress_why,omitempty"`
+	Blocker     string `json:"blocker,omitempty"`
 }
 
 // BoardCard is one head turn, summarised. ID is the seq of its first entry.
@@ -146,6 +154,9 @@ type ProjectSection struct {
 	Lead        string          `json:"lead,omitempty"`
 	UpdatedAt   int64           `json:"updated_at"`
 	UpdatedBy   string          `json:"updated_by"`
+	// Repo is the project's repository address (https://host/owner/repo or git@host:owner/repo),
+	// set by the owner only; agents read it and are told it when they start (fleet/project_repo.go).
+	Repo string `json:"repo,omitempty"`
 }
 type ProjectNeed struct {
 	Text string `json:"text"`

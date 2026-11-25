@@ -12,6 +12,25 @@ import (
 	"github.com/blackcode-ch/tmx-go/internal/whatsapp"
 )
 
+func TestWhatsAppReadTranscript(t *testing.T) {
+	d := apitest.New(t)
+	d.EnableWhatsApp(t)
+	d.LinkWhatsApp(t)
+	chat := "41791111111@s.whatsapp.net"
+	d.WaFake.Emit(whatsapp.EvHistory{Messages: []whatsapp.Incoming{{Msg: model.WaMessage{
+		ID: "voice", ChatJID: chat, Type: model.WaVoice, At: 1, FromMe: true,
+		Media: &model.WaMedia{Mime: "audio/ogg", DurationMS: 35000, Transcript: "fixture speech"},
+	}}}})
+	access := map[string]model.WaChatAccess{"head": {Read: []string{chat}}}
+	if _, err := d.WhatsApp.SetSettings(whatsapp.SettingsPatch{ChatAccess: &access}); err != nil {
+		t.Fatal(err)
+	}
+	out := mustOK(t, session(t, d, "head"), "whatsapp_read", map[string]any{"chat": chat})
+	if !strings.HasPrefix(out, whatsapp.Frame) || !strings.Contains(out, "[voice note, 0:35] fixture speech") {
+		t.Fatal(out)
+	}
+}
+
 func TestWhatsAppTools(t *testing.T) {
 	d := apitest.New(t)
 	d.EnableWhatsApp(t)
@@ -29,6 +48,10 @@ func TestWhatsAppTools(t *testing.T) {
 		},
 		Progress: 100,
 	})
+	access := map[string]model.WaChatAccess{"head": {Read: []string{anna, bo}}}
+	if _, err := d.WhatsApp.SetSettings(whatsapp.SettingsPatch{ChatAccess: &access}); err != nil { // the owner opened both chats to the head
+		t.Fatal(err)
+	}
 	head := session(t, d, "head")
 
 	out := mustOK(t, head, "whatsapp_chats", nil)
@@ -63,7 +86,7 @@ func TestWhatsAppTools(t *testing.T) {
 	if _, err := d.WhatsApp.SetSettings(whatsapp.SettingsPatch{AllowedChats: &[]string{bo}}); err != nil {
 		t.Fatal(err)
 	}
-	if out := mustOK(t, head, "whatsapp_send", map[string]any{"chat": bo, "text": "see you"}); !strings.Contains(out, "Sent to \"Bo\"") {
+	if out := mustOK(t, head, "whatsapp_send", map[string]any{"chat": bo, "text": "see you"}); !strings.Contains(out, "Queued for \"Bo\"") {
 		t.Fatalf("allowed send:\n%s", out)
 	}
 	// The message shows as sent a moment after the fake took it: wait for that, not just the send.

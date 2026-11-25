@@ -1,11 +1,13 @@
+import { reloadGate } from "@/lib/reload-guard";
 // Attaching files to a message box: paperclip, paste and drag-and-drop, with chips that show
 // each file uploading, ready or failed. Used by the agent composer and the chat composer;
 // each passes its own upload call (files upload as soon as they are added, so sending is fast).
 import { useEffect, useRef, useState, type DragEvent } from "react";
-import { FileText, Loader2, Paperclip, X } from "lucide-react";
+import { FileText, Image as ImageIcon, Loader2, Paperclip, X } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { usePhoneClassic } from "@/hooks/use-phone-classic";
 import { formatSize, readBase64 } from "@/lib/attachments";
 import { cn } from "@/lib/utils";
 
@@ -26,11 +28,14 @@ export type UploadFn = (f: { name: string; type: string; data: string }) => Prom
 const pendingByBox = new Map<string, Pending[]>();
 const listeners = new Map<string, Set<(l: Pending[]) => void>>();
 let seq = 0;
+let releaseReload: (() => void) | undefined;
 
 function change(box: string, fn: (l: Pending[]) => Pending[]) {
   const next = fn(pendingByBox.get(box) ?? []);
   if (next.length) pendingByBox.set(box, next);
   else pendingByBox.delete(box);
+  if (pendingByBox.size && !releaseReload) releaseReload = reloadGate.hold();
+  if (!pendingByBox.size && releaseReload) { const release = releaseReload; releaseReload = undefined; release(); }
   listeners.get(box)?.forEach((l) => l(next));
 }
 
@@ -132,6 +137,38 @@ export function DropOverlay({ show }: { show: boolean }) {
 
 export function AttachButton({ onFiles, disabled, hint }: { onFiles: (f: FileList) => void; disabled?: boolean; hint?: string }) {
   const picker = useRef<HTMLInputElement>(null);
+  const photos = useRef<HTMLInputElement>(null);
+  // Classic on a phone: Photos first, as Python's mobile app (its picker was
+  // <input type="file" accept="image/*">: the photo library, with the camera); any file is the
+  // second button, "File…". The owner, 17 Nov 20:38.
+  const phone = usePhoneClassic();
+  if (phone) {
+    const pick = (ref: typeof picker, accept: string) => (
+      <input
+        ref={ref}
+        type="file"
+        accept={accept}
+        multiple
+        hidden
+        onChange={(e) => {
+          if (e.target.files?.length) onFiles(e.target.files);
+          e.target.value = "";
+        }}
+      />
+    );
+    return (
+      <>
+        {pick(photos, "image/*")}
+        {pick(picker, "*/*")}
+        <Button variant="ghost" size="icon-sm" onClick={() => photos.current?.click()} disabled={disabled} aria-label="Attach a photo" title="Photo…" className="shrink-0 rounded-lg text-muted-foreground hover:text-foreground" data-attach-photo>
+          <ImageIcon className="size-4" />
+        </Button>
+        <Button variant="ghost" size="icon-sm" onClick={() => picker.current?.click()} disabled={disabled} aria-label="Attach a file" title="File…" className="shrink-0 rounded-lg text-muted-foreground hover:text-foreground" data-attach-file>
+          <Paperclip className="size-4" />
+        </Button>
+      </>
+    );
+  }
   return (
     <>
       <input
@@ -157,7 +194,7 @@ export function AttachButton({ onFiles, disabled, hint }: { onFiles: (f: FileLis
             <Paperclip className="size-4" />
           </Button>
         </TooltipTrigger>
-        <TooltipContent>{hint ?? "Attach files · or paste / drop them here"}</TooltipContent>
+        <TooltipContent>{hint ?? "Attach files · or paste / drop them here"}<br />Drawings from Snipping Tool: paste with Ctrl+V or save the edited image first.</TooltipContent>
       </Tooltip>
     </>
   );
@@ -166,11 +203,14 @@ export function AttachButton({ onFiles, disabled, hint }: { onFiles: (f: FileLis
 export function AttachChips({ files, onRemove }: { files: Pending[]; onRemove: (key: string) => void }) {
   if (!files.length) return null;
   return (
-    <ul className="flex flex-wrap gap-2 px-3 pt-3" aria-label="Attached files">
-      {files.map((f) => (
-        <FileChip key={f.key} f={f} onRemove={() => onRemove(f.key)} />
-      ))}
-    </ul>
+    <div>
+      <p className="px-3 pt-2 text-xs text-muted-foreground">Drawings from Snipping Tool: paste with Ctrl+V or save the edited image first.</p>
+      <ul className="flex flex-wrap gap-2 px-3 pt-3" aria-label="Attached files">
+        {files.map((f) => (
+          <FileChip key={f.key} f={f} onRemove={() => onRemove(f.key)} />
+        ))}
+      </ul>
+    </div>
   );
 }
 

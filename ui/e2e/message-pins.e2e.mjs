@@ -33,7 +33,7 @@ test("message pins sync between desktop and phone and retain done items", { time
     await desktop.page.getByRole("button", { name: "Reopen", exact: true }).click();
     await phone.page.getByRole("heading", { name: "Pinned · 1 unfinished", exact: true }).waitFor();
     await phone.page.getByRole("button", { name: "Unpin", exact: true }).click();
-    await desktop.page.getByRole("heading", { name: "Pinned · 0 unfinished", exact: true }).waitFor();
+    await desktop.page.getByRole("region", { name: "Pinned messages" }).waitFor({ state: "detached" }); // no pins: no strip
     assert.deepEqual([...desktop.errors, ...phone.errors], []);
   } finally { await browser.close(); await d.stop(); }
 });
@@ -49,7 +49,7 @@ test("one tap pins and unpins a conversation message on desktop and phone", { ti
       await pin.click();
       await page.getByRole("heading", { name: "Pinned · 1 unfinished", exact: true }).waitFor();
       await page.getByRole("button", { name: "Unpin message", exact: true }).first().click();
-      await page.getByRole("heading", { name: "Pinned · 0 unfinished", exact: true }).waitFor();
+      await page.getByRole("region", { name: "Pinned messages" }).waitFor({ state: "detached" }); // no pins: no strip
       assert.deepEqual(errors, []);
       await context.close();
     }

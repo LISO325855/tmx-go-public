@@ -86,7 +86,7 @@ func TestCompanionConversation(t *testing.T) {
 	// e4: a worker's task, declined by the owner (another error line).
 	worker := mkWorker(t, d)
 	enableCompanion(t, owner, "worker")
-	wtask, err := d.Companion.CreateAgent(worker, model.CompanionSpec{Goal: "Look up the train times to Bern"})
+	wtask, err := d.Companion.CreateAgent(worker, model.CompanionSpec{Goal: "Send the train times to the client"}, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,7 +140,7 @@ func TestCompanionConversation(t *testing.T) {
 	if e := byID[m2.ID+":error"]; e.Text != "Companion did not take the message: Not in this conversation." {
 		t.Fatalf("error: %+v", e)
 	}
-	if e := byID[wtask.ID]; e.Text != "Look up the train times to Bern" || e.AgentName == "" || e.AgentName == worker {
+	if e := byID[wtask.ID]; e.Text != "Send the train times to the client" || e.AgentName == "" || e.AgentName == worker {
 		t.Fatalf("task: %+v", e)
 	}
 	if e := byID[hm.ID]; e.AgentName != "head" || e.Text != "Is the owner free for a call?" || e.TaskID != hm.ID {
@@ -309,45 +309,16 @@ func TestCompanionMessagesGate(t *testing.T) {
 	f.Complete(m.RemoteID, "I can't pay bills.")
 	waitTask(t, owner, m.ID, model.CompanionCompleted)
 
-	// The head's message that reads like it acts: allowing it needs a proof; denying does not.
+	// The head's message with a money word: no card, it goes at once (a card until 17 Nov).
 	hm, err := d.Fleet.SendMessage(fleet.AgentCaller(d.Fleet.HeadID()), fleet.SendRequest{To: "companion", Body: "Delete the old account at the bank"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if hm.State != model.MessageState(model.CompanionAwaitingApproval) {
-		t.Fatalf("head's message: %+v", hm)
+	if hm.State == model.MessageState(model.CompanionAwaitingApproval) {
+		t.Fatalf("head's message waits for a card: %+v", hm)
 	}
-	task, _ := d.Companion.Get(hm.ID)
-	ap, _ := d.Fleet.ApprovalByID(task.ApprovalID)
-	var in model.CompanionApprovalInput
-	_ = json.Unmarshal(ap.Input, &in)
-	if ap.Tool != model.ToolCompanionMessage || in.Text != task.Text {
-		t.Fatalf("approval: %+v %+v", ap, in)
-	}
-	code, conf = call(t, owner, "POST", "/api/approvals/"+ap.ID, map[string]string{"decision": "allow"}, nil)
-	if code != http.StatusPreconditionRequired || !strings.Contains(conf.Reason, "let head send Companion a message that may spend or move money") {
-		t.Fatalf("allow without proof: %d %+v", code, conf)
-	}
-	if code, _ := call(t, confirmed(t, owner, conf), "POST", "/api/approvals/"+ap.ID, map[string]string{"decision": "allow"}, nil); code != 0 {
-		t.Fatalf("allow with proof: %d", code)
+	if aps, _ := d.Fleet.Approvals(model.ApprovalPending); len(aps) != 0 {
+		t.Fatalf("a card was made: %+v", aps)
 	}
 	waitTask(t, owner, hm.ID, model.CompanionWorking)
-
-	// Companion reads that the head's message waits (read-only view).
-	var needs struct {
-		Items []struct{ What string } `json:"items"`
-	}
-	if _, err := d.Companion.SendHeadMessage(d.Fleet.HeadID(), "Send the invoice to the client", ""); err != nil {
-		t.Fatal(err)
-	}
-	if code, _ := call(t, linkClient(t, d), "GET", "/api/companion/link/needs", nil, &needs); code != 0 {
-		t.Fatal(code)
-	}
-	found := false
-	for _, it := range needs.Items {
-		found = found || strings.HasPrefix(it.What, "wants to send you (Companion) a message")
-	}
-	if !found {
-		t.Fatalf("needs view: %+v", needs.Items)
-	}
 }

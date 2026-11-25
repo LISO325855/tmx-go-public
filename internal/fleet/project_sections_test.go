@@ -70,10 +70,12 @@ func TestProjectSectionValidationIsAtomic(t *testing.T) {
 	_, f, p := sectionFixture(t)
 	original := "Original"
 	_, _ = f.SetProjectSection(OwnerCaller, p.ID, ProjectSectionPatch{Status: &original})
-	tooMany := "1\n2\n3\n4"
-	if _, err := f.SetProjectSection(OwnerCaller, p.ID, ProjectSectionPatch{Status: &tooMany}); err == nil {
-		t.Fatal("accepted fourth line")
+	// A status takes any number of lines (three at most until 17 Nov).
+	fourLines := "1\n2\n3\n4"
+	if sec, err := f.SetProjectSection(OwnerCaller, p.ID, ProjectSectionPatch{Status: &fourLines}); err != nil || sec.Status != fourLines {
+		t.Fatalf("a four-line status: %+v %v", sec, err)
 	}
+	_, _ = f.SetProjectSection(OwnerCaller, p.ID, ProjectSectionPatch{Status: &original})
 	changed, badLinks := "Changed", []string{"title | "}
 	if _, err := f.SetProjectSection(OwnerCaller, p.ID, ProjectSectionPatch{Status: &changed, Links: &badLinks}); err == nil {
 		t.Fatal("accepted empty URL")
@@ -86,9 +88,9 @@ func TestProjectSectionValidationIsAtomic(t *testing.T) {
 	if sec.Status != original {
 		t.Fatal("invalid patch persisted partial fields")
 	}
-	long := strings.Repeat("é", 601)
+	long := strings.Repeat("é", 16001) // the ceiling: 16000 characters (600 until 17 Nov)
 	sec, err := f.SetProjectSection(OwnerCaller, p.ID, ProjectSectionPatch{Status: &long})
-	if err != nil || len([]rune(sec.Status)) != 600 {
+	if err != nil || len([]rune(sec.Status)) != 16000 {
 		t.Fatal("status limit")
 	}
 	if _, err := f.SetProjectSection(Caller{AgentID: "unknown"}, p.ID, ProjectSectionPatch{}); err == nil {

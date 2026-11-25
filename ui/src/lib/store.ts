@@ -1,14 +1,19 @@
+import { reloadGate } from "./reload-guard";
 // The UI's state: the daemon snapshot, kept current by BusEvents, plus per-agent timelines.
+import { StreamHealth, HEALTH_INTERVAL_MS, bounded } from "./stream-health";
 import { create } from "zustand";
 import { ApiError, type EventStream, type Transport } from "./transport";
 import { derivePolicy } from "./profiles";
 import { loadResources, onResourceEvent } from "./resources";
 import type { Agent, Approval, BusEvent, Message, Policy, Profile, Project, Snapshot, TimelineEntry } from "./types";
+import { useUI } from "./ui";
 
-export type Status = "booting" | "ready" | "unauthorized" | "offline";
+/** locked: a paired phone the daemon answers 423 to; the lock screen covers the page (lib/phone-lock.ts). */
+export type Status = "booting" | "ready" | "unauthorized" | "offline" | "locked";
 export type Conn = "connecting" | "open" | "reconnecting";
 
 export interface Timeline {
+  error?: boolean; // last fetch failed; retained entries may be stale while retrying
   entries: TimelineEntry[];
   /** a full view (last 200+) has been fetched, not just the preview */
   full: boolean;
@@ -29,6 +34,8 @@ interface State {
   machine: string;
   version: string;
   workspace: string;
+  /** the daemon's UI profile: "classic" or "" (lib/ui-profile.ts; read it with useClassic) */
+  uiProfile: string;
   policy: Policy;
   /** by slug */
   profiles: Record<string, Profile>;
@@ -49,6 +56,7 @@ export const useStore = create<State>(() => ({
   machine: "",
   version: "",
   workspace: "",
+  uiProfile: "",
   policy: { levels: {} },
   profiles: {},
   headId: null,
@@ -80,8 +88,21 @@ export function onApprovalCreated(fn: ApprovalListener) {
 const PREVIEW_LIMIT = 12;
 const FULL_LIMIT = 200;
 
+/**
+ * The dashboard's snapshot: without shelved agents (a fleet can hold hundreds of them, and they
+ * are hidden unless "Show all" is on). With "Show all" on, every agent.
+ */
+function snapshotPath(): string {
+  return useUI.getState().showAllAgents ? "/api/snapshot" : "/api/snapshot?shelved=0";
+}
+
 function applySnapshot(s: Snapshot) {
   const agents: Record<string, Agent> = {};
+  // A snapshot without shelved agents (the event stream's, after a reconnect) must not drop
+  // the shelved ones "Show all" already loaded.
+  if (s.shelved_omitted !== undefined && useUI.getState().showAllAgents) {
+    for (const a of Object.values(get().agents)) if (a.shelved_at) agents[a.id] = a;
+  }
   for (const a of s.agents ?? []) agents[a.id] = a;
   if (s.head) agents[s.head.id] = s.head;
   const projects: Record<string, Project> = {};
@@ -97,6 +118,7 @@ function applySnapshot(s: Snapshot) {
     machine: s.machine,
     version: s.version,
     workspace: s.workspace,
+    uiProfile: s.ui_profile ?? "",
     policy: s.policy ?? { levels: {} },
     profiles,
     headId,
@@ -112,8 +134,9 @@ function applySnapshot(s: Snapshot) {
   // were open before a reconnect catch up from their last seq.
   for (const a of Object.values(agents)) {
     const tl = timelines[a.id];
-    if (tl && tl.entries.length) void catchUp(a.id);
-    else void loadTimeline(a.id, PREVIEW_LIMIT, false);
+    if (tl?.error) void loadTimeline(a.id, Math.max(FULL_LIMIT, tl.limit), true);
+    else if (tl && tl.entries.length) void catchUp(a.id);
+    else void loadTimeline(a.id, tl?.full ? FULL_LIMIT : PREVIEW_LIMIT, !!tl?.full);
   }
 }
 
@@ -149,6 +172,8 @@ function handleEvent(ev: BusEvent) {
   switch (ev.type) {
     case "snapshot":
       applySnapshot(ev.data as Snapshot);
+      attempt = 0;
+      set({ conn: "open", droppedAt: 0 });
       break;
     case "agent.updated": {
       const a = ev.data as Agent;
@@ -256,19 +281,70 @@ function handleEvent(ev: BusEvent) {
 let stream: EventStream | null = null;
 let retryTimer: ReturnType<typeof setTimeout> | undefined;
 let attempt = 0;
+const health = new StreamHealth();
+let monitorTimer: ReturnType<typeof setInterval> | undefined;
+let lastHealthAt = 0;
+let checkingHealth = false;
+let monitorCleanup: (() => void) | undefined;
+
+function streamLost() {
+  stream?.close();
+  stream = null;
+  set((st) => ({ conn: "reconnecting", droppedAt: st.droppedAt || Date.now() }));
+  scheduleReconnect();
+}
+
+async function checkHealth() {
+  const t = get().transport;
+  if (!t || t.kind === "mock" || checkingHealth) return;
+  checkingHealth = true;
+  lastHealthAt = Date.now();
+  try {
+    const h = await bounded(t.request<{ version: string }>("GET", "/api/health"));
+    if (t !== get().transport) return;
+    if (health.versionChanged(h.version)) reloadGate.request(() => window.location.reload());
+  } catch {
+    if (t === get().transport && get().conn === "open") streamLost();
+  } finally { checkingHealth = false; }
+}
+
+function monitorConnection() {
+  clearInterval(monitorTimer);
+  monitorCleanup?.();
+  const tick = () => {
+    if (get().transport?.kind === "mock" || get().status === "locked" || get().status === "unauthorized") return;
+    if (stream && health.stale(Date.now())) streamLost();
+    if (Date.now() - lastHealthAt >= HEALTH_INTERVAL_MS) void checkHealth();
+  };
+  monitorTimer = setInterval(tick, 5000);
+  // Mobile browsers suspend timers while locked. Recheck immediately on return.
+  if (typeof window !== "undefined") {
+    const online = () => { tick(); retryNow(); void checkHealth(); };
+    const visible = () => { if (!document.hidden) { tick(); void checkHealth(); } };
+    window.addEventListener("online", online);
+    document.addEventListener("visibilitychange", visible);
+    monitorCleanup = () => { window.removeEventListener("online", online); document.removeEventListener("visibilitychange", visible); };
+  }
+}
 
 export async function start(t: Transport) {
   set({ transport: t });
   try {
-    const snap = await t.request<Snapshot>("GET", "/api/snapshot");
+    const snap = await bounded(t.request<Snapshot>("GET", snapshotPath()));
+    health.versionChanged(snap.version);
     applySnapshot(snap);
   } catch (e) {
     if (e instanceof ApiError && (e.status === 401 || e.status === 403)) {
       set({ status: "unauthorized", statusMessage: e.message });
       return;
     }
+    if (e instanceof ApiError && e.status === 423) {
+      set({ status: "locked", statusMessage: "" }); // unlocking calls retryNow()
+      return;
+    }
     set({ status: get().status === "ready" ? "ready" : "offline", statusMessage: (e as Error).message });
   }
+  monitorConnection();
   connect();
 }
 
@@ -276,16 +352,18 @@ function connect() {
   const t = get().transport;
   if (!t) return;
   stream?.close();
+  health.frame(Date.now());
   set((st) => ({ conn: st.conn === "open" ? "reconnecting" : st.conn }));
   stream = t.openEvents({
     onOpen() {
-      attempt = 0;
-      set({ conn: "open", droppedAt: 0 });
+      void checkHealth();
     },
-    onMessage: handleEvent,
+    onMessage(ev) {
+      health.frame(Date.now());
+      handleEvent(ev);
+    },
     onClose() {
-      set((st) => ({ conn: "reconnecting", droppedAt: st.droppedAt || Date.now() }));
-      scheduleReconnect();
+      streamLost();
     },
   });
 }
@@ -299,10 +377,14 @@ function scheduleReconnect() {
     if (!t) return;
     if (get().status !== "ready") {
       try {
-        applySnapshot(await t.request<Snapshot>("GET", "/api/snapshot"));
+        applySnapshot(await bounded(t.request<Snapshot>("GET", snapshotPath())));
       } catch (e) {
         if (e instanceof ApiError && (e.status === 401 || e.status === 403)) {
           set({ status: "unauthorized", statusMessage: e.message });
+          return;
+        }
+        if (e instanceof ApiError && e.status === 423) {
+          set({ status: "locked", statusMessage: "" }); // unlocking calls retryNow()
           return;
         }
       }
@@ -320,7 +402,12 @@ export function retryNow() {
 // ---------------------------------------------------------------------------------------------
 // timelines
 
+const timelineRetries = new Map<string, ReturnType<typeof setTimeout>>();
+const timelineAttempts = new Map<string, number>();
+
 export async function loadTimeline(agentId: string, limit = FULL_LIMIT, full = true) {
+  clearTimeout(timelineRetries.get(agentId));
+  timelineRetries.delete(agentId);
   const t = get().transport;
   if (!t) return;
   set((st) => {
@@ -328,11 +415,14 @@ export async function loadTimeline(agentId: string, limit = FULL_LIMIT, full = t
     return { timelines: { ...st.timelines, [agentId]: { ...tl, loading: true } } };
   });
   try {
-    const res = await t.request<{ entries: TimelineEntry[] | null }>(
+    const res = await bounded(t.request<{ entries: TimelineEntry[] | null }>(
       "GET",
       `/api/agents/${encodeURIComponent(agentId)}/timeline?limit=${limit}`,
-    );
+    ));
     const entries = res?.entries ?? [];
+    clearTimeout(timelineRetries.get(agentId));
+    timelineRetries.delete(agentId);
+    timelineAttempts.delete(agentId);
     set((st) => {
       const prev = st.timelines[agentId];
       // Union with what we already have (events that arrived meanwhile, or a larger fetch that
@@ -346,6 +436,7 @@ export async function loadTimeline(agentId: string, limit = FULL_LIMIT, full = t
           ...st.timelines,
           [agentId]: {
             entries: merged,
+            error: false,
             full: full || !!prev?.full,
             loading: false,
             maybeMore: full ? entries.length >= limit : (prev?.maybeMore ?? false),
@@ -355,28 +446,47 @@ export async function loadTimeline(agentId: string, limit = FULL_LIMIT, full = t
       };
     });
   } catch {
+    if (t !== get().transport) return;
+    const attempt = timelineAttempts.get(agentId) ?? 0;
+    timelineAttempts.set(agentId, attempt + 1);
+    clearTimeout(timelineRetries.get(agentId));
+    timelineRetries.set(agentId, setTimeout(() => {
+      timelineRetries.delete(agentId);
+      if (t === get().transport) void loadTimeline(agentId, limit, full);
+    }, Math.min(15_000, 1000 * 2 ** Math.min(attempt, 4))));
     set((st) => {
       const tl = st.timelines[agentId];
       if (!tl) return {};
-      return { timelines: { ...st.timelines, [agentId]: { ...tl, loading: false } } };
+      return { timelines: { ...st.timelines, [agentId]: { ...tl, loading: false, error: true } } };
     });
   }
 }
 
+const catchupCursor = new Map<string, number>();
+const catchingUp = new Set<string>();
+
 async function catchUp(agentId: string) {
   const t = get().transport;
   const tl = get().timelines[agentId];
-  if (!t || !tl?.entries.length) return;
-  const after = tl.entries[tl.entries.length - 1].seq;
+  if (!t || !tl?.entries.length || catchingUp.has(agentId)) return;
+  catchingUp.add(agentId);
+  let after = catchupCursor.get(agentId) ?? tl.entries[tl.entries.length - 1].seq;
+  catchupCursor.set(agentId, after);
   try {
-    const res = await t.request<{ entries: TimelineEntry[] | null }>(
-      "GET",
-      `/api/agents/${encodeURIComponent(agentId)}/timeline?after=${after}&limit=1000`,
-    );
-    appendEntries(agentId, res?.entries ?? []);
+    while (t === get().transport) {
+      const res = await bounded(t.request<{ entries: TimelineEntry[] | null }>(
+        "GET", `/api/agents/${encodeURIComponent(agentId)}/timeline?after=${after}&limit=1000`,
+      ));
+      const entries = res?.entries ?? [];
+      appendEntries(agentId, entries);
+      const next = entries.at(-1)?.seq ?? after;
+      if (entries.length < 1000 || next <= after) { catchupCursor.delete(agentId); break; }
+      after = next;
+      catchupCursor.set(agentId, after);
+    }
   } catch {
-    /* next reconnect tries again */
-  }
+    if (get().conn === "open") streamLost(); // retry from a fresh snapshot, visibly
+  } finally { catchingUp.delete(agentId); }
 }
 
 const fullInFlight = new Set<string>();
@@ -422,3 +532,10 @@ export function agentName(agents: Record<string, Agent>, idOrName: string | unde
   if (idOrName === "owner") return "you";
   return agents[idOrName]?.name ?? idOrName;
 }
+
+// "Show all" switched on: load the shelved agents the default snapshot leaves out.
+useUI.subscribe((s, prev) => {
+  if (!s.showAllAgents || prev.showAllAgents) return;
+  const t = get().transport;
+  if (t) void t.request<Snapshot>("GET", "/api/snapshot").then(applySnapshot).catch(() => {});
+});

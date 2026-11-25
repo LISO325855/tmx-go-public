@@ -48,6 +48,15 @@ func (f *Fleet) addPermissionLocked(r *agentRec, proc runner.Process, req runner
 	if kind == "" {
 		kind = model.ApprovalPermission
 	}
+	if f.opts.AgentMachine && kind == model.ApprovalQuestion {
+		f.log.Info("declined harness owner question on agent machine", "agent", r.a.Name, "request", req.ID)
+		f.goTracked(func() {
+			if err := proc.Answer(req.ID, runner.Decision{Message: "Decide within your authority or ask your lead."}); err != nil {
+				f.log.Warn("could not decline harness owner question", "request", req.ID, "err", err)
+			}
+		})
+		return
+	}
 	opts := req.Options
 	if opts == nil {
 		opts = []string{}
@@ -96,6 +105,9 @@ func (f *Fleet) saveOwnerQuestionLocked(c Caller, req AskRequest, card *model.Ow
 	}
 	if r == nil {
 		return model.Approval{}, errf(KindForbidden, "only agents ask the owner questions")
+	}
+	if f.opts.AgentMachine {
+		return model.Approval{}, errf(KindConflict, "this node does not queue owner questions; decide within your authority or ask your lead")
 	}
 	opts := req.Options
 	if opts == nil {
@@ -160,7 +172,7 @@ func (f *Fleet) Decide(c Caller, id string, d DecideRequest) (model.Approval, er
 			if fresh {
 				f.bus.Publish(model.BusEvent{Type: model.EvMessageCreated, AgentID: mail.To, Data: *mail})
 			}
-			f.deliverOwner(*mail)
+			f.deliverQueued(mail.To, true)
 		}
 		return result, err
 	}

@@ -1,0 +1,9 @@
+[
+  {"id":"incoming","type":"voice","from_me":false,"mime":"audio/ogg","duration_ms":35000,"data":"OggS incoming fixture"},
+  {"id":"outgoing","type":"voice","from_me":true,"mime":"audio/ogg","duration_ms":35000,"data":"OggS outgoing fixture"},
+  {"id":"photo","type":"image","from_me":false,"mime":"image/jpeg","data":"JPEG fixture"},
+  {"id":"file","type":"document","from_me":false,"mime":"application/pdf","data":"%PDF fixture"},
+  {"id":"audio","type":"audio","from_me":false,"mime":"audio/mpeg","data":"ID3 fixture"},
+  {"id":"video","type":"video","from_me":true,"mime":"video/mp4","data":"MP4 fixture"},
+  {"id":"sticker","type":"sticker","from_me":false,"mime":"image/webp","data":"WEBP fixture"}
+]

@@ -56,6 +56,11 @@ func (f *Fleet) scheduleRecoveryLocked(r *agentRec) {
 		return
 	}
 	delay, reason := r.recovery.next(time.Now())
+	cause := "process exited"
+	if r.a.State == model.StateError && r.a.Error != "" {
+		cause = r.a.Error
+	}
+	f.watchCrashLocked(r, cause, reason, len(r.recovery.attempts)+1, delay) // watch_fleet.go: the head is told
 	if reason != "" {
 		r.a.Desired = "stopped"
 		r.a.Error = reason + "; inspect the agent, then start it deliberately"
@@ -90,6 +95,7 @@ func (f *Fleet) restoreAfterCrash(r *agentRec, generation uint64) {
 			r.a.Desired = "stopped"
 			r.a.Error = "automatic restart failed: " + err.Error()
 			f.appendLocked(r, model.TimelineEntry{Kind: model.EntryError, IsError: true, Text: r.a.Error})
+			f.watchRestartFailedLocked(r, err)
 			f.saveAgentLocked(r)
 		}
 		f.mu.Unlock()

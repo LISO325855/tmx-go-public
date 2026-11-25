@@ -14,6 +14,31 @@ import (
 	"github.com/blackcode-ch/tmx-go/internal/whatsapp/watest"
 )
 
+func TestWaDownloadAndTranscript(t *testing.T) {
+	d := cliDaemon(t)
+	d.EnableWhatsApp(t)
+	d.LinkWhatsApp(t)
+	chat := "41791111111@s.whatsapp.net"
+	d.WaFake.Media["/voice-fixture"] = []byte("OggS fixture")
+	d.WaFake.Emit(whatsapp.EvHistory{Messages: []whatsapp.Incoming{{
+		Msg: model.WaMessage{ID: "voice-fixture", ChatJID: chat, FromMe: true, Type: model.WaVoice, At: 1,
+			Media: &model.WaMedia{Mime: "audio/ogg", DurationMS: 35000, Transcript: "fixture speech"}},
+		Ref: &whatsapp.MediaRef{Kind: "audio", DirectPath: "/voice-fixture"},
+	}}})
+	if out, errs, code := tmx(t, "wa", "read", chat); code != 0 || !strings.Contains(out, "[voice note, 0:35] fixture speech") {
+		t.Fatalf("read %d: %s %s", code, out, errs)
+	}
+	if out, errs, code := tmx(t, "wa", "download", chat, "voice-fixture"); code != 0 || !strings.Contains(out, "Stored on daemon:") || !strings.Contains(out, "12 bytes") {
+		t.Fatalf("download %d: %s %s", code, out, errs)
+	}
+	if out, _, code := tmx(t, "wa", "download", chat, "absent"); code == 0 {
+		t.Fatalf("missing message accepted: %s", out)
+	}
+	if _, _, code := tmx(t, "wa", "download", chat); code == 0 {
+		t.Fatal("missing ID accepted")
+	}
+}
+
 // lockedOutput is the link command's stdout, read while the command still writes it. It
 // rechecks the whole text so far on every write, so a marker split across writes still counts.
 type lockedOutput struct {

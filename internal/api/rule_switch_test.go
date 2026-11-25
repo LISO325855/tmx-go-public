@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"testing"
 
+	"github.com/blackcode-ch/tmx-go/internal/api/apitest"
 	tc "github.com/blackcode-ch/tmx-go/internal/client"
 	"github.com/blackcode-ch/tmx-go/internal/guard"
 )
@@ -13,6 +14,61 @@ type ruleRow struct {
 	State      guard.Outcome `json:"state"`
 	Switchable bool          `json:"switchable"`
 	AlwaysOn   string        `json:"always_on"`
+}
+
+// A fresh install over the API (defaults version 2): four rules Blocked, every other switchable
+// rule Allowed, none Held; no master switch in the answer; the hook's policy says the same.
+func TestSafetyDefaultsAPI(t *testing.T) {
+	d := apitest.New(t, apitest.DefaultGuard)
+	owner := tc.New(d.URL, d.OwnerToken)
+	var info struct {
+		Guard map[string]any `json:"guard"`
+		Rules []ruleRow      `json:"rules"`
+	}
+	if st, _ := call(t, owner, "GET", "/api/safety", nil, &info); st != 0 {
+		t.Fatalf("safety: %d", st)
+	}
+	if info.Guard["enabled"] != nil || info.Guard["off_for"] != nil || info.Guard["defaults_version"] != float64(guard.DefaultsVersion) {
+		t.Fatalf("guard settings: %v", info.Guard)
+	}
+	blocked := map[string]bool{guard.RuleDisk: true, guard.RuleDeleteRoot: true, guard.RulePermsRoot: true, guard.RuleBoot: true}
+	n := 0
+	for _, r := range info.Rules {
+		if !r.Switchable {
+			continue
+		}
+		n++
+		want := guard.Allow
+		if blocked[r.ID] {
+			want = guard.Block
+		}
+		if r.ID == guard.RuleElevation {
+			want = guard.Hold // administrator rights: the one rule Held by default (17 Nov)
+		}
+		if r.State != want {
+			t.Errorf("%s is %s by default, want %s", r.ID, r.State, want)
+		}
+	}
+	if n != 22 {
+		t.Errorf("%d switchable rules, want 22", n)
+	}
+	var policy struct {
+		States map[string]guard.Outcome `json:"states"`
+	}
+	agent := tc.New(d.URL, d.AgentToken(t, "head"))
+	if st, _ := call(t, agent, "GET", "/api/guard/policy", nil, &policy); st != 0 || len(policy.States) != n {
+		t.Fatalf("policy: %d %v", st, policy.States)
+	}
+	for id, o := range policy.States {
+		if (o == guard.Hold) != (id == guard.RuleElevation) || (o == guard.Block) != blocked[id] {
+			t.Errorf("the hook would apply %s to %s", o, id)
+		}
+	}
+	// Nothing to hold: the hook's hold for a rule that is Allowed is refused, no card appears.
+	hold := map[string]any{"tool": "Bash", "command": "ufw disable", "rule": guard.RuleNetwork}
+	if st, _ := call(t, agent, "POST", "/api/guard/holds", hold, nil); st != http.StatusBadRequest {
+		t.Fatalf("hold for a rule that is Allowed by default: %d", st)
+	}
 }
 
 // The owner's rule switches (3 Nov 22:14), acceptance 1, 2, 9 at the API: the defaults are listed;
@@ -37,8 +93,18 @@ func TestRuleSwitchAPI(t *testing.T) {
 	if r := rows[guard.RuleElevation]; r.State != guard.Hold || !r.Switchable {
 		t.Fatalf("elevation row: %+v", r)
 	}
-	if r := rows[guard.RuleKillByName]; r.State != guard.Allow || r.AlwaysOn == "" {
-		t.Fatalf("kill-by-name row: %+v", r)
+	if r := rows[guard.RuleKillByName]; r.State != guard.Block || r.Switchable {
+		t.Fatalf("kill-by-name row (a fixed block): %+v", r)
+	}
+	for _, id := range []string{guard.RuleBrowserScript, guard.RuleP2PInvite, guard.RuleP2PJoin, guard.RuleP2PInviteWA} {
+		if r := rows[id]; !r.Switchable {
+			t.Fatalf("%s has no switch: %+v", id, r)
+		}
+	}
+	for id, r := range rows {
+		if !r.Switchable && r.State != guard.Block {
+			t.Fatalf("the fixed rule %s is %s: only blocks are fixed", id, r.State)
+		}
 	}
 	if r := rows[guard.RuleKillTmx]; r.State != guard.Block || r.Switchable {
 		t.Fatalf("fixed carve-out row: %+v", r)

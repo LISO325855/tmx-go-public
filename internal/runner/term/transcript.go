@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -66,14 +67,22 @@ func (t *transcript) note(text string) {
 // its record ("[Pasted text #1 +12 lines]"): such a prompt is not attributed to a person.
 func (t *transcript) wasTyped(prompt string) bool {
 	p := normText(prompt)
+	// Unwrap only for comparison. If this is not a known echo, read retains prompt verbatim.
+	unwrapped := p
+	if m := outerPaste.FindStringSubmatch(p); m != nil && !pasteTag.MatchString(m[1]) {
+		unwrapped = normText(m[1])
+	}
 	for i, s := range t.typed {
-		if s == p || strings.HasPrefix(s, p) || strings.HasPrefix(p, s) {
+		if s == unwrapped || s == p || strings.HasPrefix(s, p) || strings.HasPrefix(p, s) {
 			t.typed = append(t.typed[:i], t.typed[i+1:]...)
 			return true
 		}
 	}
 	return strings.HasPrefix(p, "[Pasted text #")
 }
+
+var outerPaste = regexp.MustCompile(`(?s)^<pasted_content(?:\s[^>]*)?>(.*)</pasted_content(?:\s[^>]*)?>$`)
+var pasteTag = regexp.MustCompile(`</?pasted_content(?:\s[^>]*)?>`)
 
 func normText(s string) string {
 	return strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(s, "\r\n", "\n"), "\r", "\n"))

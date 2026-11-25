@@ -64,6 +64,26 @@ func PythonHome() (string, error) {
 // "role": "full" explicitly: a token with no role is not given a full peer's reach here.
 // A secret this daemon already holds with another value is never overwritten (ImportConflict).
 func ImportPython(cfg config.Config, p config.Paths, pyHome string) ([]Imported, error) {
+	edit := MutationMutex(p.PeersFile())
+	edit.Lock()
+	defer edit.Unlock()
+	return importPython(cfg, p, pyHome)
+}
+
+// ImportPythonCurrent is the daemon's import path: config is loaded only after
+// taking the same mutation lock as removal, pairing and rotation.
+func ImportPythonCurrent(p config.Paths, pyHome string) ([]Imported, error) {
+	edit := MutationMutex(p.PeersFile())
+	edit.Lock()
+	defer edit.Unlock()
+	cfg, err := config.Load(p)
+	if err != nil {
+		return nil, err
+	}
+	return importPython(cfg, p, pyHome)
+}
+
+func importPython(cfg config.Config, p config.Paths, pyHome string) ([]Imported, error) {
 	if !cfg.Production() || len(cfg.Peers) == 0 {
 		return nil, fmt.Errorf("import needs the %q profile with \"peers\" in config.json", config.ProfileProduction)
 	}
@@ -93,7 +113,7 @@ func ImportPython(cfg config.Config, p config.Paths, pyHome string) ([]Imported,
 		case cur != "":
 			row.Status, row.Fingerprint = ImportConflict, Fingerprint(cur)
 		default:
-			fp, err := tokens.Store(peer.Name, tok, "python-import")
+			fp, err := tokens.StoreLocked(peer.Name, tok, "python-import")
 			if err != nil {
 				return out, err
 			}

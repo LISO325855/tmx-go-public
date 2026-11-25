@@ -10,7 +10,7 @@ import (
 // between chat mode and its harness's own screen, on the same conversation. Owner only: the
 // screen is for a person to watch and type in; agents have no use for it.
 func (s *Server) modeRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("POST /api/agents/{id}/mode", s.ownerOnly(s.setMode))
+	mux.HandleFunc("POST /api/agents/{id}/mode", s.managers(s.setMode))
 }
 
 // POST /api/agents/{id}/mode {mode: chat|terminal} → {agent, pending, note}.

@@ -1,5 +1,13 @@
 # Agent policy
 
+> **Superseded in part, 17 Nov 2026 (owner decision, guard A).** The fleet no longer refuses a
+> launch because a harness is unguarded: agents always start, and an agent the command guard
+> cannot check gets an error row in its timeline instead (DESIGN.md, Safety, "Agents always
+> start"). `internal/fleet/launch_admission.go` therefore no longer calls `CheckLaunch`; the
+> function and its tests remain as the statement of which Windows launches count as guarded.
+> Elevation and unsafe working folders are still refused. Sentences below that say unguarded
+> or guard-off Windows launches are refused describe the earlier design.
+
 This package performs no process, filesystem or network operations. Launch admission
 must call `CheckLaunch` before spawn, with the canonical harness name and the host's
 actual OS. Both Claude modes use `claude`. On Windows every other harness requires

@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/blackcode-ch/tmx-go/internal/runner"
 )
 
 // Lease is daemon-created launch evidence, never an API request field. Keep it
@@ -28,6 +30,14 @@ func (l *Lease) Close() error {
 		pin.Close()
 	}
 	return nil
+}
+
+// CloseShimPin releases the departing daemon's executable handle on hosted detach.
+// The hosted command keeps its existing hard links and guarded configuration.
+func (l *Lease) CloseShimPin() {
+	if l.shimBinary != nil {
+		l.shimBinary.Close()
+	}
 }
 
 func (l *Lease) Verify() error {
@@ -61,18 +71,19 @@ func (l *Lease) Env(searchPath string) []string {
 	return []string{"CODEX_HOME=" + l.Config.Home, "PATH=" + l.Shims + string(os.PathListSeparator) + searchPath}
 }
 
-// Prepare only writes beneath base. Existing files must match exactly, so a
-// restart cannot silently trust an agent-modified config/manifest/shim.
+// Prepare only writes beneath base. Shims and non-system manifest fields must match;
+// verified Microsoft system binary updates may refresh only their recorded hashes.
+// managed config is regenerated from the daemon selection on each launch.
 // guardCtx is pinned into the manifest so a later shim run authorizes against
 // the boundary tmx chose at launch, never the agent's own environment.
-func Prepare(base, cwd, codex, tmx, searchPath string, guardCtx Guard) (lease *Lease, err error) {
+func Prepare(base, cwd, codex, tmx, searchPath string, guardCtx Guard, managed ...map[string]runner.MCPServer) (lease *Lease, err error) {
 	if !filepath.IsAbs(base) || !filepath.IsAbs(codex) || !filepath.IsAbs(tmx) {
 		return nil, fmt.Errorf("Codex guard paths must be absolute")
 	}
 	if strings.ToLower(filepath.Ext(codex)) != ".exe" {
 		return nil, fmt.Errorf("Codex guard needs the native codex.exe, not a shell wrapper")
 	}
-	lease = &Lease{Shims: filepath.Join(base, "shims"), Manifest: filepath.Join(base, "manifest.json")}
+	lease = &Lease{}
 	defer func() {
 		if err != nil {
 			lease.Close()
@@ -83,19 +94,28 @@ func Prepare(base, cwd, codex, tmx, searchPath string, guardCtx Guard) (lease *L
 		return lease, err
 	}
 	lease.pins = append(lease.pins, lease.Binary)
-	lease.Config, err = NewConfig(filepath.Join(base, "home"), cwd, "tmx supplies this agent's current instructions through its managed launch.\n")
+	lease.Config, err = NewConfig(filepath.Join(base, "home"), cwd, "tmx supplies this agent's current instructions through its managed launch.\n", managed...)
 	if err != nil {
 		return lease, err
 	}
-	if err = os.MkdirAll(lease.Shims, 0700); err != nil {
-		return lease, err
-	}
 	manifest := Manifest{Targets: map[string]Target{}, Codex: Target{Path: lease.Binary.Path, SHA256: lease.Binary.SHA256}, Guard: guardCtx}
-	lease.shimBinary, err = OpenPin(tmx)
+	lease.shimBinary, err = openPin(tmx, true)
 	if err != nil {
 		return lease, err
 	}
 	lease.pins = append(lease.pins, lease.shimBinary)
+	// A hosted agent may still use the old generation after a daemon update.
+	// Keep its manifest and hard links in place when preparing the new binary.
+	generation, genErr := shimGeneration(lease.shimBinary)
+	if genErr != nil {
+		return lease, genErr
+	}
+	shimBase := filepath.Join(base, "shim-versions", generation)
+	lease.Shims = filepath.Join(shimBase, "shims")
+	lease.Manifest = filepath.Join(shimBase, ManifestFileName)
+	if err = os.MkdirAll(lease.Shims, 0700); err != nil {
+		return lease, err
+	}
 	for _, name := range ShimNames {
 		if target, resolveErr := ResolveTarget(name, searchPath); resolveErr == nil {
 			p, pinErr := OpenPin(target)
@@ -130,6 +150,9 @@ func Prepare(base, cwd, codex, tmx, searchPath string, guardCtx Guard) (lease *L
 	if marshalErr != nil {
 		return lease, marshalErr
 	}
+	if _, refreshErr := refreshSystemManifest(lease.Manifest, manifest, verifyMicrosoftSystemFile); refreshErr != nil {
+		return lease, refreshErr
+	}
 	p, pinErr := writePinned(lease.Manifest, b)
 	if pinErr != nil {
 		return lease, pinErr
@@ -156,9 +179,10 @@ func writePinned(path string, body []byte) (*Pin, error) {
 	if err != nil {
 		return nil, err
 	}
-	if p.SHA256 != fmt.Sprintf("%x", sha256.Sum256(body)) {
+	expected := fmt.Sprintf("%x", sha256.Sum256(body))
+	if p.SHA256 != expected {
 		p.Close()
-		return nil, fmt.Errorf("managed Codex file changed: %s", filepath.Base(path))
+		return nil, fmt.Errorf("managed Codex file changed: %s (expected SHA-256 %s, actual SHA-256 %s)", path, expected, p.SHA256)
 	}
 	return p, nil
 }

@@ -69,9 +69,12 @@ type RecordingSummary struct {
 	Error string `json:"error,omitempty"`
 	// Requested: the owner asked for it (Summarize), so missing transcripts are made even when
 	// transcription is not automatic.
-	Requested  bool  `json:"requested,omitempty"`
-	CreatedAt  int64 `json:"created_at"`
-	StartedAt  int64 `json:"started_at,omitempty"`
-	FinishedAt int64 `json:"finished_at,omitempty"`
-	UpdatedAt  int64 `json:"updated_at"`
+	Requested      bool   `json:"requested,omitempty"`
+	CreatedAt      int64  `json:"created_at"`
+	StartedAt      int64  `json:"started_at,omitempty"`
+	FinishedAt     int64  `json:"finished_at,omitempty"`
+	UpdatedAt      int64  `json:"updated_at"`
+	DeadlineAt     int64  `json:"deadline_at,omitempty"`
+	AwaitingWorker bool   `json:"-"` // report reserved before the worker's process command
+	MadeHere       string `json:"-"` // durable reason for daemon fallback
 }

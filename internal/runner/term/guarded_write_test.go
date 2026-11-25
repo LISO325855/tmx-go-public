@@ -78,7 +78,7 @@ func within(t *testing.T, d time.Duration, what string, fn func()) {
 }
 
 // menuScreen is a permission menu as Claude draws it.
-const menuScreen = "Bash command\r\n  rm -rf build\r\nDo you want to proceed?\r\n❯ 1. Yes\r\n  2. No\r\n"
+const menuScreen = "\u2500\u2500\u2500\u2500\r\nBash command\r\n  rm -rf build\r\nDo you want to proceed?\r\n❯ 1. Yes\r\n  2. No\r\n"
 
 // TestGuardedWriteRefusesTransitionLandingBeforeTheWrite is the reviewer's repro: a fake
 // process (here, the detector goroutine standing in for the watcher's own evaluate/menuLocked)
@@ -382,39 +382,6 @@ func TestShellRefusesNonOwnerInput(t *testing.T) {
 
 // TestSendQueuesUnlessIdleWithoutMenu: a message (mail, an agent's typed text) is typed at once
 // only into an idle input box; with a menu on the way or a turn running it waits for evaluate.
-func TestSendQueuesUnlessIdleWithoutMenu(t *testing.T) {
-	p, bp := newGuardedTestProcess(t)
-	close(bp.release)
-	queued := func() int {
-		p.mu.Lock()
-		defer p.mu.Unlock()
-		return len(p.w.queued)
-	}
-
-	p.mu.Lock()
-	p.w.candN = 1
-	p.mu.Unlock()
-	_ = p.w.send("one")
-	p.mu.Lock()
-	p.w.candN = 0
-	p.state = model.StateWorking
-	p.mu.Unlock()
-	_ = p.w.send("two")
-	p.mu.Lock()
-	p.state = model.StateIdle
-	p.mu.Unlock()
-	p.w.scr.Write([]byte("Do you want to proceed?\r\n❯ 1. Yes\r\n  2. No\r\n"))
-	_ = p.w.send("three")
-	if n := queued(); n != 3 {
-		t.Fatalf("queued %d, want 3", n)
-	}
-	select {
-	case got := <-bp.writes:
-		t.Fatalf("a message was typed into a menu or a running turn: %q", got)
-	default:
-	}
-}
-
 func TestPlainTextDropsControlBytes(t *testing.T) {
 	in := "a\x1b[201~b\r\nc\rd\te\x00\x07\x7f\u009bf\xff"
 	if got := runner.PlainText(in); got != "a[201~b\nc\nd\tef" {

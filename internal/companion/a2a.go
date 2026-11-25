@@ -22,6 +22,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -53,6 +54,9 @@ type Client struct {
 	Token   string // the agent key; "" for the public routes (health, agent card)
 	Agent   string // X-Companion-Agent-Client, e.g. "tmx/0.1.0"
 	HTTP    *http.Client
+	// OwnerSet: the address is the one the owner gave himself (config companion.url), not one
+	// tmx found: the listener check then does not ask for the installed app (listener.go).
+	OwnerSet bool
 }
 
 // Error is a failed call. Unreachable: no connection was made, so nothing was sent.
@@ -61,6 +65,7 @@ type Client struct {
 // KeyRefused: Companion's auth layer does not accept tmx's key (unknown, removed, rotated, or
 // another account signed in): a connection problem, not a refusal of the task.
 type Error struct {
+	RetryAfter  time.Duration
 	Status      int
 	Reason      string
 	Msg         string
@@ -142,9 +147,9 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) (re
 	}
 	hc := c.HTTP
 	if hc == nil {
-		hc = &http.Client{Timeout: 20 * time.Second}
+		hc = &http.Client{Transport: &http.Transport{DisableKeepAlives: true, ResponseHeaderTimeout: 120 * time.Second}, Timeout: 135 * time.Second}
 		if c.Token != "" {
-			hc = verifiedClient()
+			hc = verifiedClient(c.OwnerSet)
 		}
 	}
 	resp, err := NoRedirectClient(hc).Do(req)
@@ -157,7 +162,9 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) (re
 		return &Error{Msg: "Companion's answer was cut off: " + err.Error(), Unconfirmed: method == http.MethodPost}
 	}
 	if resp.StatusCode >= 300 {
-		return answerError(resp.StatusCode, b, method)
+		e := AsError(answerError(resp.StatusCode, b, method))
+		e.RetryAfter = retryAfter(resp.Header.Get("Retry-After"), time.Now())
+		return e
 	}
 	if out != nil && len(b) > 0 {
 		if err := json.Unmarshal(b, out); err != nil {
@@ -170,7 +177,7 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) (re
 // transportError: a refused or unresolvable connection sent nothing; anything later may have.
 func transportError(err error, method string) error {
 	if errors.Is(err, ErrListenerIdentity) {
-		return &Error{Status: http.StatusForbidden, Msg: ErrListenerIdentity.Error()}
+		return &Error{Status: http.StatusForbidden, Msg: ListenerReason(err)} // says what failed
 	}
 	var op *net.OpError
 	if errors.Is(err, syscall.ECONNREFUSED) || errors.As(err, &op) && op.Op == "dial" {
@@ -219,17 +226,12 @@ func answerError(status int, b []byte, method string) error {
 	}
 	// Companion's own rule: a 4xx means nothing was sent or run; a 5xx is unconfirmed.
 	e.Unconfirmed = status >= 500 && method == http.MethodPost
-	// Its auth layer answers before any route runs, as {"detail": ...} (the A2A façade's own
-	// errors are {"error": ...}): 401 = the key is not accepted; 503 = it could not check the
-	// key (its list of agents is unreadable). Either way nothing was sent or run.
-	if a.Error == nil && a.Detail != nil {
-		switch status {
-		case http.StatusUnauthorized:
-			e.KeyRefused = true
-		case http.StatusServiceUnavailable:
-			e.Unconfirmed, e.Unreachable = false, true
-		}
+	// A generic 503 detail body does not prove that no task was created.
+	// Only the auth layer's 401 is known to reject before sending.
+	if a.Error == nil && a.Detail != nil && status == http.StatusUnauthorized {
+		e.KeyRefused = true
 	}
+
 	return e
 }
 
@@ -285,12 +287,18 @@ type Message struct {
 
 // Task is an A2A task as Companion returns it.
 type Task struct {
-	ID        string `json:"id"`
+	ID         string `json:"id"`
+	CreateTime string `json:"createTime,omitempty"`
+	Metadata   struct {
+		CreateTime string          `json:"createTime,omitempty"`
+		Progress   json.RawMessage `json:"progress,omitempty"`
+	} `json:"metadata,omitempty"`
 	ContextID string `json:"contextId"`
 	Status    struct {
-		State     string   `json:"state"`
-		Timestamp string   `json:"timestamp"`
-		Message   *Message `json:"message"`
+		State     string          `json:"state"`
+		Timestamp string          `json:"timestamp"`
+		Progress  json.RawMessage `json:"progress,omitempty"`
+		Message   *Message        `json:"message"`
 	} `json:"status"`
 	History   []Message `json:"history"`
 	Artifacts []struct {
@@ -302,8 +310,12 @@ type Task struct {
 // Send posts a new message (taskID "" = a new task; else the answer to that task's
 // question) with returnImmediately: Companion answers at once and tmx polls.
 func (c *Client) Send(ctx context.Context, text, taskID, contextID string) (Task, error) {
+	return c.sendMessage(ctx, text, taskID, contextID, newMessageID())
+}
+
+func (c *Client) sendMessage(ctx context.Context, text, taskID, contextID, messageID string) (Task, error) {
 	body := map[string]any{
-		"message": Message{MessageID: newMessageID(), Role: "ROLE_USER", Parts: []Part{{Text: text}},
+		"message": Message{MessageID: messageID, Role: "ROLE_USER", Parts: []Part{{Text: text}},
 			TaskID: taskID, ContextID: contextID},
 		"configuration": map[string]any{"returnImmediately": true, "historyLength": 2},
 	}
@@ -422,4 +434,16 @@ func partsText(ps []Part) string {
 		}
 	}
 	return strings.Join(b, "\n")
+}
+
+// retryAfter accepts both forms allowed by HTTP. An invalid value uses the normal backoff.
+func retryAfter(value string, now time.Time) time.Duration {
+	if seconds, err := strconv.Atoi(value); err == nil && seconds >= 0 {
+		// Bound before converting to avoid duration overflow.
+		return time.Duration(min(seconds, 86400)) * time.Second
+	}
+	if at, err := http.ParseTime(value); err == nil && at.After(now) {
+		return at.Sub(now)
+	}
+	return 0
 }

@@ -15,7 +15,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { accountKey, accountsApi, accountTitle, DEFAULT_ACCOUNT, methodLabel, sentence, type AccountStatus } from "@/lib/accounts";
+import { accountKey, accountsApi, accountTitle, fableNeedsYou, freeResetRows, methodLabel, removeExplanation, sentence, type AccountStatus } from "@/lib/accounts";
 import { relativeTime } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import { HarnessMark, InstallHint, LimitRow } from "./usage-bits";
@@ -45,6 +45,8 @@ export function AccountCard({
   const [askOut, setAskOut] = useState(false);
   const [signingOut, setSigningOut] = useState(false);
   const [askRemove, setAskRemove] = useState(false);
+  const [weekly, setWeekly] = useState(false);
+  const [resetting, setResetting] = useState(false);
   const id = a.account ?? {};
   const method = methodLabel(id.method);
   const limits = a.limits ?? [];
@@ -129,6 +131,31 @@ export function AccountCard({
       )}
 
       <div className="flex flex-1 flex-col px-4 pb-4">
+        {fableNeedsYou(a) && (
+          <p role="status" className={cn("mb-3 rounded-md bg-state-waiting/10 p-2.5 text-xs", AMBER)}>
+            <strong>Needs you</strong> · {a.reset?.state === "needs_you" ? a.reset.message : `${title}'s Fable usage has reached 95%. Free Fable reset will be attempted at 99%.`}
+          </p>
+        )}
+        {a.harness === "claude" && a.connected && a.account?.method !== "api_key" && (
+          <div className="mb-4 space-y-2 rounded-md border p-2.5 text-xs" aria-label="Free resets">
+            {freeResetRows(a, now).map((r) => (
+              <p key={r.label}><strong>{r.label}</strong><br /><span className="text-muted-foreground">{r.detail}</span></p>
+            ))}
+            {a.reset && a.reset.state !== "needs_you" && <p role="status">{a.reset.message}</p>}
+            <p className="text-muted-foreground">Fable resets automatically at 99% when a free reset is usable. Weekly resets require your switch each time.</p>
+            <label className="flex items-center gap-2">
+              <input type="checkbox" role="switch" checked={weekly} disabled={resetting} onChange={(e) => setWeekly(e.target.checked)} />
+              Use one free Weekly reset for {id.email || title}
+            </label>
+            {weekly && <Button size="sm" disabled={resetting || !id.email} onClick={async () => {
+              setResetting(true);
+              try { await accountsApi.reset(a.name, id.email!, "weekly"); setWeekly(false); }
+              catch (e) { toast.error("Weekly reset could not be requested", { description: (e as Error).message }); }
+              finally { setResetting(false); }
+            }}>Confirm Weekly reset at 99%</Button>}
+            {a.reset?.state === "needs_you" && <p>Check /usage and free reset offers in Claude for this account. An unverified attempt is never retried automatically.</p>}
+          </div>
+        )}
         {a.connected ? (
           limits.length > 0 ? (
             <div className="space-y-4 pt-1">
@@ -191,36 +218,30 @@ export function AccountCard({
             </TooltipTrigger>
             <TooltipContent>Check again</TooltipContent>
           </Tooltip>
-          <Button variant="ghost" size="xs" className="text-muted-foreground" disabled={signingOut} onClick={() => setAskOut(true)}>
+          <Button variant="ghost" size="xs" className="text-muted-foreground" disabled={signingOut || !!a.sign_out_reason} title={a.sign_out_reason} onClick={() => setAskOut(true)}>
             {signingOut && <Loader2 className="animate-spin" />}
             Sign out
           </Button>
         </footer>
       )}
 
-      {multi && (!a.launch_default || a.name !== DEFAULT_ACCOUNT) && (
-        <div className="flex items-center gap-1 border-t px-4 py-1.5">
-          {!a.launch_default && (
-            <Button variant="ghost" size="xs" className="text-muted-foreground" onClick={() => void makeDefaultForNew()}>
-              Use for new agents
-            </Button>
-          )}
-          {a.name !== DEFAULT_ACCOUNT && (
-            <Button variant="ghost" size="xs" className="ml-auto text-muted-foreground" disabled={login === "running"} onClick={() => setAskRemove(true)}>
-              Remove
-            </Button>
-          )}
-        </div>
-      )}
+      {/* Every card can be removed (the owner, 17 Nov): a named account leaves the list, a default one is hidden. */}
+      <div className="flex items-center gap-1 border-t px-4 py-1.5">
+        {multi && !a.launch_default && (
+          <Button variant="ghost" size="xs" className="text-muted-foreground" onClick={() => void makeDefaultForNew()}>
+            Use for new agents
+          </Button>
+        )}
+        <Button variant="ghost" size="xs" className="ml-auto text-muted-foreground" disabled={login === "running"} onClick={() => setAskRemove(true)}>
+          Remove
+        </Button>
+      </div>
 
       <AlertDialog open={askRemove} onOpenChange={setAskRemove}>
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>Remove {title}?</AlertDialogTitle>
-            <AlertDialogDescription>
-              It leaves the list. Its folder on this machine, and any sign-in in it, stay: sign out first to end the sign-in. Agents that already use
-              it keep using it.
-            </AlertDialogDescription>
+            <AlertDialogDescription>{removeExplanation(a)}</AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel>Keep it</AlertDialogCancel>

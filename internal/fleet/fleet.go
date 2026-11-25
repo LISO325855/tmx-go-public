@@ -15,9 +15,11 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/blackcode-ch/tmx-go/internal/claudeext"
 	"github.com/blackcode-ch/tmx-go/internal/config"
 	"github.com/blackcode-ch/tmx-go/internal/discover"
 	"github.com/blackcode-ch/tmx-go/internal/guard"
@@ -25,6 +27,7 @@ import (
 	"github.com/blackcode-ch/tmx-go/internal/p2p"
 	"github.com/blackcode-ch/tmx-go/internal/people"
 	"github.com/blackcode-ch/tmx-go/internal/processes"
+	"github.com/blackcode-ch/tmx-go/internal/rules"
 	"github.com/blackcode-ch/tmx-go/internal/runner"
 	"github.com/blackcode-ch/tmx-go/internal/store"
 	"github.com/blackcode-ch/tmx-go/internal/sysinfo"
@@ -41,6 +44,9 @@ type Options struct {
 	Store      *store.Store
 	Paths      config.Paths
 	Runners    map[model.Mode]runner.Runner
+
+	FaeRuntimeContextCap int
+
 	// Elevated is a trusted host capability, never a request/config field. Nil
 	// uses the real process token; fake-runner tests supply their simulated host.
 	Elevated func() bool
@@ -58,7 +64,7 @@ type Options struct {
 	// Policy seeds the built-in profiles when the store has none yet (config.json "policy";
 	// zero = model.DefaultPolicy()). Afterwards the profiles in the store are authoritative.
 	Policy    model.Policy
-	Guard     *guard.Settings // nil = guard.DefaultSettings() (on for everyone)
+	Guard     *guard.Settings // nil = guard.DefaultSettings() (every rule at its default)
 	SaveGuard func(guard.Settings) error
 	P2P       p2p.Node // the peer-to-peer node (DESIGN.md "Peer-to-peer network"); nil = off
 	Logger    *slog.Logger
@@ -68,16 +74,33 @@ type Options struct {
 	Suspend func(pid int, stop bool) ([]sysinfo.Proc, error)
 	// Discover finds agents started outside tmx (discover/adopt); nil = the real machine.
 	Discover *discover.Scanner
+	// ClaudeExt reads the owner's Claude Code MCP servers for profiles that add some
+	// (Profile.MCPServers); nil = none are added (the agent's timeline says so).
+	ClaudeExt *claudeext.Service
 	// AgentBypass: Claude agents with the guard hook run in bypass mode (guard.go); nil = on.
-	AgentBypass *bool
+	AgentBypass  *bool
+	AgentMachine bool
 	// FleetAuthorities are "name@host" senders whose peer mail counts as the owner's standing
 	// order (authority.go); nil = DefaultFleetAuthorities.
 	FleetAuthorities []string
+	FleetLead        string // explicit attested remote agent@node
 	// Teammates are the people the owner marked as teammates of a project (authority.go);
 	// nil or empty = none.
 	Teammates []model.Teammate
 	// Accounts are the harnesses' named accounts (internal/accounts); nil = one account each.
 	Accounts AccountHomes
+	// ResetInFlight protects a quota reset until verification or its deadline.
+	ResetInFlight func(time.Time) bool
+	// UIProfile is config.json "ui.profile": "" or config.UIProfileClassic. Classic makes Claude
+	// agents start in Claude Code's own screen when a launch names no mode (harness.go), and the
+	// snapshot tells the dashboard to be the Python one. Trusted config, never agent input.
+	UIProfile string
+	// Watch is config.json "watch": what the head is told about the machine and the fleet
+	// (watch.go); nil = the defaults (on).
+	Watch *config.WatchConfig
+	// Rules is the fleet's rules source (rules.go, internal/rules): its text opens every agent's
+	// instructions. nil = none, the instructions are the profile's as before.
+	Rules *rules.Service
 }
 
 // Fleet is the orchestrator. Create with New, then Start; Close on shutdown.
@@ -85,6 +108,7 @@ type Fleet struct {
 	approvalNotify  approvalNotifications
 	hostRetry       time.Duration                  // hosting.go
 	stopHost        func(dir string) (bool, error) // hosting.go
+	fleetLead       string                         // guarded by mu; requires per-message attestation
 	authorities     map[string]bool                // authority.go
 	teammates       []model.Teammate               // authority.go
 	processes       *processes.Registry
@@ -105,49 +129,78 @@ type Fleet struct {
 	reminders           *people.Scheduler // people.go: durable reminders
 	reminderLoopStarted bool
 	shelveLoopStarted   bool
-	profiles            map[string]*model.Profile // by slug
-	agents              map[string]*agentRec      // by ID
-	projects            map[string]*model.Project
-	tokens              map[string]string      // agent token -> agent ID
-	perms               map[string]permRequest // pending permission approval ID -> harness request
-	res                 resState               // launch queue and brakes (resources.go)
-	safety              *safetyState           // guard settings and holds (guard.go)
+	mailLoopOnce        sync.Once // mail_backstop.go
+	// disk_floor.go: the last reading of the data volume.
+	diskReadAt time.Time
+	diskLow    bool
+	diskFree   uint64
+	profiles   map[string]*model.Profile // by slug
+	agents     map[string]*agentRec      // by ID
+	projects   map[string]*model.Project
+	tokens     map[string]string      // agent token -> agent ID
+	perms      map[string]permRequest // pending permission approval ID -> harness request
+	res        resState               // launch queue and brakes (resources.go)
+	safety     *safetyState           // guard settings and holds (guard.go)
 
 	companion    CompanionDecider   // decides approvals of kind companion (companion.go); nil = none
 	companionMsg CompanionMessenger // sends the head's messages to Companion (companion.go); nil = none
 	whatsapp     CompanionDecider   // decides approvals of kind whatsapp (whatsapp.go); nil = none
 
-	rateLimited func(model.Harness, string, runner.RateLimit) // ratelimit.go; nil = none
+	rateLimited     func(model.Harness, string, runner.RateLimit) // ratelimit.go; nil = none
+	claudeAlternate func(account, model string) string
 
 	peer peerState // mail to and from the fleet's other machines (peermail.go)
+
+	watch   watchState    // the watch board and its sources (watch.go, watch_fleet.go)
+	procreg *procRegistry // processes seen under the agents (registry.go)
 }
 
 // agentRec is the live state of one agent. Guarded by Fleet.mu.
 type agentRec struct {
-	recovery crashRecovery
-	a        model.Agent
-	proc     runner.Process
-	done     chan struct{} // closed when the current process's event loop ends
-	starting bool          // a runner.Start is in flight
-	stopping bool          // a stop was requested; the exit becomes "stopped"
+	mailInterrupt bool
+	mailNudge     bool // priority mail arrived during an in-progress handoff
+	mailHandoff   bool // claim-to-runner handoff in progress; guarded by Fleet.mu
+	recovery      crashRecovery
+	a             model.Agent
+	proc          runner.Process
+	done          chan struct{}        // closed when the current process's event loop ends
+	starting      bool                 // a runner.Start is in flight
+	accountSwitch bool                 // one account restart at a time
+	accountOrigin *claudeAccountOrigin // original resume path until the alternate is ready
+	stopping      bool                 // a stop was requested; the exit becomes "stopped"
 	// detaching: the daemon is stopping and left the process running in its session host
 	// (runner.Detacher): its end is not an exit.
 	detaching bool
 	// hostUnknown: whether its session host still runs could not be told (hosting.go); it is
 	// not started again (two copies on one conversation) until that is settled.
-	hostUnknown  bool
-	hostRetrying bool // a retryHost loop is waiting
-	hostStopping bool // stopUnknownHost runs: no start until it is done
-	token        string
-	seq          int64
+	hostUnknown      bool
+	handoverState    model.AgentState // persisted state before this daemon touched the agent
+	repaintAttention bool             // one visible warning per handover
+	repaintRestarted bool             // one automatic legacy repaint recovery per daemon handover
+	hostRetrying     bool             // a retryHost loop is waiting
+	hostStopping     bool             // stopUnknownHost runs: no start until it is done
+	token            string
+	seq              int64
 	// sessionConfirmed: the harness reported SessionID, so the conversation exists and is
 	// resumed; otherwise a pre-assigned SessionID is passed as a new conversation's id.
 	sessionConfirmed bool
-	waiting          int // pending permission approvals
-	terms            map[*TerminalSub]struct{}
-	humanInputAt     time.Time // the owner last typed into its terminal
-	retryMail        bool      // a delivery retry (after human typing) is scheduled
-	// instructionsDue: a harness that takes no system prompt (opencode, pi) gets tmx's
+	// freshFallback: this agent was already restarted once with a new conversation because
+	// the harness did not have the old one (resume_fallback.go); not a second time.
+	freshFallback bool
+	// codexLost: the stored Codex conversation was found nowhere at the last start
+	// (codex_carry.go): a new conversation's id is not stored over it.
+	codexLost bool
+	// procStarted: when this daemon started the process that runs now (ms; 0 = none, or one
+	// that was reattached). Mail claimed since then was written to that process and no other.
+	procStarted  int64
+	waiting      int // pending permission approvals
+	terms        map[*TerminalSub]struct{}
+	humanInputAt time.Time // the owner last typed into its terminal
+	retryMail    bool      // a delivery retry (after human typing) is scheduled
+	// instructionsDue: after a start on an earlier conversation, a harness that takes its
+	// instructions at launch (Claude, Codex) gets them again, with the project's CLAUDE.md
+	// pointer, in front of its next prompt or mail (harness.go resumedNoteLocked). And:
+	// a harness that takes no system prompt (opencode, pi) gets tmx's
 	// instructions again with its next prompt or mail: after a resume (its conversation
 	// carries them only from its first message), and every instructionsEvery of use (these
 	// harnesses don't tell tmx when they compact). instructionsAt: when it last got them.
@@ -155,15 +208,23 @@ type agentRec struct {
 	instructionsAt  time.Time
 	// The head's board (board.go): the thread of the current turn, the seq it started at,
 	// and whether its thread was chosen (else an unfiled General turn may move when it ends).
-	thread       string
+	thread string
+	// nextThread: the Board topic of an owner's message that reached the head in the middle
+	// of a turn on another topic; it begins when the running turn ends (events.go).
+	nextThread   string
+	nextExplicit bool
 	turnFrom     int64
 	turnExplicit bool
 	// Live mode switch (mode.go): when it last became idle, whether a switch is scheduled or
 	// running, and whether its process ended by itself while switched (it then goes home).
-	idleAt          time.Time
-	switchScheduled bool
-	switching       bool
-	goHome          bool
+	idleAt             time.Time
+	updateIdleAt       time.Time        // positive runner idle evidence, even while a brake masks State
+	updateActivity     time.Time        // turn activity, excluding terminal redraws and system notes
+	updateTurnActivity time.Time        // state transitions or transcript/turn events, never screen progress
+	updateState        model.AgentState // last fleet state observed by the hard update deadline
+	switchScheduled    bool
+	switching          bool
+	goHome             bool
 }
 
 type permRequest struct {
@@ -196,10 +257,10 @@ func New(opts Options) (*Fleet, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	f := &Fleet{
 		hostRetry: hostRetry, stopHost: stopHost, // hosting.go
-		authorities: normalizeAuthorities(opts.FleetAuthorities),
-		teammates:   normalizeTeammates(opts.Teammates),
-		processes:   processes.New(),
-		opts:        opts, st: opts.Store, log: opts.Logger, bus: newBus(),
+		authorities: normalizeAuthorities(opts.FleetAuthorities), fleetLead: strings.ToLower(opts.FleetLead),
+		teammates: normalizeTeammates(opts.Teammates),
+		processes: processes.New(),
+		opts:      opts, st: opts.Store, log: opts.Logger, bus: newBus(),
 		ctx: ctx, cancel: cancel,
 		profiles: map[string]*model.Profile{},
 		agents:   map[string]*agentRec{},
@@ -234,7 +295,10 @@ func New(opts Options) (*Fleet, error) {
 		if err != nil {
 			return nil, err
 		}
-		f.agents[a.ID] = &agentRec{a: a, seq: seq, sessionConfirmed: a.SessionID != "" && talked}
+		// Fae workers only record a session after OpenCode creates it. Their TUI can
+		// have a resumable session before tmx has recorded a turn in its timeline.
+		confirmed := a.SessionID != "" && (talked || (a.Harness == model.HarnessOpenCode && a.Profile == model.FreeWorkerProfile))
+		f.agents[a.ID] = &agentRec{a: a, seq: seq, handoverState: a.State, sessionConfirmed: confirmed}
 	}
 	projects, err := f.st.ListProjects()
 	if err != nil {
@@ -250,6 +314,8 @@ func New(opts Options) (*Fleet, error) {
 		return nil, err
 	}
 	f.startApprovalNotifications()
+	f.initWatch()
+	f.initRegistry()
 	return f, nil
 }
 
@@ -269,10 +335,28 @@ func (f *Fleet) Unsubscribe(s *Sub) { f.bus.Unsubscribe(s) }
 // waits for their event loops. A process in a session host (runner.Detacher) is left
 // running instead: the next daemon reattaches to it (DESIGN.md "Restarts").
 func (f *Fleet) Close(ctx context.Context) error {
+	// A runner or hosted tool can be stuck waiting on inherited pipes.
+	// The process stops waiting at the deadline even if that cleanup has
+	// not returned.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f.closeRunners(ctx)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		f.cancel()
+		return ctx.Err()
+	}
+}
+
+func (f *Fleet) closeRunners(ctx context.Context) {
 	f.mu.Lock()
 	if f.closed {
 		f.mu.Unlock()
-		return nil
+		return
 	}
 	f.closed = true
 	var ids []string
@@ -281,7 +365,7 @@ func (f *Fleet) Close(ctx context.Context) error {
 		if r.proc == nil {
 			continue
 		}
-		if d, ok := r.proc.(runner.Detacher); ok && f.hostedLocked(r.a) {
+		if d, ok := r.proc.(runner.Detacher); ok && r.accountOrigin == nil && f.hostedLocked(r.a) {
 			r.detaching = true
 			detach = append(detach, d)
 			continue
@@ -303,14 +387,7 @@ func (f *Fleet) Close(ctx context.Context) error {
 	}
 	wg.Wait()
 	f.cancel()
-	done := make(chan struct{})
-	go func() { f.wg.Wait(); close(done) }()
-	select {
-	case <-done:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	f.wg.Wait()
 }
 
 // Snapshot is the whole fleet as the UI and agents see it.
@@ -326,7 +403,7 @@ func (f *Fleet) Snapshot() (model.Snapshot, error) {
 	defer f.mu.Unlock()
 	s := model.Snapshot{
 		RollbackWarning: f.st.RollbackWarning(),
-		Machine:         f.opts.Machine, Version: f.opts.Version, Workspace: f.opts.Workspace,
+		Machine:         f.opts.Machine, Version: f.opts.Version, Workspace: f.opts.Workspace, UIProfile: f.opts.UIProfile,
 		Policy: f.policyLocked(), Profiles: f.profileListLocked(), Approvals: pending,
 		Agents: f.agentsLocked(), Projects: f.projectsLocked(),
 	}
@@ -443,13 +520,16 @@ func (f *Fleet) headLocked() *agentRec {
 	return nil
 }
 
-// saveAgentLocked persists an agent and publishes agent.updated. A live mode switch is not
-// stored (mode.go): the store keeps the launch mode, which a daemon restart brings back.
+// saveAgentLocked persists an agent's current mode and publishes agent.updated.
 func (f *Fleet) saveAgentLocked(r *agentRec) {
+	if r.updateState != r.a.State {
+		r.updateTurnActivity = time.Now()
+		r.updateState = r.a.State
+	}
 	r.a.UpdatedAt = model.Now()
 	stored := r.a
-	if stored.HomeMode != "" {
-		stored.Mode = stored.HomeMode
+	if origin := r.accountOrigin; origin != nil {
+		stored.Account, stored.SessionID = origin.account, origin.session
 	}
 	if err := f.st.PutAgent(stored); err != nil {
 		f.log.Error("store agent", "agent", r.a.Name, "err", err)
@@ -478,6 +558,9 @@ func (f *Fleet) nameOfLocked(id string) string {
 	}
 	if id == model.WhatsAppParty {
 		return "WhatsApp"
+	}
+	if id == model.WatchParty {
+		return "tmx watch"
 	}
 	if name, host, ok := SplitPeer(id); ok {
 		return name + "@" + host

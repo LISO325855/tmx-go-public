@@ -1,5 +1,7 @@
-// "New agent" in a project: name, harness (installed or not, chat or terminal only), mode,
-// profile, model, role and brief. The brief is also the agent's first message.
+// "New agent": name, harness (installed or not, chat or terminal only), mode, profile, model,
+// role and brief. The brief is also the agent's first message. Opened from a project page it is
+// for that project; opened from anywhere else (ui.openNewAgent(): the sidebar's "+ Agent", the
+// Ctrl K search; parity A5, as Python's "+ Agent") the project is a field of the form.
 import { useEffect, useMemo, useState } from "react";
 import { Eye, Loader2, MessagesSquare, SquareTerminal } from "lucide-react";
 import { toast } from "sonner";
@@ -9,14 +11,17 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
+import { useClassic } from "@/hooks/use-classic";
 import { api } from "@/lib/api";
 import { modelName } from "@/lib/format";
-import { FALLBACK_HARNESSES } from "@/lib/harness";
+import { defaultLaunchMode, FALLBACK_HARNESSES } from "@/lib/harness";
 import { useHarnessAccounts } from "@/lib/accounts";
 import { sortProfiles } from "@/lib/profiles";
-import { navigate, paths } from "@/lib/router";
+import { navigate, paths, useRoute } from "@/lib/router";
 import { useStore } from "@/lib/store";
 import type { Harness, HarnessInfo, Mode, Project } from "@/lib/types";
+import { ui, useUI } from "@/lib/ui";
+import { newAgentProjects, pickNewAgentProject } from "@/lib/project-create";
 import { cn } from "@/lib/utils";
 
 const NAME_RX = /^[a-z0-9][a-z0-9-]{0,39}$/;
@@ -41,13 +46,13 @@ function Tag({ children, tone = "muted" }: { children: React.ReactNode; tone?: "
   );
 }
 
-function HarnessOption({ h, selected, onSelect }: { h: HarnessInfo; selected: boolean; onSelect: () => void }) {
+function HarnessOption({ h, selected, onSelect, locked }: { h: HarnessInfo; selected: boolean; onSelect: () => void; locked: boolean }) {
   return (
     <button
       type="button"
       role="radio"
       aria-checked={selected}
-      disabled={!h.installed}
+      disabled={!h.installed || locked}
       onClick={onSelect}
       title={h.installed ? h.path : `Not installed here${h.install ? `: ${h.install}` : ""}`}
       className={cn(
@@ -64,19 +69,49 @@ function HarnessOption({ h, selected, onSelect }: { h: HarnessInfo; selected: bo
   );
 }
 
-export function NewAgentDialog({ project, open, onOpenChange }: { project: Project; open: boolean; onOpenChange: (v: boolean) => void }) {
+/** The New agent dialog opened from anywhere (lib/ui.ts openNewAgent): mounted once in App. */
+export function NewAgentHost() {
+  const st = useUI((s) => s.newAgent);
+  const route = useRoute();
+  // the project of the page you are on is the one offered first
+  const here = useStore((s) => (route.name === "project" ? route.id : route.name === "agent" ? s.agents[route.id]?.project_id : undefined));
+  return <NewAgentDialog open={!!st} onOpenChange={(v) => ui.openNewAgent(v)} initialProjectId={(st ? st.projectId : undefined) ?? here} />;
+}
+
+export function NewAgentDialog({
+  project: fixed,
+  open,
+  onOpenChange,
+  initialProjectId,
+}: {
+  /** the project the agent goes into; without it the form has a Project field */
+  project?: Project;
+  open: boolean;
+  onOpenChange: (v: boolean) => void;
+  /** without a fixed project: the one the Project field starts on */
+  initialProjectId?: string;
+}) {
   const profiles = useStore((s) => s.profiles);
-  const hasLead = useStore((s) => !!project.lead_id && !!s.agents[project.lead_id]);
-  const [harnesses, setHarnesses] = useState<HarnessInfo[]>(FALLBACK_HARNESSES);
+  const allProjects = useStore((s) => s.projects);
+  const [projectId, setProjectId] = useState("");
+  const offered = useMemo(() => newAgentProjects(Object.values(allProjects)), [allProjects]);
+  const project = fixed ?? allProjects[projectId];
+  const hasLead = useStore((s) => !!project?.lead_id && !!s.agents[project.lead_id]);
+  const classic = useClassic();
+  const [harnesses, setHarnesses] = useState<HarnessInfo[]>([]);
+  const [harnessReadFailed, setHarnessReadFailed] = useState(false);
   const [name, setName] = useState("");
-  const [harness, setHarness] = useState<Harness>("claude");
-  const [mode, setMode] = useState<Mode>("chat");
+  const [chosenHarness, setHarness] = useState<Harness>("claude");
+  const [chosenMode, setMode] = useState<Mode>("chat");
   const [profile, setProfile] = useState("worker");
   const [model, setModel] = useState("");
   const [role, setRole] = useState("");
   const [brief, setBrief] = useState("");
   const [agyFullAccess, setAgyFullAccess] = useState(false);
   const [account, setAccount] = useState(""); // "" = the harness's default for new agents
+  const prof = profiles[profile];
+  const harness = prof?.harness ?? chosenHarness;
+  const mode = prof?.harness ? "terminal" : chosenMode;
   const harnessAccounts = useHarnessAccounts(harness);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -85,7 +120,10 @@ export function NewAgentDialog({ project, open, onOpenChange }: { project: Proje
     if (!open) return;
     setName("");
     setHarness("claude");
-    setMode("chat");
+    setHarnesses([]);
+    setHarnessReadFailed(false);
+    // classic: Claude Code starts in its own screen, as in Python (lib/harness.ts defaultLaunchMode)
+    setMode(defaultLaunchMode(FALLBACK_HARNESSES[0], classic));
     setProfile("worker");
     setModel("");
     setRole("");
@@ -93,40 +131,42 @@ export function NewAgentDialog({ project, open, onOpenChange }: { project: Proje
     setAgyFullAccess(false);
     setError("");
     setBusy(false);
+    // read once when the dialog opens: a project changing elsewhere must not reset the form
+    setProjectId(pickNewAgentProject(Object.values(useStore.getState().projects), initialProjectId));
     let live = true;
     api
       .harnesses()
-      .then((hs) => live && hs?.length && setHarnesses(hs))
-      .catch(() => {});
+      .then((hs) => { if (live) setHarnesses(hs); })
+      .catch(() => { if (live) setHarnessReadFailed(true); });
     return () => {
       live = false;
     };
-  }, [open]);
+  }, [open, classic, initialProjectId]);
 
   const info = harnesses.find((h) => h.name === harness) ?? harnesses[0];
   const choices = useMemo(
     () => sortProfiles(Object.values(profiles)).filter((p) => p.level === "worker" || (p.level === "lead" && !hasLead)),
     [profiles, hasLead],
   );
-  const prof = profiles[profile];
-  const claudeModels = Array.from(new Set([prof?.model ?? "", ...(prof?.allowed_models ?? [])].filter(Boolean)));
-  const isClaude = harness === "claude";
+  const profileModels = Array.from(new Set([prof?.model ?? "", ...(prof?.allowed_models ?? [])].filter(Boolean)));
+  const usesProfileModel = harness === "claude" || !!prof?.provider;
   const isShell = harness === "shell";
-  const shownModel = isClaude ? model || prof?.model || "" : model;
+  const shownModel = usesProfileModel ? model || prof?.model || "" : model;
   const readOnlyOnPi = harness === "pi" && !!prof?.read_only;
   const nameOK = NAME_RX.test(name);
-  const canCreate = nameOK && !!info?.installed && !readOnlyOnPi && !busy;
+  const canCreate = nameOK && !!project && !!info?.installed && !readOnlyOnPi && !busy;
 
   function pickHarness(h: HarnessInfo) {
     setHarness(h.name);
     setAccount("");
-    setMode(h.modes.includes(mode) ? mode : h.modes[0]);
+    // classic: each harness starts on its own default (Claude its screen, Codex chat)
+    setMode(classic ? defaultLaunchMode(h, true) : h.modes.includes(mode) ? mode : h.modes[0]);
     setModel("");
   }
 
   async function create(e: React.FormEvent) {
     e.preventDefault();
-    if (!canCreate) return;
+    if (!canCreate || !project || !info) return;
     setBusy(true);
     setError("");
     try {
@@ -136,11 +176,11 @@ export function NewAgentDialog({ project, open, onOpenChange }: { project: Proje
         profile,
         harness,
         mode,
-        model: isShell ? undefined : isClaude ? (model && model !== prof?.model ? model : undefined) : model.trim() || undefined,
+        model: isShell ? undefined : usesProfileModel ? (model && model !== prof?.model ? model : undefined) : model.trim() || undefined,
         role: role.trim() || undefined,
         brief: brief.trim() || undefined,
         agy_full_access: (harness === "agy" || harness === "antigravity") && agyFullAccess || undefined,
-        account: account || undefined,
+        account: prof?.account || account || undefined,
       });
       onOpenChange(false);
       toast.success(`Started ${a.name}`, { description: `${info.label} in ${mode} mode` });
@@ -156,9 +196,52 @@ export function NewAgentDialog({ project, open, onOpenChange }: { project: Proje
       <DialogContent className="max-h-[92dvh] overflow-y-auto sm:max-w-[37.5rem]">
         <form onSubmit={create} className="grid gap-4">
           <DialogHeader>
-            <DialogTitle>New agent in {project.name}</DialogTitle>
+            <DialogTitle>{fixed ? `New agent in ${fixed.name}` : "New agent"}</DialogTitle>
             <DialogDescription>It starts in the project folder{hasLead ? " and reports to the lead" : ""}.</DialogDescription>
           </DialogHeader>
+
+          {!fixed && (
+            <div className="grid gap-1.5">
+              <Label htmlFor="na-project">Project</Label>
+              {offered.length > 0 ? (
+                <Select
+                  value={projectId}
+                  onValueChange={(v) => {
+                    setProjectId(v);
+                    setProfile("worker"); // the lead profile is only offered where there is no lead yet
+                    setModel("");
+                  }}
+                >
+                  <SelectTrigger id="na-project" className="w-full" aria-label="Project">
+                    <SelectValue placeholder="Pick a project" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {offered.map((p) => (
+                      <SelectItem key={p.id} value={p.id}>
+                        <span>{p.name}</span>
+                        {p.status !== "active" && <span className="text-2xs text-muted-foreground">{p.status}</span>}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              ) : (
+                <p className="text-xs text-muted-foreground">There is no project yet. An agent lives in a project.</p>
+              )}
+              <p className="text-2xs text-muted-foreground">
+                The agent works in this project's folder.{" "}
+                <button
+                  type="button"
+                  className="text-brand underline-offset-2 hover:underline"
+                  onClick={() => {
+                    onOpenChange(false);
+                    ui.openNewProject(true);
+                  }}
+                >
+                  New project…
+                </button>
+              </p>
+            </div>
+          )}
 
           <div className="grid gap-1.5">
             <Label htmlFor="na-name">Name</Label>
@@ -178,9 +261,10 @@ export function NewAgentDialog({ project, open, onOpenChange }: { project: Proje
 
           <div className="grid gap-1.5">
             <span className="text-sm font-medium">Harness</span>
+            {harnessReadFailed && <p className="text-sm text-muted-foreground">Harness status unavailable.</p>}
             <div role="radiogroup" aria-label="Harness" className="grid grid-cols-2 gap-2 sm:grid-cols-3">
               {harnesses.map((h) => (
-                <HarnessOption key={h.name} h={h} selected={h.name === harness} onSelect={() => pickHarness(h)} />
+                <HarnessOption key={h.name} h={h} selected={h.name === harness} onSelect={() => pickHarness(h)} locked={!!prof?.harness} />
               ))}
             </div>
           </div>
@@ -212,7 +296,7 @@ export function NewAgentDialog({ project, open, onOpenChange }: { project: Proje
             </div>
             <p className="text-2xs text-muted-foreground">
               {MODE_HINT[mode]}
-              {!info?.structured && !isShell && ` ${info?.label} has no chat mode.`}
+              {info && !info.structured && !isShell && ` ${info.label} has no chat mode.`}
             </p>
           </div>
 
@@ -249,13 +333,13 @@ export function NewAgentDialog({ project, open, onOpenChange }: { project: Proje
               <Label htmlFor="na-model">Model</Label>
               {isShell ? (
                 <Input id="na-model" value="" disabled placeholder="A shell has no model" />
-              ) : isClaude ? (
+              ) : usesProfileModel ? (
                 <Select value={shownModel} onValueChange={setModel}>
                   <SelectTrigger id="na-model" className="w-full" aria-label="Model">
                     <SelectValue placeholder="The profile's model" />
                   </SelectTrigger>
                   <SelectContent>
-                    {claudeModels.map((m) => (
+                    {profileModels.map((m) => (
                       <SelectItem key={m} value={m}>
                         <span>{modelName(m)}</span>
                         <span className="font-mono text-2xs text-muted-foreground">{m}</span>
@@ -275,7 +359,7 @@ export function NewAgentDialog({ project, open, onOpenChange }: { project: Proje
               )}
               {!isShell && (
                 <p className="text-2xs text-muted-foreground">
-                  {isClaude ? "Models this profile allows." : "Empty uses the harness's own default."}
+                  {usesProfileModel ? "Models this profile allows." : "Empty uses the harness's own default."}
                 </p>
               )}
             </div>

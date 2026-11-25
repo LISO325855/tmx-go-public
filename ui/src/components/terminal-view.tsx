@@ -1,13 +1,19 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode, type RefObject } from "react";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { FitAddon } from "@xterm/addon-fit";
 import { Loader2, PlugZap } from "lucide-react";
+import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { useStore } from "@/lib/store";
+import { useGate } from "@/lib/owner-gate";
+import { guardTerminalForGate } from "@/lib/gate-focus";
 import { useTheme } from "@/lib/theme";
 import { cn } from "@/lib/utils";
+import { agentOfTerminalPath } from "@/lib/transport";
+import { stripTerminalQueryReplies } from "@/lib/terminal-input";
 import { remScale } from "@/lib/text-size";
+import { isLoginPasteShortcut, loginPaste } from "@/lib/login-paste";
 
 function themeFor(dark: boolean) {
   return dark
@@ -51,7 +57,7 @@ function themeFor(dark: boolean) {
  * ended: what shows once the socket closes; without it, Disconnected with a Reconnect button
  * (an agent's pty outlives the socket, so reconnecting attaches again).
  */
-export function TerminalView({ path, focusTick, ended, className }: { path: string; focusTick?: number; ended?: ReactNode; className?: string }) {
+export function TerminalView({ path, focusTick, ended, className, autoFocus = true, loginCode }: { autoFocus?: boolean; path: string; focusTick?: number; ended?: ReactNode; className?: string; loginCode?: RefObject<((code: string) => boolean) | null> }) {
   const host = useRef<HTMLDivElement>(null);
   const term = useRef<Terminal | null>(null);
   const transport = useStore((s) => s.transport);
@@ -74,23 +80,67 @@ export function TerminalView({ path, focusTick, ended, className }: { path: stri
     });
     const fit = new FitAddon();
     t.loadAddon(fit);
-    t.open(host.current);
+    const element = host.current;
+    t.open(element);
     term.current = t;
+    const unguard = guardTerminalForGate(t, useGate);
+    t.attachCustomKeyEventHandler(() => !useGate.getState().confirming);
     try {
       fit.fit();
     } catch {
       /* not visible yet */
     }
     setState("connecting");
+    let open = false;
     const session = transport.openTerminal(path, t.cols, t.rows, {
-      onOpen: () => setState("open"),
+      onOpen: () => { open = true; setState("open"); },
       onData: (d) => t.write(d),
       onClose: () => {
+        open = false;
         if (finite) t.write("\x1b[?25l");
         setState("closed");
       },
     });
-    const sub = t.onData((d) => session.write(d));
+    function sendCode(code: string, submit = false) {
+      const input = loginPaste(code, submit);
+      if (!input || !open || useGate.getState().confirming) return false;
+      session.write(input);
+      return true;
+    }
+    function pasteClipboard(event: Event) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      if (!open || useGate.getState().confirming) return;
+      const read = window.runtime?.ClipboardGetText?.() ?? navigator.clipboard?.readText();
+      if (!read) {
+        toast.info("Use the Paste the code field below.");
+        return;
+      }
+      void read.then((code) => {
+        if (!sendCode(code)) toast.info("Use the Paste the code field below.");
+      }, () => toast.info("Use the Paste the code field below."));
+    }
+    function pasteEvent(event: ClipboardEvent) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      sendCode(event.clipboardData?.getData("text/plain") ?? "");
+    }
+    function pasteKey(event: KeyboardEvent) {
+      if (isLoginPasteShortcut(event) && (window.runtime?.ClipboardGetText || typeof navigator.clipboard?.readText === "function")) pasteClipboard(event);
+    }
+    if (loginCode) {
+      loginCode.current = (code) => sendCode(code, true);
+      element.addEventListener("paste", pasteEvent, true);
+      element.addEventListener("keydown", pasteKey, true);
+      element.addEventListener("contextmenu", pasteClipboard, true);
+    }
+    const sub = t.onData((d) => {
+      if (useGate.getState().confirming) return;
+      const id = agentOfTerminalPath(path);
+      const agent = id ? useStore.getState().agents[id] : undefined;
+      const input = agent && agent.harness !== "shell" ? stripTerminalQueryReplies(d) : d;
+      if (input) session.write(input);
+    });
     const ro = new ResizeObserver(() => {
       try {
         fit.fit();
@@ -100,22 +150,30 @@ export function TerminalView({ path, focusTick, ended, className }: { path: stri
       }
     });
     ro.observe(host.current);
-    t.focus();
+    if (autoFocus && !useGate.getState().confirming) t.focus();
     return () => {
+      open = false;
+      if (loginCode) {
+        loginCode.current = null;
+        element.removeEventListener("paste", pasteEvent, true);
+        element.removeEventListener("keydown", pasteKey, true);
+        element.removeEventListener("contextmenu", pasteClipboard, true);
+      }
+      unguard();
       ro.disconnect();
       sub.dispose();
       session.close();
       t.dispose();
       term.current = null;
     };
-  }, [path, transport, gen, finite]);
+  }, [path, transport, gen, finite, autoFocus, loginCode]);
 
   useEffect(() => {
     if (term.current) term.current.options.theme = themeFor(resolved === "dark");
   }, [resolved]);
 
   useEffect(() => {
-    if (focusTick) term.current?.focus();
+    if (focusTick && !useGate.getState().confirming) term.current?.focus();
   }, [focusTick]);
 
   return (

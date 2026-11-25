@@ -32,7 +32,7 @@ func TestProjectImportPreservesPageCardsAndRetry(t *testing.T) {
 	first, _ := e.st.GetApproval(receipt.CardIDs[0])
 	later, _ := e.st.GetApproval(receipt.CardIDs[1])
 	history, _ := e.st.GetApproval(receipt.CardIDs[2])
-	if first.Kind != model.ApprovalQuestion || first.Version != 1 || first.CreatedAt != 900 || !first.Card.OwnerOnly || !later.Deferred || history.State != model.ApprovalExpired || history.Answer != "Original words" || history.DecidedAt != 950 {
+	if first.Kind != model.ApprovalQuestion || first.Version != 1 || first.CreatedAt != 900 || !first.Card.OwnerOnly || later.Deferred || later.State != model.ApprovalExpired || later.Answer != "" || later.Card.CloseReason != "Imported closed: it was parked for later at the source" || history.State != model.ApprovalExpired || history.Answer != "Original words" || history.DecidedAt != 950 {
 		t.Fatalf("cards: %+v %+v %+v", first, later, history)
 	}
 	mail, _ := e.st.ListMessages(store.MessageFilter{})

@@ -162,7 +162,7 @@ function ProjectCard({ p }: { p: Project }) {
     <a
       href={href(paths.project(p.id))}
       className={cn(
-        "group flex flex-col rounded-xl border bg-card p-4 outline-none transition-colors duration-150 hover:border-border-strong focus-visible:ring-2 focus-visible:ring-ring",
+        "group flex h-full flex-col rounded-xl border bg-card p-4 outline-none transition-colors duration-150 hover:border-border-strong focus-visible:ring-2 focus-visible:ring-ring",
         p.status !== "active" && "bg-transparent",
       )}
     >
@@ -173,9 +173,7 @@ function ProjectCard({ p }: { p: Project }) {
       </div>
       <p className="mt-2 line-clamp-2 min-h-[2.5rem] text-xs leading-5 text-muted-foreground">{p.brief || "No brief."}</p>
       <div className="mt-3 flex items-center gap-3 border-t pt-3 text-2xs text-muted-foreground">
-        {all.length === 0 ? (
-          <span>No agents</span>
-        ) : (
+        {all.length > 0 && (
           <span className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
             {stateCounts(all).map(([s, n]) => (
               <span key={s} className="tabular inline-flex items-center gap-1.5">
@@ -354,7 +352,7 @@ export function OverviewPage() {
               The head sets up projects and leads for you. Describe what you want to build, or create a project yourself.
             </EmptyState>
           ) : (
-            <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+            <div className="grid auto-rows-fr gap-3 sm:grid-cols-2 xl:grid-cols-3">
               {list.map((p) => (
                 <ProjectCard key={p.id} p={p} />
               ))}

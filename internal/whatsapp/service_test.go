@@ -161,7 +161,7 @@ func testWhatsAppProtocol(t *testing.T) *config.WhatsAppConfig {
 	return &config.WhatsAppConfig{Enabled: &on}
 }
 
-func newEnv(t *testing.T, fake *watest.Fake) *env {
+func newEnv(t *testing.T, fake *watest.Fake, opts ...func(*whatsapp.Options)) *env {
 	t.Helper()
 	dir := t.TempDir()
 	st, err := store.Open(filepath.Join(dir, "tmx.db"))
@@ -172,13 +172,18 @@ func newEnv(t *testing.T, fake *watest.Fake) *env {
 	e := &env{t: t, fake: fake, st: st, bus: &bus{}, cfg: testWhatsAppProtocol(t), media: filepath.Join(dir, "whatsapp", "media"),
 		clock: &clock{t: time.Now()},
 		fleet: &fakeFleet{head: "h1", profiles: map[string]string{"h1": "head", "w1": "worker"}, approvals: map[string]model.Approval{}}}
-	e.svc = whatsapp.New(whatsapp.Options{Store: st, Client: fake, MediaDir: e.media, Publish: e.bus.publish, Fleet: e.fleet,
+	o := whatsapp.Options{Store: st, Client: fake, MediaDir: e.media, Publish: e.bus.publish, Fleet: e.fleet,
 		Config: func() *config.WhatsAppConfig { e.cmu.Lock(); defer e.cmu.Unlock(); c := *e.cfg; return &c },
 		SaveConfig: func(fn func(*config.WhatsAppConfig)) error {
 			e.mutateConfig(fn)
 			return nil
 		},
-		Now: e.clock.now, ChatGap: 40 * time.Millisecond, NoticeQuiet: 50 * time.Millisecond})
+		Now: e.clock.now, NoticeQuiet: 50 * time.Millisecond,
+		DiskFree: func(string) (uint64, error) { return 20 << 30, nil }}
+	for _, opt := range opts {
+		opt(&o)
+	}
+	e.svc = whatsapp.New(o)
 	t.Cleanup(e.svc.Close)
 	if err := e.svc.Start(); err != nil {
 		t.Fatal(err)
@@ -279,6 +284,21 @@ func (e *env) seed() {
 		},
 		Progress: 40,
 	})
+	// The owner opened the seeded chats to the head (per-chat access, access.go); the tests of
+	// the access rule itself (access_test.go) start from an empty table.
+	e.open("head", anna, bo, group)
+}
+
+// open lets the profile (or agent:<name>) key read the chats.
+func (e *env) open(key string, chats ...string) {
+	e.t.Helper()
+	acc := e.svc.Settings().ChatAccess
+	cur := acc[key]
+	cur.Read = append(cur.Read, chats...)
+	acc[key] = cur
+	if _, err := e.svc.SetSettings(whatsapp.SettingsPatch{ChatAccess: &acc}); err != nil {
+		e.t.Fatal(err)
+	}
 }
 
 func TestLinkQRThenConnected(t *testing.T) {
@@ -520,10 +540,27 @@ func TestHistoryIntoStore(t *testing.T) {
 	}
 }
 
+// fixedSendTime makes timestamp ties deterministic without changing the fake's
+// send recording or the service's asynchronous send/receipt ordering.
+type fixedSendTime struct {
+	*watest.Fake
+	at time.Time
+}
+
+func (f fixedSendTime) Send(ctx context.Context, m whatsapp.Outgoing) (time.Time, error) {
+	_, err := f.Fake.Send(ctx, m)
+	return f.at, err
+}
+
 func TestReceiveEditDeleteReactReceipts(t *testing.T) {
-	e := linkedEnv(t)
+	sentAt := time.Now().Truncate(time.Millisecond)
+	fake := watest.Linked()
+	e := newEnv(t, fake, func(o *whatsapp.Options) {
+		o.Client = fixedSendTime{Fake: fake, at: sentAt}
+	})
+	e.wait("connected", func() bool { return e.svc.Status().State == model.WaConnected })
 	e.seed()
-	now := time.Now().UnixMilli()
+	now := sentAt.UnixMilli()
 	e.fake.Emit(whatsapp.EvMessage{In: msg(anna, "A3", anna, now, "are you there?")})
 	c, _ := e.svc.Chat(anna)
 	if c.Unread != 1 || c.Last.ID != "A3" {
@@ -572,13 +609,30 @@ func TestReceiveEditDeleteReactReceipts(t *testing.T) {
 	id := e.fake.SentNow()[0].ID
 	e.fake.Emit(whatsapp.EvReceipt{Chat: anna, IDs: []string{id}, Status: model.WaRead, Mine: true})
 	e.fake.Emit(whatsapp.EvReceipt{Chat: anna, IDs: []string{id}, Status: model.WaDelivered, Mine: true})
+	// Receipts concern this ID, not whichever row sorts newest. At equal
+	// milliseconds A3 sorts ahead of 3EB0FAKE..., even after our send completes.
+	ownMessage := func() (model.WaMessage, bool) {
+		messages, err := e.svc.Messages(anna, "", 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, m := range messages {
+			if m.ID == id {
+				return m, true
+			}
+		}
+		return model.WaMessage{}, false
+	}
 	e.wait("read", func() bool {
-		m, _ := e.svc.Messages(anna, "", 1)
-		return len(m) == 1 && m[0].Status == model.WaRead
+		m, found := ownMessage()
+		return found && m.Status == model.WaRead && m.At == now
 	})
+	if latest, err := e.svc.Messages(anna, "", 1); err != nil || len(latest) != 1 || latest[0].ID != "A3" {
+		t.Fatalf("timestamp-tie fixture: latest=%+v err=%v", latest, err)
+	}
 	time.Sleep(20 * time.Millisecond)
-	if m, _ := e.svc.Messages(anna, "", 1); m[0].Status != model.WaRead || m[0].SenderName != "You" || m[0].Origin != "owner" {
-		t.Fatalf("own message %+v", m[0])
+	if m, found := ownMessage(); !found || m.Status != model.WaRead || m.SenderName != "You" || m.Origin != "owner" {
+		t.Fatalf("own message %+v", m)
 	}
 	// The owner read the chat on the phone: unread goes to 0.
 	e.fake.Emit(whatsapp.EvReceipt{Chat: bo, IDs: []string{"B1"}, Status: model.WaRead})
@@ -597,7 +651,7 @@ func TestReceiveEditDeleteReactReceipts(t *testing.T) {
 	}
 }
 
-func TestSendPacedWithFilesAndReply(t *testing.T) {
+func TestSendFilesInOrderWithReply(t *testing.T) {
 	e := linkedEnv(t)
 	e.seed()
 	png := []byte("\x89PNG fake")
@@ -613,11 +667,7 @@ func TestSendPacedWithFilesAndReply(t *testing.T) {
 	if !out[0].Media.Downloaded { // the owner's own file is kept at once
 		t.Fatal("own file not kept")
 	}
-	start := time.Now()
 	e.wait("both sent", func() bool { return len(e.fake.SentNow()) == 2 })
-	if time.Since(start) < 35*time.Millisecond {
-		t.Fatal("not paced")
-	}
 	sent := e.fake.SentNow()
 	if sent[0].Quote == nil || sent[0].Quote.ID != "A1" || sent[0].Quote.Sender != anna || sent[0].Media == nil || sent[0].Text != "look" {
 		t.Fatalf("first %+v", sent[0])
@@ -662,7 +712,7 @@ func TestSendPacedWithFilesAndReply(t *testing.T) {
 func TestRateLimitOverAllChats(t *testing.T) {
 	e := linkedEnv(t)
 	e.seed()
-	for i := range whatsapp.WindowMax {
+	for i := range 31 {
 		chat := anna
 		if i%2 == 1 {
 			chat = bo
@@ -671,13 +721,41 @@ func TestRateLimitOverAllChats(t *testing.T) {
 			t.Fatalf("send %d: %v", i, err)
 		}
 	}
-	_, err := e.svc.Send("owner", anna, whatsapp.SendRequest{Text: "one more"})
-	if status(err) != http.StatusTooManyRequests || !strings.Contains(err.Error(), "bans numbers") {
-		t.Fatalf("31st: %v", err)
+	e.wait("account reached its send cap", func() bool { return len(e.fake.SentNow()) == 15 })
+}
+
+func TestDeferredAgentSendReportsOutcome(t *testing.T) {
+	if testing.Short() {
+		t.Skip("exercises a full one-minute send window")
 	}
-	e.clock.add(whatsapp.Window + time.Second)
-	if _, err := e.svc.Send("owner", anna, whatsapp.SendRequest{Text: "later"}); err != nil {
-		t.Fatalf("after the window: %v", err)
+	e := linkedEnv(t)
+	e.seed()
+	if _, err := e.svc.SetSettings(whatsapp.SettingsPatch{AllowedChats: &[]string{bo}}); err != nil {
+		t.Fatal(err)
+	}
+	for range 15 {
+		if _, err := e.svc.Send("owner", anna, whatsapp.SendRequest{Text: "fill the send window"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e.wait("first 15 sends", func() bool { return len(e.fake.SentNow()) == 15 })
+	res, err := e.svc.AgentSend("h1", bo, "deferred", "")
+	if err != nil || res.Approval != nil || res.Message == nil || res.Message.Status != model.WaPending {
+		t.Fatalf("agent send was not queued: %+v, %v", res, err)
+	}
+	if len(e.fake.SentNow()) != 15 {
+		t.Fatal("deferred message went out immediately")
+	}
+	e.waitWithin(65*time.Second, "agent receives deferred outcome", func() bool {
+		for _, m := range e.fleet.mailsNow() {
+			if m.to == "h1" && strings.Contains(m.body, res.Message.ID) && strings.Contains(m.body, "was sent") {
+				return true
+			}
+		}
+		return false
+	})
+	if sent := e.fake.SentNow(); len(sent) != 16 || sent[15].ID != res.Message.ID {
+		t.Fatalf("deferred transport send did not match the queued message: %+v", sent)
 	}
 }
 
@@ -729,14 +807,11 @@ func TestAgentSendNeedsApproval(t *testing.T) {
 		!strings.Contains(mails[1].body, "did not send") || !strings.Contains(mails[1].body, "not now") {
 		t.Fatalf("mails %+v", mails)
 	}
-	// Up to MaxAgentPending waiting at once.
-	for range whatsapp.MaxAgentPending {
+	// No limit on how many wait for the owner (the owner, 17 Nov): past the former cap, still taken.
+	for range whatsapp.MaxAgentPending + 1 {
 		if _, err := e.svc.AgentSend("h1", bo, "again", ""); err != nil {
-			t.Fatal(err)
+			t.Fatalf("past the former pending cap: %v", err)
 		}
-	}
-	if _, err := e.svc.AgentSend("h1", bo, "too many", ""); status(err) != http.StatusTooManyRequests {
-		t.Fatalf("pending cap: %v", err)
 	}
 	// A chat on the allowed list sends at once; so does "allowed" for every chat.
 	if _, err := e.svc.SetSettings(whatsapp.SettingsPatch{AllowedChats: &[]string{anna}}); err != nil {

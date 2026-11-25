@@ -36,6 +36,15 @@ func statFields(pid string) ([]string, bool) {
 	return strings.Fields(string(b[i+2:])), true
 }
 
+func ProcessStart(pid int) int64 {
+	f, ok := statFields(strconv.Itoa(pid))
+	if !ok || len(f) < 20 {
+		return 0
+	}
+	start, _ := strconv.ParseInt(f[19], 10, 64)
+	return start
+}
+
 // Procs walks /proc (one small read per process).
 func Procs() ([]Proc, error) {
 	ents, err := os.ReadDir("/proc")
@@ -187,7 +196,13 @@ func Disks() ([]Disk, error) {
 		}
 		sectors, _ := strconv.ParseUint(f[9], 10, 64)
 		weighted, _ := strconv.ParseUint(f[13], 10, 64) // ms, time-in-queue integral
-		out = append(out, Disk{Name: name, IOTime: time.Duration(weighted) * time.Millisecond, Written: sectors * 512})
+		d := Disk{Name: name, IOTime: time.Duration(weighted) * time.Millisecond, Written: sectors * 512}
+		writes, errW := strconv.ParseUint(f[7], 10, 64) // writes completed
+		ticks, errT := strconv.ParseUint(f[12], 10, 64) // ms the device had I/O in flight
+		if errW == nil && errT == nil {
+			d.Writes, d.Busy, d.HasOps = writes, time.Duration(ticks)*time.Millisecond, true
+		}
+		out = append(out, d)
 	}
 	return out, nil
 }

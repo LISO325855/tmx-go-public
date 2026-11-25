@@ -8,17 +8,18 @@ import (
 	"github.com/blackcode-ch/tmx-go/internal/transfers"
 	"github.com/blackcode-ch/tmx-go/internal/update"
 	"github.com/blackcode-ch/tmx-go/internal/uploads"
-	"io"
 	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"syscall"
 	"time"
 
 	"github.com/blackcode-ch/tmx-go/internal/accounts"
 	"github.com/blackcode-ch/tmx-go/internal/api"
 	"github.com/blackcode-ch/tmx-go/internal/chat"
+	"github.com/blackcode-ch/tmx-go/internal/claudeext"
 	"github.com/blackcode-ch/tmx-go/internal/companion"
 	"github.com/blackcode-ch/tmx-go/internal/config"
 	"github.com/blackcode-ch/tmx-go/internal/fleet"
@@ -26,46 +27,96 @@ import (
 	"github.com/blackcode-ch/tmx-go/internal/guard"
 	"github.com/blackcode-ch/tmx-go/internal/hiddenexec"
 	"github.com/blackcode-ch/tmx-go/internal/jobs"
+	"github.com/blackcode-ch/tmx-go/internal/machinehealth"
 	"github.com/blackcode-ch/tmx-go/internal/model"
 	"github.com/blackcode-ch/tmx-go/internal/p2p"
 	"github.com/blackcode-ch/tmx-go/internal/peers"
 	"github.com/blackcode-ch/tmx-go/internal/recorder"
 	"github.com/blackcode-ch/tmx-go/internal/recworker"
+	"github.com/blackcode-ch/tmx-go/internal/reshistory"
+	"github.com/blackcode-ch/tmx-go/internal/resources"
+	"github.com/blackcode-ch/tmx-go/internal/restartguard"
 	"github.com/blackcode-ch/tmx-go/internal/rollback"
+	"github.com/blackcode-ch/tmx-go/internal/rules"
 	"github.com/blackcode-ch/tmx-go/internal/runner"
 	"github.com/blackcode-ch/tmx-go/internal/runner/claude"
 	"github.com/blackcode-ch/tmx-go/internal/store"
+	"github.com/blackcode-ch/tmx-go/internal/sysinfo"
+	"github.com/blackcode-ch/tmx-go/internal/teamstore"
 )
 
 // cmdDaemon runs the daemon in the foreground until SIGINT/SIGTERM or POST /api/shutdown.
 func cmdDaemon(e *env, args []string) (err error) {
-	if _, err := parse(newFlags("daemon"), args); err != nil {
+	flags := newFlags("daemon")
+	home := flags.String("home", "", "existing daemon data directory")
+	if _, err := parse(flags, args); err != nil {
 		return err
 	}
-	if err := e.load(); err != nil {
-		return err
+	paths := e.paths
+	if !e.loaded {
+		if *home != "" {
+			if !filepath.IsAbs(*home) {
+				return errors.New("daemon --home requires an absolute existing data directory")
+			}
+			st, statErr := os.Stat(*home)
+			if statErr != nil || !st.IsDir() {
+				return fmt.Errorf("daemon data directory %q is unavailable", *home)
+			}
+			paths = config.Paths{Home: filepath.Clean(*home)}
+			if err := paths.Ensure(); err != nil {
+				return err
+			}
+		} else {
+			paths, err = config.Resolve()
+			if err != nil {
+				return err
+			}
+		}
 	}
 	// After an update the daemon starts its successor from the new binary. This deferred call runs
 	// last: once the agents are stopped, the store is closed and the lock is released.
-	var restartExe string
+	var restartExe, hostExe string
 	defer func() {
 		if restartExe != "" && err == nil {
-			err = respawnDaemon(e, restartExe)
+			err = handoffDaemon(e, restartExe, hostExe)
 		}
 	}()
-	lock, err := config.WaitLock(e.paths, 15*time.Second) // a predecessor may still be stopping its agents
-	if err != nil {
-		return err
+	if *home != "" {
+		previous, inherited := os.LookupEnv(config.EnvHome)
+		if err := os.Setenv(config.EnvHome, paths.Home); err != nil {
+			return err
+		}
+		defer func() {
+			if inherited {
+				_ = os.Setenv(config.EnvHome, previous)
+			} else {
+				_ = os.Unsetenv(config.EnvHome)
+			}
+		}()
 	}
-	defer lock.Release()
-
-	logFile, err := os.OpenFile(e.paths.DaemonLog(), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	logFile, err := os.OpenFile(paths.DaemonLog(), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return err
 	}
 	defer logFile.Close()
-	log := slog.New(slog.NewTextHandler(io.MultiWriter(e.errw, logFile), &slog.HandlerOptions{Level: slog.LevelInfo}))
+	log := slog.New(slog.NewTextHandler(&daemonLogWriter{file: logFile, stderr: e.errw}, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(log)
+	defer func() {
+		if err != nil {
+			log.Error("tmx daemon exited with an error", "pid", os.Getpid(), "err", err)
+		}
+	}()
+	log.Info("tmx daemon starting", "pid", os.Getpid(), "home", paths.Home, "version", config.Version)
+	lock, err := config.WaitLock(paths, 15*time.Second)
+	if err != nil {
+		return err
+	}
+	defer lock.Release()
+	if !e.loaded {
+		if err := e.loadPaths(paths); err != nil {
+			return err
+		}
+	}
 	for _, warning := range e.cfg.Warnings {
 		log.Warn(warning)
 	}
@@ -77,6 +128,16 @@ func cmdDaemon(e *env, args []string) (err error) {
 	currentExe, err := os.Executable()
 	if err != nil {
 		return err
+	}
+	// Session hosts and the Windows restart helper need an executable that
+	// survives replacement or rollback of the installed app.
+	hostSource := currentExe
+	if real, err := filepath.EvalSymlinks(currentExe); err == nil {
+		hostSource = real
+	}
+	hostExe, err = hostExecutable(e.paths.Home, hostSource)
+	if err != nil {
+		log.Warn("session hosts and restart helper: cannot copy executable", "err", err)
 	}
 	checkpoint := filepath.Join(e.paths.Home, "rollback")
 	st, err := store.OpenRecoverable(e.paths.DB(), installationPath(currentExe), checkpoint)
@@ -95,7 +156,6 @@ func cmdDaemon(e *env, args []string) (err error) {
 		return fmt.Errorf("listen on 127.0.0.1:%d: %w", e.cfg.Port, err)
 	}
 
-	paths := e.paths
 	sl, rm := newResourceControl(e, log)
 	var node p2p.Node // stays a nil interface when p2p is off
 	host := startP2P(paths, e.cfg, log)
@@ -109,28 +169,49 @@ func cmdDaemon(e *env, args []string) (err error) {
 	if err != nil {
 		return err
 	}
-	// Terminal agents run in session hosts that outlive this daemon (fleet/hosting.go), from a
-	// copy of this tmx so an update can replace the installed one while they run.
-	var hostExe string
-	if self, err := os.Executable(); err == nil {
-		if real, err := filepath.EvalSymlinks(self); err == nil {
-			self = real
-		}
-		if hostExe, err = hostExecutable(paths.Home, self); err != nil {
-			log.Warn("session hosts: no copy of tmx for them; terminal agents end with the daemon", "err", err)
-			hostExe = ""
-		}
+	if !e.cfg.UseUserAccounts(paths.Home) {
+		profiles.IsolateDefaults(paths.Home)
 	}
+	// The owner's Claude Code MCP servers and plugins, for profiles that add some.
+	cext := claudeext.New(claudeext.Options{Env: claude.BaseEnv(), Claude: func() (string, error) {
+		return claude.LookPath(runner.Spec{Command: e.cfg.ClaudeCommand})
+	}})
+	// The fleet's rules source (internal/rules): made before the fleet, which opens every agent's
+	// instructions with it; the head's line and the GitHub token are bound once those exist.
+	var rulesNotify func(rules.Event)
+	var rulesToken func() string
+	rulesSvc := rules.New(rules.Options{Dir: filepath.Join(paths.Home, "rules"), Logger: log,
+		Settings: rulesSettings(paths, e.cfg),
+		Token: func() string {
+			if rulesToken == nil {
+				return ""
+			}
+			return rulesToken()
+		},
+		Notify: func(ev rules.Event) {
+			if rulesNotify != nil {
+				rulesNotify(ev)
+			}
+		}})
+	defer rulesSvc.Close()
+	var accts *accounts.Service // assigned before the updater starts
 	f, err := fleet.New(fleet.Options{
+		ClaudeExt:      cext,
+		Rules:          rulesSvc,
 		Tasks:          e.cfg.Tasks,
 		HostExecutable: hostExe,
 		Accounts:       profiles,
-		AutoShelve:     e.cfg.AutoShelve,
-		Supervisor:     e.cfg.Supervisor,
-		Store:          st, Paths: paths, Runners: runners(),
+		ResetInFlight: func(now time.Time) bool {
+			return accts != nil && accts.ResetInFlight(now)
+		},
+		AutoShelve:           e.cfg.AutoShelve,
+		Supervisor:           e.cfg.Supervisor,
+		Watch:                e.cfg.Watch,
+		FaeRuntimeContextCap: e.cfg.FaeRuntimeContextCap,
+		Store:                st, Paths: paths, Runners: runners(),
 		Machine: e.cfg.Machine, Version: config.Version, Workspace: e.cfg.Workspace,
-		FleetAuthorities: e.cfg.FleetAuthorities, Teammates: e.cfg.Teammates, AgentBypass: e.cfg.AgentBypass,
-		URL: e.cfg.URL(), ClaudeCommand: e.cfg.ClaudeCommand, HeadHarness: e.cfg.HeadHarness,
+		FleetAuthorities: e.cfg.FleetAuthorities, FleetLead: e.cfg.FleetLead, Teammates: e.cfg.Teammates, AgentBypass: e.cfg.AgentBypass, AgentMachine: e.cfg.AgentMachine,
+		URL: e.cfg.URL(), ClaudeCommand: e.cfg.ClaudeCommand, HeadHarness: e.cfg.HeadHarness, UIProfile: e.cfg.UIProfile(),
 		Policy: e.cfg.EffectivePolicy(), // seeds the built-in profiles on first start only
 		Guard:  e.cfg.Guard,
 		SaveGuard: func(g guard.Settings) error {
@@ -150,6 +231,7 @@ func cmdDaemon(e *env, args []string) (err error) {
 		ln.Close()
 		return err
 	}
+	rulesNotify = f.RulesEvent
 	attachResourceControl(f, sl, rm)
 	jobWorkers, jobErr := jobs.OpenFailSafe(jobs.Options{Path: filepath.Join(paths.Home, "jobs.json"), Fresh: rm.Fresh})
 	if jobErr != nil {
@@ -169,7 +251,8 @@ func cmdDaemon(e *env, args []string) (err error) {
 	}
 	machine := e.cfg.Machine
 	chats, err := chat.New(chat.Options{Node: chatNode, Store: st, Agents: f, Logger: log, FilesDir: paths.ChatFilesDir(),
-		Jobs: jobWorkers, FileMaxBytes: e.cfg.P2P.FileLimit(),
+		TeamStore: teamstore.New(paths), // team status: each computer's report to its group's admin, after its owner opted in
+		Jobs:      jobWorkers, FileMaxBytes: e.cfg.P2P.FileLimit(),
 		Name: func() string { // the name people see: the node's display name, else the machine
 			if chatNode != nil {
 				if n := chatNode.DisplayName(); n != "" {
@@ -190,6 +273,9 @@ func cmdDaemon(e *env, args []string) (err error) {
 		if err != nil {
 			ln.Close()
 			return err
+		}
+		if e.cfg.Companion != nil { // the section is absent until something is set
+			companion.SetTrustedPrograms(e.cfg.Companion.TrustedPrograms) // the owner's, for the listener check
 		}
 		comp = companion.New(companion.Options{Store: st, Fleet: f, Paths: paths, Version: config.Version, Logger: log, Install: inst})
 		f.SetCompanion(comp)
@@ -222,11 +308,42 @@ func cmdDaemon(e *env, args []string) (err error) {
 	if drain {
 		netLog = p2p.StartDrain(ctx, node, 200) // testing the network layer alone
 	}
+	const updateSwapBackoffEnv = "TMXG_UPDATE_SWAP_RETRY_AFTER"
 	exe, _ := os.Executable()
 	if real, err := filepath.EvalSymlinks(exe); err == nil {
 		exe = real
 	}
+	audioGuard := &restartguard.Guard{}
+	pendingSwap := make(chan func() (string, error), 1)
+	var deferSwap func(func() (string, error)) bool
+	if runtime.GOOS == "windows" {
+		deferSwap = func(apply func() (string, error)) bool {
+			select {
+			case pendingSwap <- apply:
+				stop()
+				return true
+			default:
+				return false
+			}
+		}
+	}
 	upd := update.New(update.Options{
+		DeferSwap: deferSwap,
+		PrepareRestart: func() (func(), error) {
+			if retryAt, err := time.Parse(time.RFC3339Nano, os.Getenv(updateSwapBackoffEnv)); runtime.GOOS == "windows" && err == nil && time.Now().Before(retryAt) {
+				return nil, fmt.Errorf("Windows update restart deferred after a skipped swap until %s", retryAt.Format(time.RFC3339))
+			}
+			releaseAudio, err := audioGuard.Reserve(false, func() bool { return len(rec.Busy()) > 0 })
+			if err != nil {
+				return nil, err
+			}
+			releaseReset, err := accts.ReserveRestart()
+			if err != nil {
+				releaseAudio()
+				return nil, err
+			}
+			return func() { releaseReset(); releaseAudio() }, nil
+		},
 		Paths: paths, Version: config.Version, Executable: exe, Desktop: desktop.Available, Logger: log,
 		Settings: func() config.UpdateConfig {
 			if c, err := config.Load(paths); err == nil && c.Update != nil {
@@ -249,11 +366,7 @@ func cmdDaemon(e *env, args []string) (err error) {
 			stop()
 		},
 	})
-	// Trial has no updater loop (manual endpoints remain owner-controlled). Production runs it for
-	// the owner's installs only: config forces automatic checks off in v1 (no signed release yet).
-	if e.cfg.Profile != config.ProfileTrial {
-		go upd.Run(ctx)
-	}
+	rulesToken = upd.GitHubToken
 	voice := newVoice(paths, st, upd, sl, f, log) // voice.go: local transcription
 	rec.SetTranscriber(voice)                     // finished recordings can be transcribed (auto or on request)
 
@@ -275,28 +388,50 @@ func cmdDaemon(e *env, args []string) (err error) {
 		}
 		recw.Finished(r)
 	})
-	wa := newWhatsApp(paths, st, f, log) // wa.go: the owner's WhatsApp, linked as a companion device
+	wa := newWhatsApp(paths, st, f, log, voice) // wa.go: the owner's WhatsApp, linked as a companion device
 	f.SetWhatsApp(wa)
 	ups := uploads.New(paths)
 	ups.Prune(func(id string) bool { _, err := f.Agent(id); return err == nil }) // agents removed while down
 	// The AI accounts the harnesses are signed in to, and their plans' usage (DESIGN.md "AI
 	// accounts and usage"). The harnesses run in a folder of their own, never a project.
-	accts := accounts.New(accounts.Options{Dir: filepath.Join(paths.Home, "accounts"), Publish: f.Publish, Logger: log,
+	accts = accounts.New(accounts.Options{Dir: filepath.Join(paths.Home, "accounts"), Publish: f.Publish, Logger: log,
+		ClaudeUsageChanged: f.FailoverClaudeAccount,
+		NodeHome:           paths.Home, AllowUserLogins: e.cfg.UseUserAccounts(paths.Home),
 		Commands: accountCommands(e.cfg),
 		// The sign-in shown and made here (`claude auth login`) is the agents' own.
 		Env:      []string{claude.EnvConfigDir + "=" + claudeDir},
 		Profiles: profiles})
+	f.SetClaudeFailoverSelector(accts.ClaudeFailoverAccount)
+	// Start only after the reset busy callback has its account service.
+	// Both profiles consume manual installs and schedule explicitly enabled auto updates.
+	go upd.Run(ctx)
 	f.SetRateLimitHook(func(h model.Harness, account string, rl runner.RateLimit) {
-		accts.RateLimited(fleet.AccountHarness(h), account, rl.Type, rl.ResetsAt)
+		harness := fleet.AccountHarness(h)
+		if accts.RateLimited(harness, account, rl.Type, rl.ResetsAt) && harness == model.HarnessClaude {
+			f.FailoverClaudeAccount(account)
+		}
 	})
 	// peers: the Python fleet's other machines (production only; DESIGN.md "Python fleet interop").
 	var fleetPeers *peers.Client
-	if e.cfg.Production() && len(e.cfg.Peers) > 0 {
+	if e.cfg.Production() {
 		fleetPeers = peers.New(e.cfg, paths, log)
 		voice.SetPeer(fleetPeers)
 		f.SetPeerSender(fleetPeers, fleetPeers.Machine())
+		f.SetPeerHealth(func() []fleet.PeerHealth { // the watch tells the head when a machine stays unreachable
+			st := fleetPeers.Statuses()
+			out := make([]fleet.PeerHealth, 0, len(st))
+			for _, p := range st {
+				out = append(out, fleet.PeerHealth{Name: p.Name, OK: p.OK, Seen: p.Seen})
+			}
+			return out
+		})
+		f.SetFleetState(func() fleet.FleetStateBlock { // the head's owner turn carries the Python fleet's state block
+			st := fleetPeers.FleetState()
+			return fleet.FleetStateBlock{From: st.From, At: st.At, Lines: st.Lines}
+		})
 		sum.SetPeer(fleetPeers) // summaries.via_peer: a peer's local model writes this machine's summaries
 		go fleetPeers.Run(ctx)
+		go fleetPeers.RunFleetState(ctx)
 	}
 	var copies *transfers.Service
 	if fleetPeers != nil {
@@ -317,10 +452,17 @@ func cmdDaemon(e *env, args []string) (err error) {
 		defer copies.Close()
 		copies.Resume()
 	}
-	srv := api.New(api.Options{SystemWarnings: e.cfg.Warnings, Fleet: f, OwnerToken: token, Port: e.cfg.Port, TrustedHosts: e.cfg.API.TrustedHosts, Shutdown: stop, Restart: func() { restartExe = currentExe; stop() }, Gate: g, Logger: log,
-		Jobs: jobWorkers, Transfers: copies,
-		Resources: rm, Slots: sl, Chats: chats, P2P: node, P2PLog: netLog, Companion: comp, Uploads: ups, Updater: upd, Recorder: rec,
-		Voice: voice, Summaries: sum, RecWorker: recw, WhatsApp: wa, Accounts: accts, Peers: fleetPeers,
+	// A machine already in use never gets the first-run setup opening by itself (api/config.go).
+	if marked, err := api.MarkOnboardedIfInUse(f); err != nil {
+		log.Warn("first-run setup: could not check whether this machine is already in use", "err", err)
+	} else if marked {
+		log.Info("first-run setup: this machine is already in use; marked as shown")
+	}
+	hist := reshistory.New(paths, nil, log) // the Watchdog page's resource history
+	srv := api.New(api.Options{SystemWarnings: e.cfg.Warnings, Fleet: f, OwnerToken: token, Port: e.cfg.Port, TrustedHosts: e.cfg.API.TrustedHosts, PhoneLock: e.cfg.PhoneLock, LANAccess: e.cfg.API.LANAccess, Shutdown: stop, Restart: func() { restartExe = currentExe; stop() }, Gate: g, Logger: log,
+		Jobs: jobWorkers, Transfers: copies, AudioGuard: audioGuard,
+		Resources: rm, History: hist, Health: machinehealth.New(), Slots: sl, Chats: chats, P2P: node, P2PLog: netLog, Companion: comp, Uploads: ups, Updater: upd, Recorder: rec,
+		Voice: voice, Summaries: sum, RecWorker: recw, WhatsApp: wa, Accounts: accts, ClaudeExt: cext, Peers: fleetPeers,
 		SaveP2PName: func(name string) error {
 			c, err := config.Load(paths)
 			if err != nil {
@@ -332,14 +474,35 @@ func cmdDaemon(e *env, args []string) (err error) {
 			c.P2P.Name = name
 			return config.Save(paths, c)
 		}})
+	// Voice must be ready before HTTP accepts the first dictation after restart.
+	if err := voice.Start(); err != nil {
+		log.Error("voice start", "err", err)
+	}
 	served := make(chan error, 1)
 	go func() { served <- srv.Serve(ctx, ln) }()
 	// Post-swap watchdog: a new binary on probation confirms itself healthy or, at the deadline,
 	// restarts so that its next start restores the previous pair (rollback.StartProbation).
-	go watchProbation(ctx, log, checkpoint, e.cfg.URL()+"/api/health", time.Now, probationPoll, func() {
-		restartExe = currentExe
-		stop()
-	})
+	go func() {
+		watchProbation(ctx, log, checkpoint, e.cfg.URL()+"/api/health", time.Now, probationPoll, func() {
+			restartExe = currentExe
+			stop()
+		})
+		// Retry a confirmed notice on later starts too; the mailbox deduplicates it.
+		for {
+			if result, ok := rollback.LastProbation(checkpoint); !ok || result.Outcome != "confirmed" {
+				return
+			} else if err := f.UpdateNotice(result); err == nil {
+				return
+			} else {
+				log.Warn("update notice", "err", err)
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(probationPoll):
+			}
+		}
+	}()
 
 	if err := config.WriteDaemonInfo(paths, config.DaemonInfo{
 		PID: os.Getpid(), Port: e.cfg.Port, StartedAt: model.Now(), Version: config.Version,
@@ -352,12 +515,21 @@ func cmdDaemon(e *env, args []string) (err error) {
 	if err := rm.Start(); err != nil { // continues processes a crashed daemon left paused
 		log.Warn("resource control start", "err", err)
 	}
-	if err := f.Start(); err != nil {
+	if err := f.StartContext(ctx); err != nil {
 		log.Error("fleet start", "err", err)
 		stop()
 	}
+	f.SetChatNamer(func(id string) string { // the watch names a chat whose agents talk without a person
+		if c, err := chats.Chat(id); err == nil {
+			return c.Name
+		}
+		return ""
+	})
+	go rulesSvc.Run(ctx) // after the fleet's start: there is a head to tell what the first look finds
 	go rm.Run(ctx)
 	go rm.Watchdog(ctx)
+	// The Watchdog page's history: it reads the sampler's latest sample, measures nothing itself.
+	go hist.RunWithDisks(ctx, func() resources.Sample { return rm.View().Sample }, sysinfo.Disks, 5*time.Second)
 	go sl.Run(ctx)
 	if err := chats.Start(); err != nil {
 		log.Error("chats start", "err", err)
@@ -366,9 +538,6 @@ func cmdDaemon(e *env, args []string) (err error) {
 		if err := comp.Start(); err != nil {
 			log.Error("companion start", "err", err)
 		}
-	}
-	if err := voice.Start(); err != nil {
-		log.Error("voice start", "err", err)
 	}
 	recw.Start()
 	if err := sum.Start(); err != nil {
@@ -379,56 +548,84 @@ func cmdDaemon(e *env, args []string) (err error) {
 	}
 	accts.Start() // checks in the background; never holds up the start
 	var serveErr error
+	var stopReason any
 	select {
 	case <-ctx.Done():
+		stopReason = context.Cause(ctx)
 	case serveErr = <-served:
 		served = nil // the result is already consumed, even when Serve returns nil
+		stopReason = serveErr
 		stop()
 	}
-	log.Info("tmx daemon stopping")
-	accts.Close()
-	recw.Close()
-	sum.Close()
-	wa.Close()
-	voice.Close()
-	if comp != nil {
-		comp.Close()
-	}
-	chats.Close()
+	log.Info("tmx daemon stopping", "reason", stopReason)
+	sl.Close()
 	cctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if err := f.Close(cctx); err != nil {
-		log.Warn("fleet close", "err", err)
+	type shutdownResult struct {
+		serveErr error
+		fleetErr error
 	}
+	closed := make(chan shutdownResult, 1)
+	go func(err error, server <-chan error) {
+		accts.Close()
+		recw.Close()
+		sum.Close()
+		wa.Close()
+		voice.Close()
+		if comp != nil {
+			comp.Close()
+		}
+		chats.Close()
+		fleetErr := f.Close(cctx)
+		if fleetErr != nil {
+			log.Warn("fleet close", "err", fleetErr)
+		}
+		if server != nil {
+			err = <-server
+		}
+		closed <- shutdownResult{serveErr: err, fleetErr: fleetErr}
+	}(serveErr, served)
+	// Persist state independently of fleet teardown and HTTP drain.
 	rm.Close()
-	if served != nil {
-		serveErr = <-served
+	hist.Save()
+	var result shutdownResult
+	select {
+	case result = <-closed:
+	case <-cctx.Done():
+		result.fleetErr = cctx.Err()
+		log.Warn("daemon shutdown deadline reached; exiting", "err", result.fleetErr)
 	}
-	if serveErr != nil && !errors.Is(serveErr, context.Canceled) {
-		return serveErr
+	select {
+	case apply := <-pendingSwap:
+		restartExe = currentExe
+		swapErr := errors.Join(result.fleetErr, cctx.Err())
+		if swapErr == nil {
+			var next string
+			next, swapErr = apply()
+			if swapErr == nil {
+				restartExe = next
+			}
+		}
+		if swapErr != nil {
+			retryAt := time.Now().Add(time.Hour)
+			// respawnDaemon inherits the environment, so its first automatic
+			// update checks cannot repeat this shutdown.
+			_ = os.Setenv(updateSwapBackoffEnv, retryAt.Format(time.RFC3339Nano))
+			log.Error("update: restarting previous binary after skipped swap", "err", swapErr, "retry_at", retryAt)
+		}
+	default:
+		if result.serveErr != nil && !errors.Is(result.serveErr, context.Canceled) {
+			return result.serveErr
+		}
 	}
 	log.Info("tmx daemon stopped")
 	return nil
 }
 
-// busyAgents names what an update must not interrupt: agents in a turn, starting, waiting for an
-// answer or paused by a brake, and open approvals.
+// busyAgents uses live idle/turn evidence and a bounded quiet interval, while
+// retaining the independent gate for open approvals.
 func busyAgents(f *fleet.Fleet) []string {
-	snap, err := f.Snapshot()
-	if err != nil {
-		return []string{"the fleet (" + err.Error() + ")"}
-	}
-	var out []string
-	for _, a := range snap.Agents {
-		switch a.State {
-		case model.StateWorking, model.StateWaiting, model.StateStarting, model.StatePaused:
-			out = append(out, a.Name)
-		}
-	}
-	if n := len(snap.Approvals); n > 0 {
-		out = append(out, fmt.Sprintf("%d open approvals", n))
-	}
-	return out
+	return f.UpdateBusy(time.Now())
 }
 
 // respawnDaemon starts the daemon again from exe (after an update), detached like `tmx up` does.
@@ -441,9 +638,22 @@ func respawnDaemon(e *env, exe string) error {
 	fmt.Fprintf(out, "%s tmx: restarting from %s after an update\n", time.Now().Format(time.RFC3339), exe)
 	cmd := hiddenexec.Command(exe, "daemon")
 	cmd.Stdout, cmd.Stderr = out, out
-	cmd.Env = os.Environ()
+	cmd.Env = append(os.Environ(), config.EnvHome+"="+e.paths.Home)
 	detach(cmd)
-	return cmd.Start()
+	dir := filepath.Join(e.paths.Home, "rollback")
+	p, pending, _ := rollback.OnProbation(dir)
+	err = cmd.Start()
+	if !pending || p.DesktopSHA256 == "" {
+		return err
+	}
+	if err == nil {
+		if reason := watchDesktopStart(cmd, dir, p); reason == "" {
+			return nil
+		} else {
+			err = errors.New(reason)
+		}
+	}
+	return restoreFailedDesktopStart(e, exe, dir, p, err)
 }
 
 // accountCommands are the executables the AI accounts run: claude_command, and

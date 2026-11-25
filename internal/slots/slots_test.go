@@ -135,3 +135,35 @@ func TestShrinkAndGrow(t *testing.T) {
 		t.Fatalf("per-holder bound: %v", err)
 	}
 }
+
+func TestCloseClearsHeldAndWaitingLeases(t *testing.T) {
+	m, _ := newM(t, nil)
+	owner := Holder{}
+	held, err := m.Acquire("browser", owner, "running browser job", 4242)
+	if err != nil || held.State != Held {
+		t.Fatalf("held lease: %+v, %v", held, err)
+	}
+	waiting, err := m.Acquire("browser", owner, "waiting browser job", 4243)
+	if err != nil || waiting.State != Waiting {
+		t.Fatalf("waiting lease: %+v, %v", waiting, err)
+	}
+	m.mu.Lock()
+	granted := m.leases[waiting.ID].granted
+	m.mu.Unlock()
+	m.Close()
+	m.Close()
+	select {
+	case <-granted:
+	default:
+		t.Fatal("shutdown did not wake the waiter")
+	}
+	if len(m.View().Leases) != 0 {
+		t.Fatal("shutdown retained a lease")
+	}
+	if _, err := m.Renew(held.ID, owner); !errors.Is(err, ErrClosed) {
+		t.Fatalf("renew after shutdown: %v", err)
+	}
+	if _, err := m.Acquire("browser", owner, "late job", 0); !errors.Is(err, ErrClosed) {
+		t.Fatalf("acquire after shutdown: %v", err)
+	}
+}

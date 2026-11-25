@@ -11,6 +11,7 @@
 !/ui/dist/.keep
 /ui/wailsjs/
 /ui/test-results/
+/ui/scripts/render/out/
 
 # Screenshots show whatever the agents were working on; they stay out of git.
 /ui/screenshots/

@@ -24,9 +24,12 @@ Daemon:
   tmx release sign TAG [--dry-run] check the release gates through gh, then sign the draft's SHA256SUMS
   tmx release sign-file SUMS --key PATH --out SIG --tag TAG  sign reviewed checksums offline; no upload
   tmx release sign-extra TAG [--dry-run] sign the public mirror's voice-engine release (whisper-engine-vX.Y.Z) after its gates
+  tmx peers invite --name NAME --url HTTPS_URL | join --code CODE --url HTTPS_URL
+  tmx config fleet-lead [agent@node|none]  show or set the verified fleet lead
+  tmx peers list | remove NAME    manage fleet peers (owner only, no restart)
   tmx peers import-python         move this machine's Python tmx pair tokens into this daemon (fingerprints only)
   tmx status                      is the daemon running?
-  tmx open                        print the browser URL (with the owner token)
+  tmx open [--launch]             print the browser URL (with the owner token); --launch opens it in the browser
   tmx app                         open the desktop app (starts the daemon if needed)
 
 Fleet:
@@ -39,6 +42,7 @@ Fleet:
   tmx project rm NAME --yes       stops and removes its agents; the folder stays
   tmx run NAME --project P [--profile P | --level worker|lead] [--model M] [--mode chat|terminal]
                            [--harness claude|codex|opencode|agy|pi|shell] [--prompt TEXT] [--role R] [--brief B]
+                           [--conversation ID]   resume an existing claude/codex conversation of the folder
                            [--no-wait] [--force]
   tmx send NAME [-f FILE]... TEXT...  message an agent as the owner (-f attaches a file)
   tmx start|stop|restart NAME
@@ -72,7 +76,7 @@ Resources:
   tmx processes stop ID | promote ID PROJECT OWNER    stop or transfer a tool
 
 Safety:
-  tmx guard [status|on|off] [--for LEVEL]   the dangerous-command guard (default on)
+  tmx guard                       the dangerous-command guard: what each rule does (always on; set rules in Settings > Safety)
   tmx gate [status|on|off]        the owner gate: Touch ID (macOS) or Windows Hello for sensitive actions
   tmx gate grace off|1h|24h|...   no prompt for that long after a confirmation (default 1h); tmx gate lock ends it
 
@@ -126,7 +130,7 @@ Voice (local transcription with whisper.cpp; nothing leaves the machine):
   tmx voice [status|setup]        engine and models; setup downloads what is missing
   tmx voice get|rm|model MODEL    download / remove / use a model (base-q5_1, small-q5_1, large-v3-turbo-q5_0)
   tmx voice language auto|CODE · tmx voice auto on|off   spoken language · transcribe new recordings by themselves
-  tmx transcribe FILE [--language L] [--timestamps] [--json]   WAV, MP3, FLAC or Ogg: prints the text
+  tmx transcribe FILE [--language L] [--timestamps] [--json]   WAV, MP3, FLAC, Ogg, M4A or AAC: prints the text
 
 Other:
   tmx mcp                         the MCP server agents run (started by the daemon)
@@ -134,6 +138,7 @@ Other:
   tmx hook pretooluse             the guard's Claude Code hook (started by claude)
   tmx skill [install [--dir DIR] | path]   SKILL.md for AI agents: setup, chats, CLI
                                   (install: ~/.claude/skills/tmx; the daemon serves it at /skill.md)
+  tmx startup install|status|remove  manage this Windows user's native logon entry
   tmx version | help
 `
 
@@ -147,12 +152,13 @@ var commands map[string]cmdFunc
 func init() {
 	commands = map[string]cmdFunc{
 		"antechamber": cmdAntechamber, "transfers": cmdTransfers,
-		"daemon": cmdDaemon, "up": cmdUp, "down": cmdDown, "status": cmdStatus, "open": cmdOpen,
-		"rollback": cmdRollback,
-		"peers":    cmdPeers,
-		"app":      cmdApp, "ls": cmdLs, "project": cmdProject, "run": cmdRun, "send": cmdSend,
+		"startup": cmdStartup, "daemon": cmdDaemon, "up": cmdUp, "down": cmdDown, "status": cmdStatus, "open": cmdOpen,
+		"daemon-after-exit": cmdDaemonAfterExit,
+		"rollback":          cmdRollback,
+		"peers":             cmdPeers, "config": cmdConfig,
+		"app": cmdApp, "ls": cmdLs, "project": cmdProject, "run": cmdRun, "send": cmdSend,
 		"start": cmdAction("start"), "stop": cmdAction("stop"), "restart": cmdAction("restart"),
-		"rm": cmdRm, "approvals": cmdApprovals, "approve": cmdApprove, "deny": cmdDeny,
+		"rm": cmdRm, "approvals": cmdApprovals, "cards": cmdCards, "debug": cmdDebug, "shelve": cmdShelve, "unshelve": cmdUnshelve, "approve": cmdApprove, "deny": cmdDeny,
 		"mcp": cmdMCPArgs, "companion": cmdCompanion, "version": cmdVersion, "hook": cmdHook, "gate": cmdGate, "guard": cmdGuard,
 		"harnesses": cmdHarnesses, "discover": cmdDiscover, "adopt": cmdAdopt,
 		"p2p": cmdP2P, "chat": cmdChat, "skill": cmdSkill, "update": cmdUpdate,

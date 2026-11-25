@@ -25,6 +25,10 @@ type LaunchRequest struct {
 	Brief     string        `json:"brief,omitempty"`
 	Prompt    string        `json:"prompt,omitempty"`    // first user turn; "" = the brief
 	ThreadID  string        `json:"thread_id,omitempty"` // the Matrix thread it works on; "" = the launcher's topic or its project's
+	// ConversationID: resume this existing Claude or Codex conversation of the agent's folder
+	// instead of starting a new one (launch_conversation.go). Owner, paired machine or head only.
+	// Nothing is sent to it unless Prompt is given (the Brief is not replayed as a first turn).
+	ConversationID string `json:"conversation_id,omitempty"`
 
 	CodexFullAccess bool `json:"codex_full_access,omitempty"`
 	AgyFullAccess   bool `json:"agy_full_access,omitempty"`
@@ -39,10 +43,15 @@ const HeadName = "head"
 
 // LaunchAgent creates an agent (policy-checked for the caller) and starts it.
 func (f *Fleet) LaunchAgent(c Caller, req LaunchRequest) (model.Agent, error) {
+	req.Brief = shellLaunchBrief(req) // a shell's first line is its start command (shell_start.go)
 	f.mu.Lock()
 	a, err := f.prepareLaunchLocked(c, req)
 	if err == nil && req.NoWait && !(req.Force && c.Owner) {
 		err = f.capacityLocked(req.Name)
+	}
+	var carryRoot string // set: Claude's transcript is copied over below, outside the lock
+	if err == nil && req.ConversationID != "" {
+		carryRoot, err = f.resumeConversationLocked(c, &a, req.ConversationID)
 	}
 	var thread string
 	if err == nil {
@@ -52,24 +61,52 @@ func (f *Fleet) LaunchAgent(c Caller, req LaunchRequest) (model.Agent, error) {
 		f.mu.Unlock()
 		return model.Agent{}, err
 	}
-	r := &agentRec{a: a}
+	r := &agentRec{a: a, sessionConfirmed: req.ConversationID != ""}
 	f.agents[a.ID] = r
 	f.saveAgentLocked(r)
+	if req.ConversationID != "" {
+		f.appendLocked(r, model.TimelineEntry{Kind: model.EntrySystem, Text: "Launched into the existing conversation " + a.SessionID + "."})
+	}
+	if a.Harness == model.HarnessShell {
+		f.recordShellLaunchLocked(c, r, req, thread)
+	}
 	if a.AgyFullAccess {
 		f.log.Warn("owner opted agy agent into full access", "agent", a.ID, "name", a.Name)
 		f.appendLocked(r, model.TimelineEntry{Kind: model.EntrySystem, Text: "Owner opted this agy agent into skipping permission prompts. This opt-in resets when the daemon restarts."})
 	}
 	launcher, _ := f.callerRecLocked(c)
+	prompt := req.Prompt
+	if prompt == "" && req.ConversationID == "" {
+		prompt = req.Brief
+	}
+	prompt = f.agentPromptLocked(c, prompt)
 	f.linkLaunchLocked(linkerName(launcher), thread, a)
+	f.regShellLaunchedLocked(a, launcher, thread) // registry.go: who launched a shell, and on which thread
 	if a.CodexFullAccess {
 		f.log.Warn("owner opted Codex agent into full access", "agent", a.ID, "name", a.Name, "cwd", a.Cwd)
 	}
 	f.mu.Unlock()
 
-	prompt := req.Prompt
-	if prompt == "" {
-		prompt = req.Brief
+	if carryRoot != "" {
+		// Not under f.mu: the transcript can be large. Checked again afterwards; without it
+		// the agent is not started (a resume would only fail).
+		copyErr := copyClaudeTranscript(carryRoot, a)
+		if copyErr != nil || !claudeConversationExists(carryRoot, a) {
+			f.mu.Lock()
+			if cur := f.agents[a.ID]; cur == r {
+				r.a.State, r.a.Desired = model.StateError, "stopped"
+				r.a.Error = "the conversation could not be copied into the agents' Claude folder"
+				if copyErr != nil {
+					r.a.Error += ": " + copyErr.Error()
+				}
+				f.appendLocked(r, model.TimelineEntry{Kind: model.EntryError, IsError: true, Text: r.a.Error})
+				f.saveAgentLocked(r)
+			}
+			f.mu.Unlock()
+			return f.Agent(a.ID)
+		}
 	}
+
 	o := startOpts{StartOptions: StartOptions{Force: req.Force && c.Owner}}
 	_ = f.startAgentOpts(a.ID, prompt, o) // a failed start leaves the agent in state error
 	return f.Agent(a.ID)
@@ -152,15 +189,27 @@ func (f *Fleet) prepareLaunchLocked(c Caller, req LaunchRequest) (model.Agent, e
 		proj = f.projects[parent.a.ProjectID]
 	}
 
+	if prof.Provider == model.FaeProvider {
+		if req.Harness != "" && req.Harness != prof.Harness {
+			return model.Agent{}, errf(KindInvalid, "the %s profile requires %s", prof.Slug, prof.Harness)
+		}
+		if req.Account != "" && req.Account != prof.Account {
+			return model.Agent{}, errf(KindInvalid, "the %s profile requires account %s", prof.Slug, prof.Account)
+		}
+		req.Harness, req.Account = prof.Harness, prof.Account
+	}
 	harness, mode, err := f.harnessModeLocked(req.Harness, req.Mode)
 	if err != nil {
 		return model.Agent{}, err
 	}
-	// A shell runs whatever is typed into it, with no model, no guard and no approvals: it is
-	// the owner's own terminal. An agent has no use for one (mail is never typed into a shell)
-	// and must not get one to type commands into (DESIGN.md "Fleet control").
-	if harness == model.HarnessShell && !c.Owner {
-		return model.Agent{}, errf(KindForbidden, "only the owner can launch a shell")
+	// A shell runs whatever is typed into it, with no model and no approvals. The owner and this
+	// machine's agents launch one (the owner, 17 Nov: "you and agents can launch shells, just not
+	// willy nilly"; the shells registry is the control, not a ban). An agent's shell runs only
+	// its start command, which passes the command guard below like any command of that agent;
+	// typing into a shell stays the owner's alone (terminal.go). A paired machine or Companion
+	// never launches one: they have no place in the tree to answer for it.
+	if harness == model.HarnessShell && !c.Owner && me == nil {
+		return model.Agent{}, errf(KindForbidden, "only the owner and this machine's agents can launch a shell")
 	}
 	mdl, err := f.pickHarnessModelLocked(harness, prof, req.Model, me == nil)
 	if err != nil {
@@ -183,9 +232,17 @@ func (f *Fleet) prepareLaunchLocked(c Caller, req LaunchRequest) (model.Agent, e
 	}
 
 	now := model.Now()
-	account, err := f.launchAccountLocked(harness, req.Account)
-	if err != nil {
-		return model.Agent{}, err
+	account := prof.Account
+	if prof.Provider != model.FaeProvider {
+		account, err = f.launchAccountLocked(harness, req.Account)
+		if err != nil {
+			return model.Agent{}, err
+		}
+		if req.Account == "" && req.ConversationID == "" && harness == model.HarnessClaude && f.claudeAlternate != nil {
+			if alternate := f.claudeAlternate(account, mdl); alternate != "" {
+				account = alternate
+			}
+		}
 	}
 	a := model.Agent{
 		ID: model.NewID(), Name: req.Name, Level: level, Profile: prof.Slug, Harness: harness, Account: account, Mode: mode, Model: mdl,
@@ -202,6 +259,11 @@ func (f *Fleet) prepareLaunchLocked(c Caller, req LaunchRequest) (model.Agent, e
 	}
 	if err := f.launchAdmissionLocked(a); err != nil {
 		return model.Agent{}, err
+	}
+	if harness == model.HarnessShell && !c.Owner {
+		if err := f.agentShellCommandLocked(a, req); err != nil {
+			return model.Agent{}, err
+		}
 	}
 	if level == model.LevelWorker && harness != model.HarnessShell {
 		if proj == nil && parent != nil && parent.a.Level == model.LevelHead {
@@ -282,6 +344,7 @@ func (f *Fleet) ensureHeadLocked() (*agentRec, bool, error) {
 	if headHarness != model.HarnessClaude {
 		mdl = "" // let the harness pick its own default model
 	}
+	// The head starts in chat. Classic's terminal default applies to other Claude launches.
 	now := model.Now()
 	r := &agentRec{a: model.Agent{
 		ID: model.NewID(), Name: HeadName, Level: model.LevelHead, Profile: prof.Slug, Harness: headHarness,

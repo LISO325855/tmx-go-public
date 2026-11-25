@@ -4,17 +4,20 @@ package fleet
 // lifecycle (each change an event), and the lists behind "mine" and "see by".
 
 import (
+	"fmt"
 	"slices"
 	"strings"
 	"unicode/utf8"
 
-	"github.com/blackcode-ch/tmx-go/internal/companion"
 	"github.com/blackcode-ch/tmx-go/internal/model"
 )
 
 const (
-	maxIntentText = 2000
-	maxStory      = 600
+	// The owner's words, the story and a why: a ceiling far out of reach (2000, 600 and 300
+	// characters until 17 Nov: no caps on what is written, only a ceiling against a runaway).
+	maxIntentText = maxEntryText
+	maxStory      = maxEntryText
+	maxWhy        = maxEntryText
 	// cardIntent is how much of the owner's words a list card carries (the panel has them all).
 	cardIntent = 160
 )
@@ -44,15 +47,14 @@ func (f *Fleet) NewThread(c Caller, req NewThreadRequest) (model.Thread, error) 
 	intent, source, story := strings.TrimSpace(req.IntentText), strings.TrimSpace(req.IntentSource), strings.TrimSpace(req.Story)
 	life := strings.ToLower(strings.TrimSpace(req.Lifecycle))
 	switch {
-	case utf8.RuneCountInString(intent) > maxIntentText, utf8.RuneCountInString(story) > maxStory,
-		utf8.RuneCountInString(source) > maxLinkWhy:
-		return model.Thread{}, errf(KindInvalid, "too long: attach the details as a document")
+	case len(intent) > maxIntentText, len(story) > maxStory, len(source) > maxWhy:
+		return model.Thread{}, errf(KindInvalid, "longer than %d KB: attach the details as a document", maxEntryText>>10)
 	case !validLifecycle(life):
 		return model.Thread{}, errf(KindInvalid, "lifecycle must be task or ongoing")
-	case companion.Scrub(title) != title || companion.Scrub(intent) != intent || companion.Scrub(story) != story ||
-		companion.Scrub(source) != source:
-		return model.Thread{}, errf(KindInvalid, "this looks like it contains a secret (a key, token or password); threads never hold secrets")
 	}
+	// Nothing is checked or rewritten in what is written here (17 Nov, 22:46: no filters and no
+	// silent rewrites on tmx's own records; the check on credentials is where text leaves the
+	// machine).
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -114,6 +116,11 @@ type StateRequest struct {
 	Status    string `json:"status,omitempty"`    // active | paused | waiting_on_owner | blocked | done
 	Lifecycle string `json:"lifecycle,omitempty"` // task | ongoing
 	Why       string `json:"why,omitempty"`       // one line, recorded with the event
+	// The Board view: how far the thread is, 0-100 (why then says where it stands), and what it
+	// waits for: what stops it, or what the owner has to do ("" clears it). Either may come
+	// alone, without a status.
+	Pct     *int    `json:"pct,omitempty"`
+	Blocker *string `json:"blocker,omitempty"`
 }
 
 // stateEvent is the event a status change records.
@@ -131,17 +138,23 @@ func (f *Fleet) SetState(c Caller, idOrTitle string, req StateRequest) (model.Th
 	status := strings.ToLower(strings.TrimSpace(req.Status))
 	life := strings.ToLower(strings.TrimSpace(req.Lifecycle))
 	why := strings.TrimSpace(req.Why)
+	blocker := ""
+	if req.Blocker != nil {
+		blocker = strings.Join(strings.Fields(*req.Blocker), " ") // one line
+	}
 	switch {
-	case status == "" && life == "":
-		return model.Thread{}, errf(KindInvalid, "say the new status or lifecycle")
+	case status == "" && life == "" && req.Pct == nil && req.Blocker == nil:
+		return model.Thread{}, errf(KindInvalid, "say the new status or lifecycle, the progress (pct) or the blocker")
+	case req.Pct != nil && (*req.Pct < 0 || *req.Pct > 100):
+		return model.Thread{}, errf(KindInvalid, "pct must be from 0 to 100")
+	case len(blocker) > maxWhy:
+		return model.Thread{}, errf(KindInvalid, "the blocker is longer than %d KB", maxWhy>>10)
 	case status != "" && !slices.Contains(model.ThreadStatuses, status):
 		return model.Thread{}, errf(KindInvalid, "status must be one of %s", strings.Join(model.ThreadStatuses, ", "))
 	case !validLifecycle(life):
 		return model.Thread{}, errf(KindInvalid, "lifecycle must be task or ongoing")
-	case utf8.RuneCountInString(why) > maxLinkWhy:
-		return model.Thread{}, errf(KindInvalid, "keep why to one line")
-	case companion.Scrub(why) != why:
-		return model.Thread{}, errf(KindInvalid, "this looks like it contains a secret (a key, token or password)")
+	case len(why) > maxWhy:
+		return model.Thread{}, errf(KindInvalid, "why is longer than %d KB", maxWhy>>10)
 	}
 
 	f.mu.Lock()
@@ -164,6 +177,30 @@ func (f *Fleet) SetState(c Caller, idOrTitle string, req StateRequest) (model.Th
 	if life != "" && life != threadLifecycle(t) {
 		t.Lifecycle = life
 		said = append(said, "lifecycle "+life)
+	}
+	// The Board's fields. A progress report keeps its one line (why) as where the thread stands;
+	// a thread that is active again or done no longer waits for anything, unless it says so.
+	if req.Pct != nil && (t.Progress == nil || *t.Progress != *req.Pct || (why != "" && why != t.ProgressWhy)) {
+		pct := *req.Pct
+		t.Progress = &pct
+		if why != "" {
+			t.ProgressWhy = why
+		}
+		said = append(said, fmt.Sprintf("%d%%", pct))
+	}
+	if req.Blocker != nil && blocker != t.Blocker {
+		t.Blocker = blocker
+		if blocker == "" {
+			said = append(said, "no longer waiting")
+		} else {
+			said = append(said, "waiting for: "+blocker)
+		}
+	} else if req.Blocker == nil && t.Blocker != "" && (status == model.ThreadActive || status == model.ThreadDone) {
+		t.Blocker = ""
+	}
+	if status == model.ThreadDone && t.Status == model.ThreadDone {
+		full := 100
+		t.Progress = &full
 	}
 	if len(said) == 0 {
 		return t, nil

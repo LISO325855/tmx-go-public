@@ -1,6 +1,10 @@
 package fleet
 
-import "github.com/blackcode-ch/tmx-go/internal/model"
+import (
+	"reflect"
+
+	"github.com/blackcode-ch/tmx-go/internal/model"
+)
 
 // AgentPatch is PATCH /api/agents/{id}; nil fields stay.
 type AgentPatch struct {
@@ -20,17 +24,22 @@ type AgentUpdate struct {
 	Note          string      `json:"note"`
 }
 
-// UpdateAgent changes an agent's role, brief, model or profile (owner only). The model is
+// UpdateAgent changes an agent's role, brief, model or profile: the owner, the head, or a lead
+// for an agent of its own project (manage.go). The model is
 // checked against the (new) profile; a new profile without a model gives its default model.
 func (f *Fleet) UpdateAgent(c Caller, idOrName string, p AgentPatch) (AgentUpdate, error) {
-	if !c.Owner {
-		return AgentUpdate{}, errf(KindForbidden, "only the owner can edit an agent")
-	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	r, err := f.resolveLocked(idOrName)
 	if err != nil {
 		return AgentUpdate{}, err
+	}
+	if err := f.manageAgentLocked(c, r, "edit an agent"); err != nil {
+		return AgentUpdate{}, err
+	}
+	// A shell's brief is the command it runs: changing it is the owner's (shell_start.go).
+	if !c.Owner && r.a.Harness == model.HarnessShell {
+		return AgentUpdate{}, errf(KindForbidden, "only the owner can edit a shell: its brief is the command it runs")
 	}
 	next := r.a
 	prof := f.profileForLocked(next)
@@ -42,6 +51,9 @@ func (f *Fleet) UpdateAgent(c Caller, idOrName string, p AgentPatch) (AgentUpdat
 		if np.Level != next.Level {
 			return AgentUpdate{}, errf(KindInvalid, "%s is a %s and keeps its level; the profile %s is for %s agents",
 				next.Name, next.Level, np.Slug, np.Level)
+		}
+		if prof.Provider != np.Provider {
+			return AgentUpdate{}, errf(KindInvalid, "launch a new agent to change providers")
 		}
 		if err := harnessProfileOK(next.Harness, *np); err != nil {
 			return AgentUpdate{}, err
@@ -69,7 +81,7 @@ func (f *Fleet) UpdateAgent(c Caller, idOrName string, p AgentPatch) (AgentUpdat
 		next.Protected = *p.Protected
 	}
 
-	out := AgentUpdate{Changed: next != r.a}
+	out := AgentUpdate{Changed: !reflect.DeepEqual(next, r.a)}
 	restartNeeded := next.Role != r.a.Role || next.Brief != r.a.Brief || next.Model != r.a.Model || next.Profile != r.a.Profile
 	if out.Changed {
 		r.a = next

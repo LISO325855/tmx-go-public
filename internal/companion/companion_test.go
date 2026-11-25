@@ -63,9 +63,10 @@ func TestRenderAndScrub(t *testing.T) {
 			t.Errorf("missing %q in\n%s", want, text)
 		}
 	}
-	for _, secret := range []string{"hunter2", "sk-abcdefghijklmnopqrstuvwx"} {
-		if strings.Contains(text, secret) {
-			t.Errorf("secret %q not removed:\n%s", secret, text)
+	// The task goes as written: nothing is replaced by "[removed by tmx]" (it was until 17 Nov).
+	for _, written := range []string{"password: hunter2", "sk-abcdefghijklmnopqrstuvwx"} {
+		if !strings.Contains(text, written) {
+			t.Errorf("%q was changed on the way:\n%s", written, text)
 		}
 	}
 	// A git hash, a URL path and a UUID are no secrets.

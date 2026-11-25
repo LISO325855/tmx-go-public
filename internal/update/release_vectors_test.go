@@ -56,7 +56,7 @@ func TestSprintS22ReleaseFailureVectors(t *testing.T) {
 			if tc.name == "wrong-key" {
 				signer = other
 			}
-			sig := []byte(FleetKeyID + ":" + base64.StdEncoding.EncodeToString(ed25519.Sign(signer, signatureMessage(FleetSignatureContext, "blackcode-ch/tmx-go", version, sums))))
+			sig := []byte(FleetKeyID + ":" + base64.StdEncoding.EncodeToString(ed25519.Sign(signer, signatureMessage(FleetSignatureContext, (*config.UpdateConfig)(nil).Resolved().Repo, version, sums))))
 			if tc.name == "modified-sums" {
 				sums = append(sums, '\n')
 			}

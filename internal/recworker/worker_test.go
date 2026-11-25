@@ -79,7 +79,6 @@ type fakeSum struct {
 	mu       sync.Mutex
 	auto     bool
 	state    map[string]model.SummaryState
-	failed   map[string]string
 	finished []string
 	here     []string // FinishedHere reasons
 }
@@ -90,11 +89,19 @@ func (s *fakeSum) Finished(r model.Recording) {
 	s.finished = append(s.finished, r.ID)
 	s.state[r.ID] = model.SummaryTranscribing
 }
-func (s *fakeSum) FinishedHere(r model.Recording, why string) {
+func (s *fakeSum) ReserveReport(model.Recording, time.Time) (bool, error) { return true, nil }
+func (s *fakeSum) FinishReport(r model.Recording, why string, deadline time.Time) {
+	if why == "" {
+		s.Finished(r)
+		return
+	}
 	s.mu.Lock()
 	s.here = append(s.here, why)
+	pending := s.state[r.ID].Pending()
 	s.mu.Unlock()
-	s.Finished(r)
+	if !pending {
+		s.Finished(r)
+	}
 }
 func (s *fakeSum) Get(id string) (model.RecordingSummary, error) {
 	s.mu.Lock()
@@ -104,12 +111,6 @@ func (s *fakeSum) Get(id string) (model.RecordingSummary, error) {
 		st = model.SummaryNone
 	}
 	return model.RecordingSummary{RecordingID: id, State: st}, nil
-}
-func (s *fakeSum) Fail(id, why string) (bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.failed[id], s.state[id] = why, model.SummaryFailed
-	return true, nil
 }
 func (s *fakeSum) Settings() summarize.Settings { return summarize.Settings{Auto: s.auto} }
 func (s *fakeSum) set(id string, st model.SummaryState) {
@@ -122,10 +123,9 @@ func (s *fakeSum) made() []string {
 	defer s.mu.Unlock()
 	return slices.Clone(s.finished)
 }
-func (s *fakeSum) why(id string) string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.failed[id]
+func (s *fakeSum) failed(id string) bool {
+	x, _ := s.Get(id)
+	return x.State == model.SummaryFailed
 }
 
 type fakeRecs struct{}
@@ -142,7 +142,7 @@ type rig struct {
 }
 
 func newRig(t *testing.T) *rig {
-	r := &rig{f: &fakeFleet{agents: map[string]model.Agent{}}, sum: &fakeSum{auto: true, state: map[string]model.SummaryState{}, failed: map[string]string{}},
+	r := &rig{f: &fakeFleet{agents: map[string]model.Agent{}}, sum: &fakeSum{auto: true, state: map[string]model.SummaryState{}},
 		now: time.Unix(1_800_000_000, 0)}
 	r.s = New(Options{Fleet: r.f, Summaries: r.sum, Recordings: fakeRecs{}, Exe: `C:\tmx\tmx.exe`, Dir: t.TempDir(),
 		Now: func() time.Time { return r.now }, Deadline: func(int) time.Duration { return 30 * time.Minute }})
@@ -218,7 +218,7 @@ func TestProcessIsBoundToItsWorker(t *testing.T) {
 }
 
 // A worker that cannot do its job (it fails, ends, waits for a person or idles before it asked) never loses the
-// report: the daemon makes it itself, once, and the worker is removed; the deadline still holds.
+// report: the daemon makes it itself, once, and the worker is removed.
 func TestWorkerFailureTheDaemonMakesTheReport(t *testing.T) {
 	for _, st := range []model.AgentState{model.StateError, model.StateExited, model.StateWaiting, model.StateIdle} {
 		r := newRig(t)
@@ -226,8 +226,8 @@ func TestWorkerFailureTheDaemonMakesTheReport(t *testing.T) {
 		r.f.set(ag, st, "claude exited 1")
 		r.s.Check()
 		r.s.Check()
-		if got := r.sum.made(); !slices.Equal(got, []string{"rec1"}) || r.sum.why("rec1") != "" {
-			t.Fatalf("%s: made %v, failed %q", st, got, r.sum.why("rec1"))
+		if got := r.sum.made(); !slices.Equal(got, []string{"rec1"}) || r.sum.failed("rec1") {
+			t.Fatalf("%s: made %v, failed %t", st, got, r.sum.failed("rec1"))
 		}
 		if len(r.sum.here) != 1 || !strings.HasPrefix(r.sum.here[0], "the report worker rec-rec1 didn't make it (") {
 			t.Fatalf("%s: the report must say why the daemon made it: %q", st, r.sum.here)
@@ -235,11 +235,7 @@ func TestWorkerFailureTheDaemonMakesTheReport(t *testing.T) {
 		if !slices.Contains(r.f.removed, ag) || r.s.Tracking("rec1") != "" {
 			t.Fatalf("%s: the worker is removed", st)
 		}
-		r.now = r.now.Add(31 * time.Minute) // still tracked: a report the daemon does not finish fails at the deadline
-		r.s.Check()
-		if !strings.Contains(r.sum.why("rec1"), "not finished in time") {
-			t.Fatalf("%s: deadline: %q", st, r.sum.why("rec1"))
-		}
+
 	}
 }
 
@@ -257,13 +253,13 @@ func TestReportDoneRemovesTheWorker(t *testing.T) {
 	}
 	r.sum.set("rec1", model.SummaryDone)
 	r.s.Check()
-	if !slices.Contains(r.f.removed, ag) || r.sum.why("rec1") != "" {
-		t.Fatalf("removed %v, failed %q", r.f.removed, r.sum.why("rec1"))
+	if !slices.Contains(r.f.removed, ag) || r.sum.failed("rec1") {
+		t.Fatalf("removed %v, failed %t", r.f.removed, r.sum.failed("rec1"))
 	}
 }
 
-// A worker gone after it asked leaves the report to the daemon: not failed, but the deadline still holds.
-func TestWorkerGoneAfterAskingKeepsTheReportThenDeadline(t *testing.T) {
+// The deadline hands an already pending report to the daemon without starting it again.
+func TestWorkerGoneAfterAskingKeepsTheReportAtDeadline(t *testing.T) {
 	r := newRig(t)
 	ag := r.stop(t, "rec1")
 	if _, _, err := r.s.Process(fleet.AgentCaller(ag), "rec1"); err != nil {
@@ -271,17 +267,17 @@ func TestWorkerGoneAfterAskingKeepsTheReportThenDeadline(t *testing.T) {
 	}
 	r.f.set(ag, model.StateExited, "")
 	r.s.Check()
-	if r.sum.why("rec1") != "" {
-		t.Fatalf("failed too early: %q", r.sum.why("rec1"))
+	if r.sum.failed("rec1") {
+		t.Fatalf("failed too early: %t", r.sum.failed("rec1"))
 	}
 	r.now = r.now.Add(31 * time.Minute)
 	r.s.Check()
-	if why := r.sum.why("rec1"); !strings.Contains(why, "not finished in time (30m0s after Stop)") {
-		t.Fatalf("deadline: %q", why)
+	if r.sum.failed("rec1") || len(r.sum.made()) != 1 || len(r.sum.here) != 1 ||
+		!strings.Contains(r.sum.here[0], "deadline passed (30m0s after Stop)") {
+		t.Fatalf("deadline: made %v, reasons %q", r.sum.made(), r.sum.here)
 	}
 }
 
-// A worker that cannot be launched fails the report with the launch error.
 // A worker that cannot be launched (no claude on this machine, over its limits) never loses the report: the
 // daemon makes it itself.
 func TestLaunchErrorTheDaemonMakesTheReport(t *testing.T) {
@@ -294,8 +290,8 @@ func TestLaunchErrorTheDaemonMakesTheReport(t *testing.T) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	if got := r.sum.made(); !slices.Equal(got, []string{"rec1"}) || r.sum.why("rec1") != "" {
-		t.Fatalf("made %v, failed %q", got, r.sum.why("rec1"))
+	if got := r.sum.made(); !slices.Equal(got, []string{"rec1"}) || r.sum.failed("rec1") {
+		t.Fatalf("made %v, failed %t", got, r.sum.failed("rec1"))
 	}
 	if len(r.sum.here) != 1 || r.sum.here[0] != "the report worker couldn't start (start failed: claude not found on PATH)" {
 		t.Fatalf("why: %q", r.sum.here)
@@ -310,5 +306,45 @@ func TestAutoOffLeavesItToSummaries(t *testing.T) {
 	r.s.Finished(model.Recording{ID: "rec2", State: model.RecordingFailed})
 	if len(r.f.launched) != 0 || !slices.Equal(r.sum.finished, []string{"rec1"}) {
 		t.Fatalf("launched %d, finished %v", len(r.f.launched), r.sum.finished)
+	}
+}
+
+func TestUntriggeredWorkerFallsBack(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		state   model.AgentState
+		elapsed time.Duration
+		reason  string
+	}{
+		{"queued at five minutes", model.StateQueued, 5 * time.Minute, "within five minutes"},
+		{"idle at menu", model.StateIdle, time.Minute, "stopped without running the report"},
+		{"first check at deadline", model.StateWorking, 30 * time.Minute, "deadline passed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRig(t)
+			ag := r.stop(t, "rec1")
+			r.f.set(ag, tc.state, "")
+			if tc.state == model.StateQueued {
+				r.now = r.now.Add(5*time.Minute - time.Second)
+				r.s.Check()
+				if len(r.sum.made()) != 0 {
+					t.Fatal("queued worker lost its five minutes")
+				}
+				r.now = r.now.Add(time.Second)
+			} else {
+				r.now = r.now.Add(tc.elapsed)
+			}
+			r.s.Check()
+			r.s.Check()
+			if len(r.sum.made()) != 1 || len(r.sum.here) != 1 || !strings.Contains(r.sum.here[0], tc.reason) {
+				t.Fatalf("made %v, reasons %q", r.sum.made(), r.sum.here)
+			}
+			if r.s.Tracking("rec1") != "" || !slices.Equal(r.f.removed, []string{ag}) {
+				t.Fatalf("worker still tracked or retired twice: %v", r.f.removed)
+			}
+			if _, _, err := r.s.Process(fleet.AgentCaller(ag), "rec1"); fleet.KindOf(err) != fleet.KindForbidden {
+				t.Fatalf("late Process: %v", err)
+			}
+		})
 	}
 }

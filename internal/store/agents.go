@@ -8,7 +8,7 @@ import (
 )
 
 const agentCols = `id, name, project_id, parent_id, level, harness, mode, model, cwd, role, brief,
-	state, desired, session_id, pid, created_at, updated_at, last_activity_at, cost_usd, turns, error, profile, shelved_at, done_at, protected`
+	state, desired, session_id, pid, created_at, updated_at, last_activity_at, cost_usd, turns, error, profile, shelved_at, done_at, protected, account`
 
 type scanner interface{ Scan(...any) error }
 
@@ -17,7 +17,7 @@ func scanAgent(r scanner) (model.Agent, error) {
 	var project, parent sql.NullString
 	err := r.Scan(&a.ID, &a.Name, &project, &parent, &a.Level, &a.Harness, &a.Mode, &a.Model,
 		&a.Cwd, &a.Role, &a.Brief, &a.State, &a.Desired, &a.SessionID, &a.PID, &a.CreatedAt,
-		&a.UpdatedAt, &a.LastActivityAt, &a.CostUSD, &a.Turns, &a.Error, &a.Profile, &a.ShelvedAt, &a.DoneAt, &a.Protected)
+		&a.UpdatedAt, &a.LastActivityAt, &a.CostUSD, &a.Turns, &a.Error, &a.Profile, &a.ShelvedAt, &a.DoneAt, &a.Protected, &a.Account)
 	a.ProjectID, a.ParentID = project.String, parent.String
 	return a, err
 }
@@ -27,7 +27,7 @@ func (s *Store) PutAgent(a model.Agent) error {
 	_, err := s.db.Exec(upsert("agents", agentCols),
 		a.ID, a.Name, nullable(a.ProjectID), nullable(a.ParentID), a.Level, a.Harness, a.Mode, a.Model,
 		a.Cwd, a.Role, a.Brief, a.State, a.Desired, a.SessionID, a.PID, a.CreatedAt, a.UpdatedAt,
-		a.LastActivityAt, a.CostUSD, a.Turns, a.Error, a.Profile, a.ShelvedAt, a.DoneAt, a.Protected)
+		a.LastActivityAt, a.CostUSD, a.Turns, a.Error, a.Profile, a.ShelvedAt, a.DoneAt, a.Protected, a.Account)
 	return err
 }
 

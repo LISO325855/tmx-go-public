@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/blackcode-ch/tmx-go/internal/config"
+	"github.com/blackcode-ch/tmx-go/internal/restartguard"
 	"github.com/blackcode-ch/tmx-go/internal/rollback"
 	"github.com/blackcode-ch/tmx-go/internal/store"
 )
@@ -356,6 +357,34 @@ func TestSnapshotFailurePreventsInstall(t *testing.T) {
 	select {
 	case <-h.restarts:
 		t.Fatal("restarted without checkpoint")
+	default:
+	}
+}
+
+func TestAudioCapturePreventsUpdateSwapEvenWithNow(t *testing.T) {
+	g := newFakeGitHub(t)
+	key, pub := newKey(t)
+	g.publish("stable", "fleet-v0.2.0", key, map[string][]byte{"tmxg_fleet-v0.2.0_windows_amd64.exe": []byte("binary fleet-v0.2.0")})
+	exe := filepath.Join(t.TempDir(), "tmx.exe")
+	writeExe(t, exe, "fleet-v0.1.1")
+	h := newHarness(t, g, pub, "fleet-v0.1.1", exe, "windows", false)
+	audio := &restartguard.Guard{}
+	_ = audio.Capture("phone", true)
+	h.u.o.PrepareRestart = func() (func(), error) { return audio.Reserve(false, nil) }
+	if s := h.u.Check(context.Background()); s.State != StateAvailable {
+		t.Fatalf("check %+v", s)
+	}
+	h.u.Install(true)
+	s := waitState(t, h.u, StateError)
+	if !strings.Contains(s.Error, "audio capture") {
+		t.Fatal(s.Error)
+	}
+	if b, _ := os.ReadFile(exe); string(b) != "binary fleet-v0.1.1" {
+		t.Fatalf("binary changed during capture: %q", b)
+	}
+	select {
+	case <-h.restarts:
+		t.Fatal("restarted during capture")
 	default:
 	}
 }

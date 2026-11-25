@@ -44,18 +44,13 @@ func (f *Fleet) DeliverExternal(agentID, from, text string) (model.Message, erro
 		f.mu.Unlock()
 		return model.Message{}, errf(KindNotFound, "no agent %q", agentID)
 	}
-	n, err := f.st.CountQueued(agentID)
-	if err != nil {
-		f.mu.Unlock()
-		return model.Message{}, err
-	}
-	if n >= MaxQueued {
-		f.mu.Unlock()
-		return model.Message{}, errf(KindTooMany, "%s already has %d messages waiting", r.a.Name, n)
-	}
 	m := model.Message{ID: model.NewID(), From: from, To: agentID, Body: text, State: model.MsgQueued, CreatedAt: model.Now()}
 	if isHead(r) {
 		m.ThreadID = f.chatThreadLocked(from) // each chat is its own string on the Board
+	}
+	if err := f.diskFloorLocked(m); err != nil {
+		f.mu.Unlock()
+		return model.Message{}, err
 	}
 	if err := f.st.PutMessage(m); err != nil {
 		f.mu.Unlock()

@@ -102,10 +102,8 @@ func (s *Service) sendWith(c fleet.Caller, chatID string, req SendRequest, agent
 			return model.ChatMessage{}, forbidden("the calling agent no longer exists")
 		}
 		agentName = a.Name
-		if n, _ := s.st.TrailingAgentMessages(ch.ID, MaxAgentRun+1); n >= MaxAgentRun {
-			s.mu.Unlock()
-			return model.ChatMessage{}, errf(fleet.KindTooMany, "agents have written %d messages in a row in this chat; wait until a person writes", n)
-		}
+		// No limit on how many messages agents write in a row (the owner, 17 Nov 19:28: agents
+		// talking to agents is the point; a runaway is something to report, not to block).
 	}
 	topic, err := s.sendTopicLocked(ch, req.Topic)
 	if err != nil {
@@ -166,8 +164,6 @@ func (s *Service) sendWith(c fleet.Caller, chatID string, req SendRequest, agent
 			text: fmt.Sprintf("[chat %q (%s) · from the owner, who takes part in this chat with you]%s %s",
 				peertext.Field(ch.Name), peertext.Field(ch.ID), s.topicNoteLocked(ch.ID, m.Topic), body) +
 				s.filesNote(files)})
-	} else if !c.Owner {
-		s.agentRunNoticeLocked(ch.ID)
 	}
 	s.unlock(true)
 	s.mu.Lock()
@@ -184,13 +180,6 @@ func groupName(c model.Chat) string {
 		return c.Name
 	}
 	return ""
-}
-
-// agentRunNoticeLocked adds a notice when agents reach MaxAgentRun messages in a row.
-func (s *Service) agentRunNoticeLocked(chatID string) {
-	if n, _ := s.st.TrailingAgentMessages(chatID, MaxAgentRun+1); n == MaxAgentRun {
-		s.systemLocked(chatID, fmt.Sprintf("Agents paused: %d agent messages in a row. Agents get no more messages from this chat until a person writes.", MaxAgentRun))
-	}
 }
 
 // ---- receiving
@@ -219,6 +208,10 @@ func (s *Service) onEnvelope(env p2p.Envelope) error {
 		return s.onAdminAccept(env)
 	case TypeTopic:
 		return s.onTopic(env)
+	case TypeStatus:
+		return s.onStatus(env) // team.go
+	case TypeTeam:
+		return s.onTeam(env)
 	}
 	return fmt.Errorf("unknown envelope type %q", env.Type)
 }
@@ -383,12 +376,6 @@ func (s *Service) replayHeld(chatID string) {
 func (s *Service) deliverToAgentLocked(ch model.Chat, m model.ChatMessage, mentioned bool) {
 	if ch.AgentID == "" {
 		return
-	}
-	if m.SenderAgent != "" {
-		s.agentRunNoticeLocked(ch.ID)
-		if n, _ := s.st.TrailingAgentMessages(ch.ID, MaxAgentRun+1); n >= MaxAgentRun {
-			return // agents paused until a person writes
-		}
 	}
 	label := ExternalLabel(ch, m, s.teammateMark(m.Sender))
 	if mentioned {

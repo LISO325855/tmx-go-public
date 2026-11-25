@@ -2,8 +2,6 @@
 // model on demand and transcribes on this machine. The UI shows the state ("voice.status"
 // events), lets the owner set it up, and sends dictation (lib/dictation.ts).
 import { create } from "zustand";
-import { toast } from "sonner";
-import { ApiError } from "./transport";
 import { onBusEvent, useStore } from "./store";
 import type { BusEvent, Transcript, TranscriptSegment } from "./types";
 
@@ -45,6 +43,7 @@ export interface VoiceSettings {
   model: string;
   /** "auto" or a language code */
   language: string;
+  dictation_languages?: string[];
   threads: number;
   threads_auto: boolean;
   vad: boolean;
@@ -81,13 +80,18 @@ export interface VoiceSettingsPatch {
 	via_peer?: string;
   model?: string;
   language?: string;
+  dictation_languages?: string[];
   threads?: number;
   vad?: boolean;
   auto_transcribe?: boolean;
 }
 
-/** POST /api/transcribe: dictation's answer (not stored). */
+/** POST /api/transcribe: dictation answer; failed audio is discarded. */
 export interface TranscribeResult {
+  held?: boolean;
+  held_reason?: string;
+  /** Shown alongside the (trustworthy) text, e.g. "Fae unreachable, used local". */
+  note?: string;
 	report?: string;
   text: string;
   language: string;
@@ -119,20 +123,7 @@ export const voiceApi = {
   transcribe: async (data: string, language?: string): Promise<TranscribeResult> => {
     const answer = await t().request<TranscribeResult | { state: "pending"; transcript_id: string }>("POST", "/api/transcribe", { data, ...(language ? { language } : {}) });
     if (!("transcript_id" in answer)) return answer;
-    useVoice.setState({ pending: true });
-    toast.info("Transcription pending", { description: "The recording is saved on this machine and will retry automatically." });
-    try {
-      for (;;) {
-        await new Promise((resolve) => setTimeout(resolve, 2000));
-        const tr = await voiceApi.transcript(answer.transcript_id).catch((e: unknown) => {
-          if (e instanceof ApiError && e.status >= 400 && e.status < 500) throw e;
-          return null; // the recording and retry live on the daemon; reconnect without re-uploading
-        });
-        if (!tr) continue;
-        if (tr.state === "done") return tr;
-        if (tr.state === "failed") throw new Error(tr.error || "Transcription failed; recording retained locally.");
-      }
-    } finally { useVoice.setState({ pending: false }); }
+    throw new Error("This computer did not finish dictation. Please try again.");
   },
   transcripts: (q?: { q?: string; source_prefix?: string; limit?: number }) => {
     const p = new URLSearchParams();
@@ -156,6 +147,7 @@ export async function loadVoice() {
 }
 
 onBusEvent((ev: BusEvent) => {
+  if (ev.type === "snapshot" && useStore.getState().conn !== "open") useVoice.setState({ status: null, loaded: false });
   if (ev.type === "voice.status" && ev.data) useVoice.setState({ status: ev.data as VoiceStatus, loaded: true });
 });
 

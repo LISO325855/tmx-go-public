@@ -21,6 +21,40 @@ type WaMessageRow struct {
 	MediaFile string
 }
 
+// WaMediaWork carries only identifiers: no media keys or audio buffers in the queue.
+type WaMediaWork struct {
+	Chat, ID string
+}
+
+// WaMediaBatch returns due work newest first. Audio and download queues are
+// independent; retry times survive daemon restarts and repeated history echoes.
+func (s *Store) WaMediaBatch(since, now int64, audio bool, limit int) ([]WaMediaWork, error) {
+	where := `media_file = '' AND at >= ? AND COALESCE(json_extract(media, '$.download_retry.at'), 0) <= ?`
+	args := []any{since, now, limit}
+	if audio {
+		where = `media_file != '' AND type IN ('voice','audio') AND COALESCE(json_extract(media, '$.transcript'), '') = ''
+			AND COALESCE(json_extract(media, '$.transcribe_retry.at'), 0) <= ?`
+		args = []any{now, limit}
+	}
+	rows, err := s.db.Query(`SELECT chat_jid, id FROM wa_messages
+		WHERE deleted = 0 AND media != '' AND status != 'pending'
+		AND COALESCE(json_extract(media, '$.expired'), 0) = 0 AND (`+where+`)
+		ORDER BY at DESC, chat_jid DESC, id DESC LIMIT ?`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []WaMediaWork
+	for rows.Next() {
+		var w WaMediaWork
+		if err := rows.Scan(&w.Chat, &w.ID); err != nil {
+			return nil, err
+		}
+		out = append(out, w)
+	}
+	return out, rows.Err()
+}
+
 const waChatCols = `jid, name, kind, unread, pinned, muted, archived, avatar, last_at, updated_at`
 
 func scanWaChat(r scanner) (model.WaChat, error) {
@@ -236,6 +270,13 @@ func (s *Store) WaPutMessage(m WaMessageRow) error {
 	return err
 }
 
+// WaHasInbound reports whether the chat holds a message its other side wrote (not deleted).
+func (s *Store) WaHasInbound(chat string) (bool, error) {
+	var n int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM (SELECT 1 FROM wa_messages WHERE chat_jid = ? AND from_me = 0 AND deleted = 0 LIMIT 1)`, chat).Scan(&n)
+	return n > 0, err
+}
+
 // WaGetMessage returns one message.
 func (s *Store) WaGetMessage(chat, id string) (WaMessageRow, error) {
 	rows, err := s.waQuery(`m.chat_jid = ? AND m.id = ?`, chat, id)
@@ -301,8 +342,39 @@ func (s *Store) WaSetStatus(chat string, ids []string, st model.WaMessageStatus)
 
 // WaSetMediaFile records the downloaded file of a message's attachment ("" forgets it).
 func (s *Store) WaSetMediaFile(chat, id, file string) error {
-	_, err := s.db.Exec(`UPDATE wa_messages SET media_file = ? WHERE chat_jid = ? AND id = ?`, file, chat, id)
+	_, err := s.db.Exec(`UPDATE wa_messages SET media_file = ?, media = json_remove(media, '$.expired', '$.download_retry', '$.transcribe_retry') WHERE chat_jid = ? AND id = ? AND media != ''`, file, chat, id)
 	return err
+}
+
+func (s *Store) WaExpireMediaFile(file string) error {
+	if file == "" {
+		return nil
+	}
+	_, err := s.db.Exec(`UPDATE wa_messages SET media = json_set(media, '$.expired', json('true')) WHERE media_file = ? AND media != ''`, file)
+	return err
+}
+
+func (s *Store) WaHasMediaFile(file string) (bool, error) {
+	var found bool
+	err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM wa_messages WHERE media_file = ?)`, file).Scan(&found)
+	return found, err
+}
+
+func (s *Store) WaChatMediaFiles(chat string) ([]string, error) {
+	rows, err := s.db.Query(`SELECT media_file FROM wa_messages WHERE chat_jid = ? AND media_file != ''`, chat)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		out = append(out, name)
+	}
+	return out, rows.Err()
 }
 
 // WaPutReaction stores one person's reaction to a message; an empty emoji removes it.
@@ -358,7 +430,7 @@ func (s *Store) WaPending() ([]WaMessageRow, error) {
 
 // WaMediaFiles lists every downloaded attachment's file name (to clean up the folder).
 func (s *Store) WaMediaFiles() (map[string]bool, error) {
-	rows, err := s.db.Query(`SELECT media_file FROM wa_messages WHERE media_file != ''`)
+	rows, err := s.db.Query(`SELECT DISTINCT media_file FROM wa_messages WHERE media_file != ''`)
 	if err != nil {
 		return nil, err
 	}

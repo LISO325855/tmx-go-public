@@ -4,6 +4,7 @@ package apitest
 
 import (
 	"context"
+	"errors"
 	"github.com/blackcode-ch/tmx-go/internal/uploads"
 	"net"
 	"net/http"
@@ -22,11 +23,14 @@ import (
 	"github.com/blackcode-ch/tmx-go/internal/config"
 	"github.com/blackcode-ch/tmx-go/internal/fleet"
 	"github.com/blackcode-ch/tmx-go/internal/gate"
+	"github.com/blackcode-ch/tmx-go/internal/guard"
+	"github.com/blackcode-ch/tmx-go/internal/machinehealth"
 	"github.com/blackcode-ch/tmx-go/internal/model"
 	"github.com/blackcode-ch/tmx-go/internal/p2p"
 	"github.com/blackcode-ch/tmx-go/internal/peers"
 	"github.com/blackcode-ch/tmx-go/internal/recorder"
 	"github.com/blackcode-ch/tmx-go/internal/recworker"
+	"github.com/blackcode-ch/tmx-go/internal/reshistory"
 	"github.com/blackcode-ch/tmx-go/internal/resources"
 	"github.com/blackcode-ch/tmx-go/internal/runner"
 	"github.com/blackcode-ch/tmx-go/internal/runner/fake"
@@ -34,6 +38,7 @@ import (
 	"github.com/blackcode-ch/tmx-go/internal/store"
 	"github.com/blackcode-ch/tmx-go/internal/summarize"
 	"github.com/blackcode-ch/tmx-go/internal/summarize/summarizetest"
+	"github.com/blackcode-ch/tmx-go/internal/teamstore"
 	"github.com/blackcode-ch/tmx-go/internal/transcribe"
 	"github.com/blackcode-ch/tmx-go/internal/update"
 	"github.com/blackcode-ch/tmx-go/internal/whatsapp"
@@ -49,11 +54,14 @@ type Daemon struct {
 	Server     *httptest.Server
 	// Resource control is wired for its API but never samples (fake PIDs are not real).
 	Resources *resources.Manager
-	Slots     *slots.Manager
-	Gate      *gate.Gate // off until a test turns it on; prompts go to GateAuth. Its grace window is off (every proof is for one request) until a test sets it
-	GateAuth  *gate.Fake
-	Home      string
-	Chats     *chat.Service // the chat layer; without a node (New) peer-to-peer is off
+	History   *reshistory.Store // empty until a test adds samples
+	// Health never touches this machine: no reader file, no nvidia-smi, until a test sets them.
+	Health   *machinehealth.Service
+	Slots    *slots.Manager
+	Gate     *gate.Gate // off until a test turns it on; prompts go to GateAuth. Its grace window is off (every proof is for one request) until a test sets it
+	GateAuth *gate.Fake
+	Home     string
+	Chats    *chat.Service // the chat layer; without a node (New) peer-to-peer is off
 	// Companion is the Companion service; it finds Companion through config.json companion.url
 	// (a test points it at a fake) and installs into AIOSHome (a temp dir, never ~/.aios).
 	Companion *companion.Service
@@ -99,7 +107,7 @@ type Daemon struct {
 // its update routes answer 501), and returns that server's URL and the updater. The updater is
 // a development build, so it never checks GitHub or installs anything (state off); it keeps
 // config.json "update" in memory (UpdateSettings) and its token in this daemon's secrets.
-func (d *Daemon) WithUpdater(t testing.TB) (string, *update.Updater) {
+func (d *Daemon) WithUpdater(t testing.TB, pc ...*peers.Client) (string, *update.Updater) {
 	t.Helper()
 	u := update.New(update.Options{Paths: config.Paths{Home: d.Home}, Version: "test", APIBase: "http://127.0.0.1:1",
 		Settings: func() config.UpdateConfig { d.updMu.Lock(); defer d.updMu.Unlock(); return d.upd },
@@ -107,6 +115,9 @@ func (d *Daemon) WithUpdater(t testing.TB) (string, *update.Updater) {
 		Publish:  d.Fleet.Publish})
 	o := d.apiOpts
 	o.Updater = u
+	if len(pc) > 0 {
+		o.Peers = pc[0]
+	}
 	srv := httptest.NewServer(api.New(o).Handler())
 	t.Cleanup(func() {
 		srv.CloseClientConnections()
@@ -156,6 +167,21 @@ func (d *Daemon) WithPeers(t testing.TB, pc *peers.Client) string {
 	return srv.URL
 }
 
+// WithTrustedHost serves this daemon's API once more as if behind `tailscale serve` under host
+// (api.trusted_hosts) and returns that server's URL. It is another api.Server over the same
+// fleet: what one request leaves in the server's memory, only later requests to this URL see.
+func (d *Daemon) WithTrustedHost(t testing.TB, host string) string {
+	t.Helper()
+	o := d.apiOpts
+	o.TrustedHosts = []string{host}
+	srv := httptest.NewServer(api.New(o).Handler())
+	t.Cleanup(func() {
+		srv.CloseClientConnections()
+		srv.Close()
+	})
+	return srv.URL
+}
+
 // UpdateSettings is config.json "update" as the updater of WithUpdater saved it.
 func (d *Daemon) UpdateSettings() config.UpdateConfig {
 	d.updMu.Lock()
@@ -169,6 +195,21 @@ func (d *Daemon) SetUpdateSettings(c config.UpdateConfig) {
 	defer d.updMu.Unlock()
 	d.upd = c
 }
+
+// HeldRules are the guard settings of a test daemon: an owner who set the rules these tests
+// raise cards for to Held for me. No rule is held by default (guard.DefaultsVersion 2), and
+// with elevation Allowed a fixture's `sudo true` would be started for real. A test of the
+// defaults themselves passes DefaultGuard.
+func HeldRules() *guard.Settings {
+	return &guard.Settings{DefaultsVersion: guard.DefaultsVersion, RuleStates: map[string]guard.Outcome{
+		guard.RuleElevation: guard.Hold, guard.RuleTmxCLI: guard.Hold, guard.RuleDeleteOutside: guard.Hold,
+		guard.RuleGitRewrite: guard.Hold, guard.RuleP2PInvite: guard.Hold, guard.RuleP2PJoin: guard.Hold,
+		guard.RuleP2PInviteWA: guard.Hold,
+	}}
+}
+
+// DefaultGuard makes the test daemon a fresh install: every guard rule at its default.
+func DefaultGuard(o *fleet.Options) { o.Guard = nil }
 
 // New starts a daemon; everything is torn down with the test. opts adjust the fleet's
 // options before it is created (e.g. a fake process table for discover/adopt).
@@ -204,6 +245,9 @@ func NewWithNode(t testing.TB, node p2p.Node, opts ...func(*fleet.Options)) *Dae
 	}
 	d.Slots = slots.New(slots.Options{})
 	d.Resources = resources.New(resources.Options{Paths: paths, Slots: d.Slots, Workspace: d.Workspace})
+	d.History = reshistory.New(paths, nil, nil)
+	d.Health = &machinehealth.Service{ReaderFile: filepath.Join(home, "no-temps.json"), Now: time.Now,
+		SMI: func(context.Context) (string, error) { return "", errors.New("no nvidia-smi in tests") }}
 	srv := httptest.NewUnstartedServer(nil) // the listener exists already; start once wired
 	d.Server, d.URL = srv, "http://"+srv.Listener.Addr().String()
 	fo := fleet.Options{Elevated: func() bool { return false },
@@ -211,6 +255,7 @@ func NewWithNode(t testing.TB, node p2p.Node, opts ...func(*fleet.Options)) *Dae
 		Runners: map[model.Mode]runner.Runner{model.ModeChat: d.Chat, model.ModeTerminal: d.Term},
 		Machine: "testbox", Version: "test", Workspace: d.Workspace, URL: d.URL, Executable: exe,
 		Resources: d.Resources,
+		Guard:     HeldRules(),
 	}
 	for _, o := range opts {
 		o(&fo)
@@ -221,7 +266,7 @@ func NewWithNode(t testing.TB, node p2p.Node, opts ...func(*fleet.Options)) *Dae
 	}
 	d.Fleet = f
 	d.Resources.Attach(f)
-	d.Chats, err = chat.New(chat.Options{Node: node, Store: st, Agents: f, Name: func() string { return "testbox" }, FilesDir: paths.ChatFilesDir(),
+	d.Chats, err = chat.New(chat.Options{TeamStore: teamstore.New(paths), TeamTick: 100 * time.Millisecond, Node: node, Store: st, Agents: f, Name: func() string { return "testbox" }, FilesDir: paths.ChatFilesDir(),
 		RetryMin: 30 * time.Millisecond, RetryMax: 150 * time.Millisecond, SendWait: time.Second})
 	if err != nil {
 		t.Fatal(err)
@@ -264,7 +309,7 @@ func NewWithNode(t testing.TB, node p2p.Node, opts ...func(*fleet.Options)) *Dae
 	d.Recorder.SetFinished(d.Summaries.Finished)
 	d.WaFake = watest.New()
 	d.WhatsApp = whatsapp.New(whatsapp.Options{Store: st, Client: d.WaFake, MediaDir: paths.WhatsAppMediaDir(), Publish: f.Publish,
-		Fleet: f, ChatGap: 10 * time.Millisecond, NoticeQuiet: 30 * time.Millisecond,
+		Fleet: f, NoticeQuiet: 30 * time.Millisecond,
 		Config: func() *config.WhatsAppConfig { d.waMu.Lock(); defer d.waMu.Unlock(); c := d.waCfg; return &c },
 		SaveConfig: func(fn func(*config.WhatsAppConfig)) error {
 			d.waMu.Lock()
@@ -279,8 +324,8 @@ func NewWithNode(t testing.TB, node p2p.Node, opts ...func(*fleet.Options)) *Dae
 		StopGrace: 500 * time.Millisecond, Env: []string{"CODEX_HOME=" + filepath.Join(home, "codex"), "CLAUDE_CONFIG_DIR=" + filepath.Join(home, "claude-config"), "GEMINI_CLI_HOME=" + filepath.Join(home, "gemini")}})
 	port := srv.Listener.Addr().(*net.TCPAddr).Port
 	d.apiOpts = api.Options{Fleet: f, OwnerToken: token, Port: port, Gate: d.Gate,
-		Resources: d.Resources, Slots: d.Slots, Chats: d.Chats, Companion: d.Companion, Uploads: d.Uploads, P2P: node, Voice: d.Voice, Recorder: d.Recorder,
-		Summaries: d.Summaries, WhatsApp: d.WhatsApp, Accounts: d.Accounts}
+		Resources: d.Resources, History: d.History, Health: d.Health, Slots: d.Slots, Chats: d.Chats, Companion: d.Companion, Uploads: d.Uploads, P2P: node, Voice: d.Voice, Recorder: d.Recorder,
+		Summaries: d.Summaries, WhatsApp: d.WhatsApp, Accounts: d.Accounts, ClaudeExt: fo.ClaudeExt}
 	srv.Config.Handler = api.New(d.apiOpts).Handler()
 	srv.Start()
 	if err := f.Start(); err != nil {
@@ -302,6 +347,11 @@ func NewWithNode(t testing.TB, node p2p.Node, opts ...func(*fleet.Options)) *Dae
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
+		// The fleet first: Close waits for its background work (an approved action such as an
+		// invite sent by WhatsApp), which must not outlive the services it uses.
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		f.Close(ctx)
 		d.Accounts.Close()
 		d.Summaries.Close()
 		d.WhatsApp.Close()
@@ -311,9 +361,6 @@ func NewWithNode(t testing.TB, node p2p.Node, opts ...func(*fleet.Options)) *Dae
 		srv.CloseClientConnections()
 		srv.Close()
 		d.Chats.Close()
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		f.Close(ctx)
 		st.Close()
 	})
 	return d
@@ -369,6 +416,26 @@ func (d *Daemon) AgentToken(t testing.TB, name string) string {
 	}
 	t.Fatalf("no process/token for %s", name)
 	return ""
+}
+
+// Ready reports that a fake runner has finished its current turn.
+func (d *Daemon) Ready(t testing.TB, name string) {
+	t.Helper()
+	d.Proc(t, name).State(model.StateIdle)
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		a, err := d.Fleet.Agent(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if a.State == model.StateIdle {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s did not become idle", name)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 // Proc returns the named agent's newest fake process.

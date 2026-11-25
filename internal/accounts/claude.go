@@ -67,6 +67,7 @@ func claudeCheck(ctx context.Context, s *scope, path string) result {
 		return res
 	}
 	u := s.runUsage(ctx, path)
+	res.freeResets = s.claudeFreeResets(ctx, res.id.Email)
 	if u.err != nil {
 		res.note, res.keepLimits = "Couldn't read usage: "+u.err.Error(), true
 		return res

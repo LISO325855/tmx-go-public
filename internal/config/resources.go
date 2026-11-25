@@ -55,7 +55,7 @@ func DefaultResources() Resources {
 // Normalize fills defaults and clamps values into their ranges.
 func (r *Resources) Normalize() {
 	if r.MaxAgents == 0 {
-		r.MaxAgents = 8
+		r.MaxAgents = 64 // a ceiling; free memory (min_free_ram_mb, memguard) is the real limit. 8 until 17 Nov
 	}
 	if r.MinFreeRAMMB == 0 {
 		r.MinFreeRAMMB = 1500
