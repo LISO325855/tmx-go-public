@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="referrer" content="no-referrer">
   <meta name="robots" content="noindex, nofollow">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-Oa/AKC5bAkkpf+44pLf1wfsowixoqvkdn8bN61/lrNU='; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-oF52xBQfeO86YZY/VDXynT5fDVhB8At0SonCd15Jrd8='; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
   <title>Join a Tiamatrix chat</title>
   <style>
     :root { color-scheme: light dark; font: 1rem/1.5 system-ui, sans-serif; }
@@ -50,7 +50,6 @@
       get("manual").hidden = true;
       get("invite").value = "";
       get("status").textContent = "";
-      open();
     }
     get("open").addEventListener("click", open);
     get("copy").addEventListener("click", async () => {
