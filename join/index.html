@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <meta name="robots" content="noindex, nofollow">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-KhEgnqenmWKiedyryzVuvR+fQXlA3KaKDM6QpycGf74='; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
+  <title>Join a Tiamatrix chat</title>
+  <style>
+    :root { color-scheme: light dark; font: 1rem/1.5 system-ui, sans-serif; }
+    body { margin: 0; padding: 2rem 1rem; }
+    main { max-width: 34rem; margin: 8vh auto; }
+    h1 { font-size: 1.75rem; line-height: 1.2; }
+    .actions { display: flex; flex-wrap: wrap; gap: .75rem; }
+    button { font: inherit; min-height: 44px; padding: .45rem .85rem; cursor: pointer; }
+    textarea { box-sizing: border-box; width: 100%; margin-top: .5rem; font: inherit; }
+    #status { min-height: 1.5em; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Join a Tiamatrix chat</h1>
+    <p id="unavailable" hidden>This invite link is missing or invalid. Ask the sender for a fresh invite.</p>
+    <section id="join" hidden>
+      <p>Open Tiamatrix → Chats → Join with a link. Paste the invite link there.</p>
+      <div class="actions">
+        <button id="open" type="button">Open Tiamatrix</button>
+        <button id="copy" type="button">Copy invite link</button>
+      </div>
+      <p id="status" role="status"></p>
+      <div id="manual" hidden>
+        <label for="invite">Copy this invite link</label>
+        <textarea id="invite" rows="3" readonly></textarea>
+      </div>
+    </section>
+    <noscript>Enable JavaScript to open or copy this Tiamatrix invite.</noscript>
+  </main>
+  <script>
+    "use strict";
+    const get = (id) => document.getElementById(id);
+    const payload = window.location.hash.slice(1);
+    if (!/^[A-Za-z0-9_-]{1,4096}$/.test(payload)) {
+      get("unavailable").hidden = false;
+    } else {
+      const link = "tmx://join/" + payload;
+      const open = () => { window.location.href = link; };
+      get("join").hidden = false;
+      get("open").addEventListener("click", open);
+      get("copy").addEventListener("click", async () => {
+        try {
+          await navigator.clipboard.writeText(link);
+          get("status").textContent = "Invite link copied.";
+        } catch {
+          get("manual").hidden = false;
+          get("invite").value = link;
+          get("invite").focus();
+          get("invite").select();
+          get("status").textContent = "Select and copy the invite link below.";
+        }
+      });
+      open();
+    }
+  </script>
+</body>
+</html>
